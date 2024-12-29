@@ -86,8 +86,31 @@ def backup_target(src: str, tgt: str, paths: List[str]) -> None:
     """Execute backup of target paths."""
     for pth in paths:
         target_path = os.path.join(tgt, pth)
+        logging.debug("Processing path: %s", target_path)
         if os.path.exists(target_path):
             logging.info("Backing up target path: %s", target_path)
+            # Construct backup_path relative to CFG_BACKUP_DIR
+            relative_path = os.path.relpath(target_path, start=tgt)
+            backup_path = os.path.join(
+                CFG_BACKUP_DIR, dot_name, source_root, relative_path
+            )
+            logging.debug("Backup path: %s", backup_path)
+            if os.path.abspath(target_path) == os.path.abspath(backup_path):
+                logging.warning("Source and backup paths are the same: %s", target_path)
+                logging.info("Source path: %s", target_path)
+                logging.info("Backup path: %s", backup_path)
+                continue
+            os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+            if os.path.isdir(target_path):
+                logging.debug("Copying directory %s to %s", target_path, backup_path)
+                shutil.copytree(
+                    target_path, backup_path, symlinks=True, dirs_exist_ok=True
+                )
+            else:
+                logging.debug("Copying file %s to %s", target_path, backup_path)
+                shutil.copy2(target_path, backup_path)
+        else:
+            logging.warning("Target path does not exist: %s", target_path)
 
 
 def preserve_target(src: str, tgt: str, paths: List[str]) -> None:
@@ -99,7 +122,7 @@ def preserve_target(src: str, tgt: str, paths: List[str]) -> None:
             logging.info("Target path already exists: %s", target_path)
             return
         logging.info("Populating: %s", target_path)
-        os.makedirs(target_path, exist_ok=True)
+        # os.makedirs(target_path, exist_ok=True)
 
 
 def overwrite_target(src: str, tgt: str, paths: List[str]) -> None:
@@ -124,14 +147,14 @@ def sync_target(src: str, tgt: str, paths: List[str]) -> None:
 def write_file(act: str, src: str, tgt: str, paths: List[str]) -> None:
     """Write files based on the specified action."""
     backup_target(src, tgt, paths)
-    if act == "preserve":
-        preserve_target(src, tgt, paths)
-    elif act == "overwrite":
-        overwrite_target(src, tgt, paths)
-    elif act == "sync":
-        sync_target(src, tgt, paths)
-    else:
-        logging.warning(f"Skipping due to unknown action: {act}")
+    # if act == "preserve":
+    #     preserve_target(src, tgt, paths)
+    # elif act == "overwrite":
+    #     overwrite_target(src, tgt, paths)
+    # elif act == "sync":
+    #     sync_target(src, tgt, paths)
+    # else:
+    #     logging.warning(f"Skipping due to unknown action: {act}")
 
 
 def read_toml(file_path: str) -> Dict[str, Any]:
@@ -215,9 +238,9 @@ if __name__ == "__main__":
     if not os.path.exists(CFG_BACKUP_DIR):
         os.makedirs(CFG_BACKUP_DIR, exist_ok=True)
 
-    for dot in dotsArr:
-        logging.info("Deploying %s", dot)
-        dotData = mainData.get(dot)
+    for dot_name in dotsArr:
+        logging.info("Deploying %s", dot_name)
+        dotData = mainData.get(dot_name)
         defPreCmd = dotData.get("pre_command")
         if isinstance(defPreCmd, str):
             defPreCmd = [defPreCmd]
