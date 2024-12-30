@@ -48,7 +48,7 @@ def pacman_query(package_managers: List[str], package: str) -> bool:
     return False
 
 
-def are_deps_installed(dependency_list: Dict[str, List[str]]) -> bool:
+def check_dependencies(dependency_list: Dict[str, List[str]]) -> bool:
     """Check if all dependencies are installed."""
     all_installed = True
     for manager, packages in dependency_list.items():
@@ -79,82 +79,119 @@ def execute_commands(commands: List[Optional[str]]) -> None:
                 logging.info(result.stdout.strip())
             except subprocess.CalledProcessError as e:
                 logging.error("Error executing command '%s': %s", command, e)
-                sys.exit(1)
-
-
-def backup_target(src: str, tgt: str, paths: List[str]) -> None:
-    """Execute backup of target paths."""
-    for pth in paths:
-        target_path = os.path.join(tgt, pth)
-        logging.debug("Processing path: %s", target_path)
-        if os.path.exists(target_path):
-            logging.info("Backing up target path: %s", target_path)
-            # Construct backup_path relative to CFG_BACKUP_DIR
-            relative_path = os.path.relpath(target_path, start=tgt)
-            backup_path = os.path.join(
-                CFG_BACKUP_DIR, dot_name, source_root, relative_path
-            )
-            logging.debug("Backup path: %s", backup_path)
-            if os.path.abspath(target_path) == os.path.abspath(backup_path):
-                logging.warning("Source and backup paths are the same: %s", target_path)
-                logging.info("Source path: %s", target_path)
-                logging.info("Backup path: %s", backup_path)
-                continue
-            os.makedirs(os.path.dirname(backup_path), exist_ok=True)
-            if os.path.isdir(target_path):
-                logging.debug("Copying directory %s to %s", target_path, backup_path)
-                shutil.copytree(
-                    target_path, backup_path, symlinks=True, dirs_exist_ok=True
+                user_input = input(
+                    "Do you wish to continue and ignore this error? (y/n): "
                 )
-            else:
-                logging.debug("Copying file %s to %s", target_path, backup_path)
-                shutil.copy2(target_path, backup_path)
-        else:
-            logging.warning("Target path does not exist: %s", target_path)
-
-
-def preserve_target(src: str, tgt: str, paths: List[str]) -> None:
-    """Preserve existing target paths."""
-    logging.info("Preserving: %s", tgt)
-    for pth in paths:
-        target_path = os.path.join(tgt, pth)
-        if os.path.exists(target_path):
-            logging.info("Target path already exists: %s", target_path)
-            return
-        logging.info("Populating: %s", target_path)
-        # os.makedirs(target_path, exist_ok=True)
-
-
-def overwrite_target(src: str, tgt: str, paths: List[str]) -> None:
-    """Overwrite target paths."""
-    logging.info("Overwriting: %s", tgt)
-    for pth in paths:
-        target_path = os.path.join(tgt, pth)
-        if os.path.exists(target_path):
-            logging.info("Target path already exists: %s", target_path)
-
-
-def sync_target(src: str, tgt: str, paths: List[str]) -> None:
-    """Sync target paths."""
-    logging.info("Syncing: %s", tgt)
-    for pth in paths:
-        target_path = os.path.join(tgt, pth)
-        if os.path.exists(target_path):
-            logging.info("Target path already exists: %s", target_path)
-            logging.info("Syncing files from source to target")
+                if user_input.lower() != "y":
+                    sys.exit(1)
 
 
 def write_file(act: str, src: str, tgt: str, paths: List[str]) -> None:
     """Write files based on the specified action."""
+
+    def backup_target(src: str, tgt: str, paths: List[str]) -> None:
+        logging.getLogger().setLevel(logging.CRITICAL)
+        """Execute backup of target paths."""
+        for pth in paths:
+            target_path = os.path.join(tgt, pth)
+            logging.debug("Processing path: %s", target_path)
+            if os.path.exists(target_path):
+                logging.info("Backing up target path: %s", target_path)
+                # Construct backup_path relative to CFG_BACKUP_DIR
+                relative_path = os.path.relpath(target_path, start=tgt)
+                backup_path = os.path.join(CFG_BACKUP_DIR, dot_name, src, relative_path)
+                logging.debug("Backup path: %s", backup_path)
+                if os.path.abspath(target_path) == os.path.abspath(backup_path):
+                    logging.warning(
+                        "Source and backup paths are the same: %s", target_path
+                    )
+                    continue
+                os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+                if os.path.isdir(target_path):
+                    logging.debug(
+                        "Copying directory %s to %s", target_path, backup_path
+                    )
+                    shutil.copytree(
+                        target_path, backup_path, symlinks=True, dirs_exist_ok=True
+                    )
+                else:
+                    logging.debug("Copying file %s to %s", target_path, backup_path)
+                    shutil.copy2(target_path, backup_path)
+            else:
+                logging.warning("Target path does not exist: %s", target_path)
+        logging.getLogger().setLevel(logging.INFO)
+
+    def preserve_target(src: str, tgt: str, paths: List[str]) -> None:
+        """Preserve existing target paths."""
+        for pth in paths:
+            source_path = os.path.join(source_root_path, src, pth)
+            target_path = os.path.join(tgt, pth)
+
+            if not os.path.exists(source_path):
+                logging.warning("Source path does not exist: %s", source_path)
+                continue
+
+            if os.path.exists(target_path):
+                logging.info("Preserving target path :  %s", target_path)
+                continue
+            else:
+                logging.info("Populating target path: %s", target_path)
+                if os.path.isdir(source_path):
+                    shutil.copytree(source_path, target_path, symlinks=True)
+                else:
+                    shutil.copy2(source_path, target_path)
+
+    def overwrite_target(src: str, tgt: str, paths: List[str]) -> None:
+        """Overwrite target paths."""
+        for pth in paths:
+            source_path = os.path.join(source_root_path, src, pth)
+            target_path = os.path.join(tgt, pth)
+
+            if not os.path.exists(source_path):
+                logging.warning("Source path does not exist: %s", source_path)
+                continue
+            logging.info("Overwriting: %s", target_path)
+            if os.path.isdir(source_path):
+                if os.path.exists(target_path):
+                    shutil.rmtree(target_path)
+                shutil.copytree(source_path, target_path, symlinks=True)
+            else:
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                shutil.copy2(source_path, target_path)
+
+    def sync_target(src: str, tgt: str, paths: List[str]) -> None:
+        """Sync target paths."""
+        for pth in paths:
+            source_path = os.path.join(source_root_path, src, pth)
+            target_path = os.path.join(tgt, pth)
+
+            if not os.path.exists(source_path):
+                logging.warning("Source path does not exist: %s", source_path)
+                continue
+
+            logging.info("Syncing files from source to target: %s", target_path)
+            if os.path.isdir(source_path):
+                if os.path.exists(target_path):
+                    shutil.rmtree(target_path)
+                shutil.copytree(source_path, target_path, symlinks=True)
+            else:
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                shutil.copy2(source_path, target_path)
+
+    # check if the inputs are valid
+    if not src or not tgt or not paths:
+        logging.warning("Skipping due to missing source, target or paths")
+        return
+
     backup_target(src, tgt, paths)
-    # if act == "preserve":
-    #     preserve_target(src, tgt, paths)
-    # elif act == "overwrite":
-    #     overwrite_target(src, tgt, paths)
-    # elif act == "sync":
-    #     sync_target(src, tgt, paths)
-    # else:
-    #     logging.warning(f"Skipping due to unknown action: {act}")
+    if act == "preserve":
+        preserve_target(src, tgt, paths)
+    elif act == "overwrite":
+        overwrite_target(src, tgt, paths)
+    elif act == "sync":
+        sync_target(src, tgt, paths)
+    else:
+        logging.warning(f"Skipping due to unknown act: {act}")
 
 
 def read_toml(file_path: str) -> Dict[str, Any]:
@@ -183,7 +220,7 @@ def filter_deps(
     return {k: v for k, v in filtered_deps.items() if v}
 
 
-def get_all_deps(data: Dict[str, Any]) -> Dict[str, List[str]]:
+def fetch_all_deps(data: Dict[str, Any]) -> Dict[str, List[str]]:
     """Get all dependencies from the provided data."""
     all_deps = data.get("dependency", {})
     dot_files = data.get("dots", [])
@@ -199,94 +236,104 @@ def get_all_deps(data: Dict[str, Any]) -> Dict[str, List[str]]:
     return all_deps
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        logging.error("Usage: python3 deez-dots.py <path_to_toml_file>")
-        sys.exit(1)
-
-    filePath = os.path.realpath(sys.argv[1])
-    rootPath = os.path.dirname(filePath)
-    if not os.path.isfile(filePath):
-        logging.error("The file '%s' does not exist.", filePath)
-        sys.exit(1)
-
-    logging.info("Reading file: %s", filePath)
-    sysPacMan = available_managers()
-    mainData = read_toml(filePath)
-    mainAction = mainData.get("default_action")
-    startCmd = mainData.get("start_command")
-    PacMan = mainData.get("package_manager", sysPacMan)
-    endCmd = mainData.get("end_command")
-    dotsArr = mainData.get("dots", [])
-
-    if not PacMan or PacMan in ["", "auto", None, [""]]:
-        PacMan = sysPacMan
-
-    Deps = filter_deps(PacMan, get_all_deps(mainData))
-
-    logging.info("Expected package manager: %s", PacMan)
-    if not are_deps_installed(Deps):
+def resolve_package_managers():
+    global package_manager
+    if not package_manager or package_manager in ["", "auto", None, [""]]:
+        package_manager = available_package_managers
+    Deps = filter_deps(package_manager, fetch_all_deps(main_config))
+    logging.info("Expected package manager: %s", package_manager)
+    if not check_dependencies(Deps):
         logging.error("Missing dependencies: %s", Deps)
         sys.exit(1)
 
-    execute_commands(startCmd)
 
-    if not dotsArr:
+def deploy_files(files: List[Dict[str, Any]]):
+    for file_action in files:
+        action = file_action.get("action", default_action)
+        source_root = file_action.get("source_root")
+        if source_root and "$" in source_root:
+            source_root = os.path.expandvars(source_root)
+        target_root = file_action.get("target_root")
+        if target_root and "$" in target_root:
+            target_root = os.path.expandvars(target_root)
+        paths = file_action.get("paths")
+        if isinstance(paths, str):
+            paths = [paths]
+        if paths and any("$" in path for path in paths):
+            paths = [os.path.expandvars(path) for path in paths]
+
+        if not source_root:
+            logging.warning("Skipping due to missing source_root for paths: %s", paths)
+            continue
+        if not target_root:
+            logging.warning("Skipping due to missing target_root for paths: %s", paths)
+            continue
+        # full_source_path = os.path.join(source_root_path, source_root)
+
+        write_file(action, source_root, target_root, paths)
+
+
+if __name__ == "__main__":
+    # if len(sys.argv) < 2:
+    # logging.error("Usage: python3 deez-dots.py <path_to_toml_file>")
+    # sys.exit(1)
+
+    if len(sys.argv) < 2:
+        config_file_path = os.path.expanduser("~/The HyDE Project/HyDE/hyde.toml")
+    else:
+        arg_1 = sys.argv[1]
+        config_file_path = os.path.realpath(arg_1)
+
+    source_root_path = os.path.dirname(config_file_path)
+    if not os.path.isfile(config_file_path):
+        logging.error("The file '%s' does not exist.", config_file_path)
+        sys.exit(1)
+
+    logging.info("Reading file: %s", config_file_path)
+    available_package_managers = available_managers()
+    main_config = read_toml(config_file_path)
+    mainAction = main_config.get("default_action")
+    start_cmd = main_config.get("start_command")
+    package_manager = main_config.get("package_manager", available_package_managers)
+    end_cmd = main_config.get("end_command")
+    declared_dots = main_config.get("dots", [])
+
+    # Dependency resolution
+    resolve_package_managers()
+    execute_commands(start_cmd)
+    logging.info("____________________________")
+
+    # preparation
+    if not declared_dots:
         logging.error("No dots declared in the file.")
         sys.exit(1)
 
     if not os.path.exists(CFG_BACKUP_DIR):
         os.makedirs(CFG_BACKUP_DIR, exist_ok=True)
 
-    for dot_name in dotsArr:
+    # evaluate dotfiles
+    for dot_name in declared_dots:
         logging.info("Deploying %s", dot_name)
-        dotData = mainData.get(dot_name)
-        defPreCmd = dotData.get("pre_command")
-        if isinstance(defPreCmd, str):
-            defPreCmd = [defPreCmd]
+        dotData = main_config.get(dot_name)
+        default_pre_cmd = dotData.get("pre_command")
+        if isinstance(default_pre_cmd, str):
+            default_pre_cmd = [default_pre_cmd]
 
-        defPostCmd = dotData.get("post_command")
-        if isinstance(defPostCmd, str):
-            defPostCmd = [defPostCmd]
+        default_post_cmd = dotData.get("post_command")
+        if isinstance(default_post_cmd, str):
+            default_post_cmd = [default_post_cmd]
 
-        defAction = dotData.get("action", mainAction)
+        default_action = dotData.get("action", mainAction)
         files = dotData.get("files")
 
         deps = dotData.get("dependency")
-        deps = filter_deps(PacMan, deps)
-        if not are_deps_installed(deps):
+        deps = filter_deps(package_manager, deps)
+        if not check_dependencies(deps):
             logging.warning("Skipping due to missing dependencies: %s", deps)
             continue
 
-        execute_commands(defPreCmd)
+        execute_commands(default_pre_cmd)
+        deploy_files(files)
 
-        for fileActions in files:
-            action = fileActions.get("action", defAction)
-            source_root = fileActions.get("source_root")
-            if source_root and "$" in source_root:
-                source_root = os.path.expandvars(source_root)
-            target_root = fileActions.get("target_root")
-            if target_root and "$" in target_root:
-                target_root = os.path.expandvars(target_root)
-            paths = fileActions.get("paths")
-            if isinstance(paths, str):
-                paths = [paths]
-            if paths and any("$" in path for path in paths):
-                paths = [os.path.expandvars(path) for path in paths]
-
-            if not source_root:
-                logging.warning(
-                    "Skipping due to missing source_root for paths: %s", paths
-                )
-                continue
-            if not target_root:
-                logging.warning(
-                    "Skipping due to missing target_root for paths: %s", paths
-                )
-                continue
-
-            sourcePath = os.path.join(rootPath, source_root)
-            write_file(action, sourcePath, target_root, paths)
-
-        execute_commands(defPostCmd)
+        execute_commands(default_post_cmd)
         logging.info("____________________________")
