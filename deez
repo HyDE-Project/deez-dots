@@ -12,19 +12,24 @@ import logging
 import time
 import argparse
 
+package_manager_commands = {
+    "pacman": {"query": "pacman -Qs", "install": "sudo pacman -S"},
+    "yay": {"query": "yay -Qs", "install": "yay -S"},
+    "paru": {"query": "paru -Qs", "install": "paru -S"},
+    "dnf": {"query": "dnf list installed", "install": "sudo dnf install"},
+    "apt": {"query": "apt list --installed", "install": "sudo apt install"},
+    "flatpak": {
+        "query": "flatpak list --app --columns application | grep ",
+        "install": "flatpak install",
+    },
+}
 
+
+# Example usage
 def pacman_query(package_managers: List[str], package: str) -> bool:
     """Check if a package is installed using the package manager."""
-    query_commands = {
-        "pacman": "pacman -Qs",
-        "yay": "yay -Qs",
-        "paru": "paru -Qs",
-        "dnf": "dnf list installed",
-        "apt": "apt list --installed",
-        "flatpak": "flatpak list --app --columns application | grep ",
-    }
     for manager in package_managers:
-        query_cmd = query_commands.get(manager)
+        query_cmd = package_manager_commands.get(manager, {}).get("query")
         if query_cmd:
             try:
                 result = subprocess.run(
@@ -47,7 +52,7 @@ def check_dependencies(dependency_list: Dict[str, List[str]]) -> bool:
     for manager, packages in dependency_list.items():
         for package in packages:
             if shutil.which(package):
-                logging.info(f"Package command '{package}' is available.")
+                logging.debug(f"Package command '{package}' is available.")
                 continue
             if not pacman_query([manager], package):
                 logging.warning(f"Package '{package}' is not installed.")
@@ -63,13 +68,14 @@ def available_managers() -> List[str]:
 
 def execute_commands(commands: List[Optional[str]]) -> None:
     """Execute a list of commands."""
+
+    if source_root_path:
+        os.chdir(source_root_path)
+
     for command in commands:
         if command:
             try:
-                result = subprocess.run(
-                    command, shell=True, check=True, text=True, capture_output=True
-                )
-                logging.info(result.stdout.strip())
+                subprocess.run(command, shell=True, check=True, text=True)
             except subprocess.CalledProcessError as e:
                 logging.error("Error executing command '%s': %s", command, e)
                 user_input = input(
@@ -89,10 +95,12 @@ def write_file(act: str, src: str, tgt: str, paths: List[str]) -> None:
             target_path = os.path.join(tgt, pth)
             logging.debug("Processing path: %s", target_path)
             if os.path.exists(target_path):
-                logging.info("Backing up target path: %s", target_path)
+                logging.debug("Backing up target path: %s", target_path)
                 # Construct backup_path relative to CFG_BACKUP_DIR
                 relative_path = os.path.relpath(target_path, start=tgt)
-                backup_path = os.path.join(CFG_BACKUP_DIR, dot_name, src, relative_path)
+                backup_path = os.path.join(
+                    CFG_BACKUP_DIR, dot_index, src, relative_path
+                )
                 logging.debug("Backup path: %s", backup_path)
                 if os.path.abspath(target_path) == os.path.abspath(backup_path):
                     logging.warning(
@@ -124,10 +132,10 @@ def write_file(act: str, src: str, tgt: str, paths: List[str]) -> None:
                 continue
 
             if os.path.exists(target_path):
-                logging.info("Preserving target path :  %s", target_path)
+                logging.debug("Preserving target path :  %s", target_path)
                 continue
             else:
-                logging.info("Populating target path: %s", target_path)
+                logging.debug("Populating target path: %s", target_path)
                 if os.path.isdir(source_path):
                     shutil.copytree(source_path, target_path, symlinks=True)
                 else:
@@ -142,7 +150,7 @@ def write_file(act: str, src: str, tgt: str, paths: List[str]) -> None:
             if not os.path.exists(source_path):
                 logging.warning("Source path does not exist: %s", source_path)
                 continue
-            logging.info("Overwriting: %s", target_path)
+            logging.debug("Overwriting: %s", target_path)
             if os.path.isdir(source_path):
                 if os.path.exists(target_path):
                     shutil.rmtree(target_path)
@@ -161,7 +169,7 @@ def write_file(act: str, src: str, tgt: str, paths: List[str]) -> None:
                 logging.warning("Source path does not exist: %s", source_path)
                 continue
 
-            logging.info("Syncing files from source to target: %s", target_path)
+            logging.debug("Syncing files from source to target: %s", target_path)
             if os.path.isdir(source_path):
                 if os.path.exists(target_path):
                     shutil.rmtree(target_path)
@@ -170,9 +178,17 @@ def write_file(act: str, src: str, tgt: str, paths: List[str]) -> None:
                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
                 shutil.copy2(source_path, target_path)
 
-    # check if the inputs are valid
-    if not src or not tgt or not paths:
-        logging.warning("Skipping due to missing source, target or paths")
+    def validate_params(src: str, tgt: str, paths: List[str]) -> bool:
+        for argv in [src, tgt, paths]:
+            if not argv:
+                logging.warning("Skipping due to missing argument: %s", argv)
+                logging.info(f"Source: {src}")
+                logging.info(f"Target: {tgt}")
+                logging.info(f"Paths: {paths}")
+                return False
+        return True
+
+    if not validate_params(src, tgt, paths):
         return
 
     backup_target(src, tgt, paths)
@@ -245,7 +261,7 @@ def resolve_package_managers(pac_man):
         sys.exit(1)
     return pac_man
 
-    logging.info("Expected package manager: %s", pac_man)
+    logging.debug("Expected package manager: %s", pac_man)
 
 
 def deploy_files(files: List[Dict[str, Any]]):
@@ -279,71 +295,177 @@ def handle_git(url: str):
     """Handle Git repository information."""
 
     def git_clone(url: str, target_dir: str):
-        subprocess.run(["git", "clone", "--depth", "1", url, target_dir], check=True)
+        if not url.startswith("http"):
+            url = "https://" + url
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", url, target_dir],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        logging.debug("Git clone output: %s", result.stdout)
+        logging.debug("Git clone errors: %s", result.stderr)
 
     def git_fetch(repo_path: str):
-        subprocess.run(["git", "-C", repo_path, "fetch", "--all"], check=True)
+        result = subprocess.run(
+            ["git", "-C", repo_path, "fetch", "--all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        logging.debug("Git fetch output: %s", result.stdout)
+        logging.debug("Git fetch errors: %s", result.stderr)
+
+    def git_pull(repo_path: str, target_branch: str):
+        result = subprocess.run(
+            ["git", "-C", repo_path, "pull", "origin", target_branch],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        logging.debug("Git pull output: %s", result.stdout)
+        logging.debug("Git pull errors: %s", result.stderr)
+
+    def git_checkout_tag(repo_path: str, tag: str):
+        result = subprocess.run(
+            ["git", "-C", repo_path, "checkout", "tags/" + tag],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        logging.debug("Git checkout tag output: %s", result.stdout)
+        logging.debug("Git checkout tag errors: %s", result.stderr)
 
     def git_checkout(repo_path: str, branch: str):
-        subprocess.run(["git", "-C", repo_path, "checkout", branch], check=True)
+        result = subprocess.run(
+            ["git", "-C", repo_path, "checkout", branch],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        logging.debug("Git checkout output: %s", result.stdout)
+        logging.debug("Git checkout errors: %s", result.stderr)
 
-    target_branch = main_config.get("git_branch", "main")
-    version = main_config.get("version", None)
+    def is_release(url: str):
+        return url.endswith(".tar.gz") or url.endswith(".zip")
+
     clone_dir = os.path.join(
         os.getenv("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
         "deez-dots",
         "clones",
     )
-
-    # Extract repository owner and name from URL
-    repo_owner = url.split("/")[-2]
-    repo_name = url.split("/")[-1].replace(".git", "")
     global source_root_path
-    if version:
+
+    if url.startswith("http"):
+        url = url.split("://", 1)[1]
+
+    if is_release(url):
+        version = (
+            url.split("/")[-1].split(".tar.gz")[0]
+            if ".tar.gz" in url
+            else url.split("/")[-1].split(".zip")[0]
+        )
+        repo_owner = url.split("/")[1]
+        repo_name = url.split("/")[2]
+        print(f"Repository Owner: {repo_owner}")
+        print(f"Repository Name: {repo_name}")
+        print(f"Version: {version}")
+
         source_root_path = os.path.join(
             clone_dir, f"{repo_owner.lower()}.{repo_name.lower()}.{version}"
         )
+        if not os.path.exists(source_root_path):
+            os.makedirs(source_root_path, exist_ok=True)
+            tarball_path = os.path.join(source_root_path, f"{version}.tar.gz")
+            subprocess.run(["curl", "-L", url, "-o", tarball_path], check=True)
+            subprocess.run(
+                [
+                    "tar",
+                    "-xzf",
+                    tarball_path,
+                    "-C",
+                    source_root_path,
+                    "--strip-components=1",
+                ],
+                check=True,
+            )
+
     else:
+        # Extract repository owner and name from URL
+        repo_owner = url.split("/")[1]
+        repo_name = url.split("/")[2].replace(".git", "")
+        target_branch = main_config.get("git_branch", "main")
+        print(f"Repository Owner: {repo_owner}")
+        print(f"Repository Name: {repo_name}")
+        print(f"Branch: {target_branch}")
+
         source_root_path = os.path.join(
             clone_dir, f"{repo_owner.lower()}.{repo_name.lower()}"
         )
+        # Clone the repository if it doesn't exist
+        if not os.path.exists(source_root_path):
+            git_clone(url, source_root_path)
+        # Fetch the latest changes
+        git_fetch(source_root_path)
+        # Pull the latest changes
+        git_pull(source_root_path, target_branch)
+        # Checkout the specified branch
+        git_checkout(source_root_path, target_branch)
 
-    # Clone the repository if it doesn't exist
-    if not os.path.exists(source_root_path):
-        git_clone(url, source_root_path)
-    # Fetch the latest changes
-    git_fetch(source_root_path)
-    # Checkout the specified branch
-    git_checkout(source_root_path, target_branch)
 
-    branches = subprocess.run(
-        ["git", "-C", source_root_path, "branch", "-r"],
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.splitlines()
-    # Get remote branches
-    remote_branches = subprocess.run(
-        ["git", "-C", source_root_path, "branch", "-r"],
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.splitlines()
-    print(f"Remote Branches: {remote_branches}")
+def install_packages(dependencies: Dict[str, List[str]]) -> None:
+    """Install all dependencies."""
+    for manager, packages in dependencies.items():
+        if not packages:
+            print(f"No packages to install for {manager}")
+            continue
+        print(f"Installing packages for {manager}: {packages}")
+        install_cmd = package_manager_commands.get(manager, {}).get("install")
+        query_cmd = package_manager_commands.get(manager, {}).get("query")
 
-    # Get tags
-    tags = subprocess.run(
-        ["git", "-C", source_root_path, "tag"],
-        check=True,
-        text=True,
-        capture_output=True,
-    ).stdout.splitlines()
+        if not install_cmd:
+            logging.error("No install command found for package manager: %s", manager)
+            continue
 
-    print(f"Repository Owner: {repo_owner}")
-    print(f"Repository Name: {repo_name}")
-    print(f"Branches: {branches}")
-    print(source_root_path)
-    print(f"Tags: {tags}")
+        if not query_cmd:
+            logging.error("No query command found for package manager: %s", manager)
+            continue
+
+        packages_to_install = []
+        for package in packages:
+            try:
+                result = subprocess.run(
+                    f"{query_cmd} {package}",
+                    shell=True,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                if result.stdout:
+                    logging.debug(
+                        f"Package '{package}' is already installed using {manager}."
+                    )
+                else:
+                    packages_to_install.append(package)
+            except subprocess.CalledProcessError as e:
+                logging.debug(f"Package '{package}' is not installed: {e}")
+                packages_to_install.append(package)
+
+        if packages_to_install:
+            try:
+                subprocess.run(
+                    f"{install_cmd} {' '.join(packages_to_install)}",
+                    shell=True,
+                    check=True,
+                )
+                logging.info(
+                    f"Packages installed successfully using {manager}: {packages_to_install}"
+                )
+            except subprocess.CalledProcessError as e:
+                logging.error("Error installing packages: %s", e)
+                sys.exit(1)
+        else:
+            logging.info(f"All packages are already installed for {manager}.")
 
 
 def main():
@@ -353,6 +475,9 @@ def main():
     )
     parser.add_argument(
         "-s", "--source", type=str, help="Path to the source root directory"
+    )
+    parser.add_argument(
+        "-i", "--install", action="store_true", help="Install all dependencies"
     )
     args = parser.parse_args()
 
@@ -370,35 +495,38 @@ def main():
         logging.error("The file '%s' does not exist.", config_file_path)
         sys.exit(1)
 
-    logging.info("Reading file: %s", config_file_path)
+    logging.debug("Reading file: %s", config_file_path)
     available_package_managers = available_managers()
     main_config = read_toml(config_file_path)
     git_url = main_config.get("git")
     if git_url:
         handle_git(git_url)
-    print(source_root_path)
 
-    mainAction = main_config.get("default_action")
+    main_action = main_config.get("default_action")
     start_cmd = main_config.get("start_command")
     end_cmd = main_config.get("end_command")
     package_manager = main_config.get("package_manager", available_package_managers)
-    declared_dots = main_config.get("dots", [])
+    available_dotfiles = main_config.get("dots", [])
 
     # Dependency resolution
     package_manager = resolve_package_managers(package_manager)
 
     # Handle all dependencies
-    # TODO make func to install all dependenciess
     all_dependencies = filter_deps(package_manager, fetch_all_deps(main_config))
+    if args.install:
+        print("Dependencies: ", all_dependencies)
+        install_packages(all_dependencies)
+
     if not check_dependencies(all_dependencies):
         logging.error("Missing dependencies: %s", all_dependencies)
         sys.exit(1)
+    print("All dependencies are installed.")
 
     execute_commands(start_cmd)
     logging.info("____________________________")
 
     # preparation
-    if not declared_dots:
+    if not available_dotfiles:
         logging.error("No dots declared in the file.")
         sys.exit(1)
 
@@ -414,10 +542,10 @@ def main():
         os.makedirs(CFG_BACKUP_DIR, exist_ok=True)
 
     # evaluate dotfiles
-    global dot_name
-    for dot_name in declared_dots:
-        logging.info("Deploying %s", dot_name)
-        dot_data = main_config.get(dot_name)
+    global dot_index
+    for dot_index in available_dotfiles:
+        logging.info("Deploying %s", dot_index)
+        dot_data = main_config.get(dot_index)
         default_pre_cmd = dot_data.get("pre_command")
         if isinstance(default_pre_cmd, str):
             default_pre_cmd = [default_pre_cmd]
@@ -427,7 +555,7 @@ def main():
             default_post_cmd = [default_post_cmd]
 
         global default_action
-        default_action = dot_data.get("action", mainAction)
+        default_action = dot_data.get("action", main_action)
         files = dot_data.get("files")
 
         get_deps = dot_data.get("dependency")
