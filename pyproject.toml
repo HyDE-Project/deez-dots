@@ -22,3 +22,6 @@ Source = "https://github.com/HyDE-Project/deez-dots"
 
 [project.scripts]
 deez = "deez:main"
+
+[tool.setuptools]
+py-modules = ["deez"]

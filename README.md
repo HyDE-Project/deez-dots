@@ -20,10 +20,30 @@ python -m deez --version
 python -m deez dots --config ./example/dots.toml --deploy
 ```
 
-Or install directly from GitHub with pip:
+Or install directly from GitHub without using a curl-to-shell bootstrap:
+
+With `pip`:
 
 ```bash
 python -m pip install git+https://github.com/HyDE-Project/deez-dots.git
+```
+
+With `pipx`:
+
+```bash
+pipx install git+https://github.com/HyDE-Project/deez-dots.git
+```
+
+With `uv` as a persistent tool install:
+
+```bash
+uv tool install git+https://github.com/HyDE-Project/deez-dots.git
+```
+
+With `uv` as a one-off run:
+
+```bash
+uv tool run --from git+https://github.com/HyDE-Project/deez-dots.git deez --version
 ```
 
 Then run it as:
