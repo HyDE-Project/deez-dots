@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import io
 import os
 import sys
@@ -7,13 +8,19 @@ import tempfile
 import unittest
 import subprocess
 from contextlib import redirect_stdout
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
-from importlib.machinery import SourceFileLoader
-
-deez_module = SourceFileLoader("deez_module", str(SCRIPT_DIR / "deez")).load_module()
+DEEZ_MODULE_PATH = SCRIPT_DIR / "deez"
+deez_loader = SourceFileLoader("deez_module", str(DEEZ_MODULE_PATH))
+deez_spec = importlib.util.spec_from_loader(deez_loader.name, deez_loader)
+if deez_spec is None:
+    raise ImportError(f"Unable to load deez module from {DEEZ_MODULE_PATH}")
+deez_module = importlib.util.module_from_spec(deez_spec)
+sys.modules[deez_spec.name] = deez_module
+deez_loader.exec_module(deez_module)
 DEEZ_SCRIPT = SCRIPT_DIR / "deez"
 EXAMPLE_CONFIG = SCRIPT_DIR / "example" / "temp.toml"
 
@@ -230,7 +237,7 @@ class TestDeezCLI(unittest.TestCase):
     def test_resolve_config_dot_targets_renders_dot_descriptions(self):
         cli = self._make_cli(
             {
-                "global": {"owner": "hyde_project"},
+                "global": {"owner": "hyde_project", "description": "Shared desktop config for HyDE test fixtures"},
                 "kitty": {"paths": ["kitty.conf"], "description": "Kitty terminal config"},
                 "hyprland": {"paths": ["hyprland.conf"], "description": "Hyprland compositor config"},
             }
@@ -241,8 +248,10 @@ class TestDeezCLI(unittest.TestCase):
             selected = cli._resolve_config_dot_targets("bundle")
 
         self.assertEqual(selected, ["kitty"])
+        self.assertIn("dots (Shared desktop config for HyDE test fixtures) by owner = no. entries", output.getvalue())
         self.assertIn("Kitty terminal config", output.getvalue())
         self.assertIn("Hyprland compositor config", output.getvalue())
+        self.assertNotIn("desc:", output.getvalue())
 
     def test_cache_list_no_cache(self):
         result = run_deez(["cache"], env=self.env)
@@ -474,7 +483,7 @@ class TestDeezCLI(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
-    def test_config_load_prints_global_description(self):
+    def test_config_load_does_not_print_global_description_for_deps_check(self):
         config_path = Path(self.tmpdir.name) / "described-dots.toml"
         config_path.write_text(
             '[global]\n'
@@ -489,7 +498,7 @@ class TestDeezCLI(unittest.TestCase):
         result = self.run_cli(["deps", "--check", "--config", str(config_path)])
 
         self.assertEqual(result.returncode, 0)
-        self.assertIn("Config description: Shared desktop config for HyDE test fixtures", result.stdout)
+        self.assertNotIn("Config description:", result.stdout)
 
     def test_dots_source_override_uses_existing_non_git_path(self):
         config_path = self._write_git_config()

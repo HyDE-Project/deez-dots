@@ -2235,11 +2235,18 @@ class DeezCLI:
             return bool(stdin and stdout and stdin.isatty() and stdout.isatty())
         except Exception:
             return False
+
     def _dot_description(self, dot: str) -> str:
         dot_data = self.main_config.get(dot, {})
         if not isinstance(dot_data, dict):
             return ""
         return _normalize_description(dot_data.get("description"))
+
+    def _dot_selection_header(self) -> str:
+        global_description = _normalize_description(self.global_config.get("description"))
+        if global_description:
+            return f"dots ({global_description}) by owner = no. entries"
+        return "dots by owner = no. entries"
 
     def _dot_selection_label(self, dot: str) -> str:
         dot_data = self.main_config.get(dot, {})
@@ -2249,10 +2256,10 @@ class DeezCLI:
         if not file_count and dot_data.get("paths"):
             file_count = 1
         owner = dot_data.get("owner") or self.global_config.get("owner") or "?"
-        label = f"{dot:<22} owner: {owner:<28} file entries: {file_count}"
+        label = f"{dot} by {owner} = {file_count}"
         description = self._dot_description(dot)
         if description:
-            label = f"{label}  desc: {description}"
+            label = f"{dot} ({description}) by {owner} = {file_count}"
         return label
 
     def _resolve_config_dot_targets(self, action_label: str) -> List[str]:
@@ -2264,6 +2271,7 @@ class DeezCLI:
             return available
         labels = [self._dot_selection_label(dot) for dot in available]
         UI.plain("\nDiscovered dots:")
+        UI.plain(f"  {self._dot_selection_header()}")
         selected = InteractiveMenu.choose_many(f"Select dots to {action_label}", available, labels=labels)
         if not selected:
             UI.info("Cancelled.")
@@ -3477,12 +3485,6 @@ def main() -> None:
             raise SystemExit(1)
     else:
         main_config = {"global": {}}
-    loaded_global_config = main_config.get("global", {})
-    if isinstance(loaded_global_config, dict):
-        config_description = _normalize_description(loaded_global_config.get("description"))
-        if config_description:
-            UI.info(f"Config description: {config_description}")
-
     global_config = main_config.get("global", {})
     home = os.path.expandvars(global_config.get("home", "$HOME"))
     distribution = global_config.get("distribution", "auto")
