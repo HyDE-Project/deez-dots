@@ -2,6 +2,7 @@ import argparse
 import importlib.util
 import io
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -115,6 +116,20 @@ class TestDeezCLI(unittest.TestCase):
             'paths = [".config/kitty/kitty.conf"]\n'
         )
         return config_path
+
+    def _make_source_archive(self, archive_path, files):
+        archive_path = Path(archive_path)
+        stage_dir = Path(self.tmpdir.name) / f"source-archive-{archive_path.stem}"
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir)
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        for rel_path, content in files.items():
+            file_path = stage_dir / rel_path
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(content)
+        with tarfile.open(archive_path, "w:gz") as tar:
+            tar.add(stage_dir, arcname="payload")
+        return archive_path
 
     def _write_installed_manifest(self, section, owner="hyde_project", version=None, files=None, extra_meta=None):
         dots_dir = Path(self.xdg_data) / "deez" / "dots"
@@ -732,6 +747,74 @@ class TestDeezCLI(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn(f"Source directory '{source_override}' does not exist and no git URL provided.", output)
+
+    def test_dots_package_supports_local_tarball_source(self):
+        archive_path = self._make_source_archive(
+            Path(self.tmpdir.name) / "assets.tar.gz",
+            {".config/kitty/kitty.conf": "font_size 12"},
+        )
+        config_path = Path(self.tmpdir.name) / "tarball-source.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{archive_path}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled kitty ->", result.stdout)
+
+    def test_dots_package_supports_file_url_tarball_source_override(self):
+        archive_path = self._make_source_archive(
+            Path(self.tmpdir.name) / "assets-url.tar.gz",
+            {".config/kitty/kitty.conf": "font_size 12"},
+        )
+        config_path = Path(self.tmpdir.name) / "file-url-source.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path), "--source", archive_path.resolve().as_uri()])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled kitty ->", result.stdout)
+
+    def test_dots_source_override_accepts_git_url(self):
+        config_path = Path(self.tmpdir.name) / "git-url-source.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+        )
+        captured = {}
+
+        class FakeCLI:
+            def __init__(self, _args, _main_config, source_dir, *_rest, **_kwargs):
+                captured["source_dir"] = source_dir
+
+            def run(self):
+                return None
+
+        with patch.object(deez_module, "DeezCLI", FakeCLI), patch.object(deez_module.GitHandler, "prepare_git_source", return_value="/tmp/deez-git-source") as prepare_git_source:
+            self.run_main(["deez", "dots", "--package", "--config", str(config_path), "--source", "https://github.com/HyDE-Project/HyDE.git"])
+
+        prepare_git_source.assert_called_once_with("https://github.com/HyDE-Project/HyDE.git", "main")
+        self.assertEqual(captured["source_dir"], "/tmp/deez-git-source")
 
     def test_root_global_overrides_before_subcommand_override_config(self):
         config_path = self._write_git_config(git_url="https://github.com/example/original.git", git_branch="main")

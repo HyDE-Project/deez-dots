@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from fnmatch import fnmatchcase
@@ -1939,6 +1940,117 @@ class GitHandler:
         success, out, _ = self.runner(["git", "-C", str(repo_path), "config", "--get", f"remote.{remote}.url"])
         return out.strip() if success else ""
 
+    @staticmethod
+    def is_source_url(source: Optional[Union[str, Path]]) -> bool:
+        parsed = urllib.parse.urlparse(str(source or "").strip())
+        return parsed.scheme in ("http", "https", "file")
+
+    @staticmethod
+    def is_release(url: str) -> bool:
+        lowered = str(url or "").strip().lower()
+        return lowered.endswith(".tar.gz") or lowered.endswith(".tgz") or lowered.endswith(".tar") or lowered.endswith(".zip")
+
+    @staticmethod
+    def file_url_to_path(url: str) -> Path:
+        parsed = urllib.parse.urlparse(url)
+        path = urllib.request.url2pathname(parsed.path or "")
+        if parsed.netloc and parsed.netloc not in ("", "localhost"):
+            path = f"//{parsed.netloc}{path}"
+        return Path(path).expanduser()
+
+    @staticmethod
+    def archive_cache_key(source: Union[str, Path]) -> str:
+        source_text = str(source).strip()
+        if not source_text:
+            return "source"
+        parsed = urllib.parse.urlparse(source_text)
+        if parsed.scheme == "file":
+            local_path = GitHandler.file_url_to_path(source_text)
+            if local_path.exists():
+                stat = local_path.stat()
+                source_text = f"file:{local_path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
+        else:
+            candidate = Path(os.path.expandvars(os.path.expanduser(source_text)))
+            if candidate.exists() and candidate.is_file():
+                stat = candidate.stat()
+                source_text = f"file:{candidate.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
+        digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+        return digest[:16]
+
+    @staticmethod
+    def _archive_filename(source: Union[str, Path]) -> str:
+        source_text = str(source).strip()
+        parsed = urllib.parse.urlparse(source_text)
+        if parsed.scheme:
+            name = Path(parsed.path).name
+        else:
+            name = Path(source_text).name
+        return name or "source.tar.gz"
+
+    @staticmethod
+    def _discover_extracted_root(extract_root: Union[str, Path]) -> Path:
+        root = Path(extract_root)
+        entries = [entry for entry in root.iterdir() if entry.name != "__MACOSX"] if root.exists() else []
+        if len(entries) == 1 and entries[0].is_dir():
+            return entries[0]
+        return root
+
+    @staticmethod
+    def _extract_archive(archive_path: Union[str, Path], extract_root: Union[str, Path]) -> None:
+        archive = Path(archive_path)
+        destination = Path(extract_root)
+        destination.mkdir(parents=True, exist_ok=True)
+        archive_name = archive.name.lower()
+        if archive_name.endswith(".zip"):
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(destination)
+            return
+        with tarfile.open(archive, "r:*") as tar:
+            tar.extractall(path=destination)
+
+    def prepare_archive_source(self, source: Union[str, Path]) -> str:
+        source_text = str(source).strip()
+        cache_key = self.archive_cache_key(source_text)
+        cache_root = self.source_cache_dir / "archives" / cache_key
+        extract_root = cache_root / "content"
+        archive_name = self._archive_filename(source_text)
+        archive_path = cache_root / archive_name
+
+        if extract_root.exists() and any(extract_root.iterdir()):
+            return str(self._discover_extracted_root(extract_root))
+
+        shutil.rmtree(cache_root, ignore_errors=True)
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+        if self.is_source_url(source_text):
+            parsed = urllib.parse.urlparse(source_text)
+            if parsed.scheme == "file":
+                local_archive = self.file_url_to_path(source_text)
+                if not local_archive.is_file():
+                    raise RuntimeError(f"Source archive '{local_archive}' does not exist.")
+                shutil.copy2(local_archive, archive_path)
+            else:
+                urllib.request.urlretrieve(source_text, str(archive_path))
+        else:
+            local_archive = Path(os.path.expandvars(os.path.expanduser(source_text)))
+            if not local_archive.is_file():
+                raise RuntimeError(f"Source archive '{local_archive}' does not exist.")
+            shutil.copy2(local_archive, archive_path)
+
+        self._extract_archive(archive_path, extract_root)
+        return str(self._discover_extracted_root(extract_root))
+
+    def prepare_git_source(self, git_url: str, target_branch: str) -> str:
+        repo_owner, repo_name = self.get_git_owner_name(git_url)
+        cache_root = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+        source_root_path = Path(self.source_cache_path(cache_root, repo_owner, repo_name, target_branch))
+        if not source_root_path.exists():
+            self.git_clone(git_url, source_root_path, target_branch)
+        self.git_fetch(source_root_path, target_branch)
+        self.git_pull(source_root_path, target_branch)
+        self.git_checkout(source_root_path, target_branch)
+        return str(source_root_path)
+
     def prepare_source(
         self,
         source_dir: Union[str, Path],
@@ -1947,13 +2059,36 @@ class GitHandler:
         *,
         explicit_source_path: bool = False,
     ) -> str:
-        source_path = Path(source_dir).expanduser()
+        source_text = os.path.expandvars(os.path.expanduser(str(source_dir or "").strip()))
+        if explicit_source_path and source_text:
+            if self.is_source_url(source_text):
+                if self.is_release(source_text):
+                    return self.prepare_archive_source(source_text)
+                if urllib.parse.urlparse(source_text).scheme == "file":
+                    local_path = self.file_url_to_path(source_text)
+                    if local_path.is_dir():
+                        source_text = str(local_path)
+                    elif local_path.is_file() and self.is_release(str(local_path)):
+                        return self.prepare_archive_source(local_path)
+                    else:
+                        raise RuntimeError(f"Source path '{local_path}' is not a directory or supported archive.")
+                else:
+                    return self.prepare_git_source(source_text, target_branch)
+            source_path = Path(source_text).expanduser()
+            if source_path.exists() and source_path.is_file():
+                if self.is_release(str(source_path)):
+                    return self.prepare_archive_source(source_path)
+                raise RuntimeError(f"Source path '{source_path}' is not a directory or supported archive.")
+        else:
+            source_path = Path(source_text).expanduser()
         if source_path.exists():
             if not source_path.is_dir():
                 raise RuntimeError(f"Source path '{source_path}' is not a directory.")
             if not explicit_source_path:
                 if git_url:
-                    self.handle(git_url)
+                    if self.is_release(git_url):
+                        return self.prepare_archive_source(git_url)
+                    return self.prepare_git_source(git_url, target_branch)
                 return str(source_path)
             if not self.is_git_repo(source_path):
                 LOG.debug("Using explicit non-git source path: %s", source_path)
@@ -1980,8 +2115,9 @@ class GitHandler:
         if explicit_source_path:
             self.git_clone(git_url, source_path, target_branch)
             return str(source_path)
-        self.handle(git_url)
-        return str(source_path)
+        if self.is_release(git_url):
+            return self.prepare_archive_source(git_url)
+        return self.prepare_git_source(git_url, target_branch)
 
     @staticmethod
     def get_git_owner_name(git_url: str) -> Tuple[str, str]:
@@ -2047,9 +2183,6 @@ class GitHandler:
                     raise RuntimeError(err2 or out2)
         except Exception:
             raise
-
-    def is_release(self, url: str) -> bool:
-        return url.endswith(".tar.gz") or url.endswith(".zip")
 
     def handle(self, url: str) -> None:
         if url.startswith("http"):
