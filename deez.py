@@ -2266,7 +2266,7 @@ class DeezCLI:
         label = f"{dot} by {owner} = {file_count}"
         description = self._dot_description(dot)
         if description:
-            label = f"{dot} ({description}) by {owner} = {file_count}"
+            label = f"{dot} ({description}) by {owner} = {file_count} entries"
         return label
 
     def _resolve_config_dot_targets(self, action_label: str) -> List[str]:
