@@ -248,10 +248,41 @@ class TestDeezCLI(unittest.TestCase):
             selected = cli._resolve_config_dot_targets("bundle")
 
         self.assertEqual(selected, ["kitty"])
-        self.assertIn("dots (Shared desktop config for HyDE test fixtures) by owner = no. entries", output.getvalue())
+        self.assertIn("Shared desktop config for HyDE test fixtures", output.getvalue())
         self.assertIn("Kitty terminal config", output.getvalue())
         self.assertIn("Hyprland compositor config", output.getvalue())
         self.assertNotIn("desc:", output.getvalue())
+
+    def test_resolve_config_dot_targets_header_ignores_owner_when_description_exists(self):
+        cli = self._make_cli(
+            {
+                "global": {"owner": "hyde_project", "description": "Shared desktop config for HyDE test fixtures"},
+                "kitty": {"paths": ["kitty.conf"]},
+                "hyprland": {"paths": ["hyprland.conf"], "owner": "other_owner"},
+            }
+        )
+
+        output = io.StringIO()
+        with patch.object(deez_module.DeezCLI, "_can_prompt_for_selection", return_value=True), patch("builtins.input", return_value="1"), redirect_stdout(output):
+            cli._resolve_config_dot_targets("bundle")
+
+        self.assertIn("Shared desktop config for HyDE test fixtures", output.getvalue())
+        self.assertNotIn("multiple owners", output.getvalue())
+
+    def test_resolve_config_dot_targets_header_falls_back_to_bundle_owner(self):
+        cli = self._make_cli(
+            {
+                "global": {"owner": "hyde_project"},
+                "kitty": {"paths": ["kitty.conf"]},
+                "hyprland": {"paths": ["hyprland.conf"], "owner": "other_owner"},
+            }
+        )
+
+        output = io.StringIO()
+        with patch.object(deez_module.DeezCLI, "_can_prompt_for_selection", return_value=True), patch("builtins.input", return_value="1"), redirect_stdout(output):
+            cli._resolve_config_dot_targets("bundle")
+
+        self.assertIn("bundle dots from hyde_project", output.getvalue())
 
     def test_cache_list_no_cache(self):
         result = run_deez(["cache"], env=self.env)

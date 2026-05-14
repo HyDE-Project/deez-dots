@@ -2242,11 +2242,18 @@ class DeezCLI:
             return ""
         return _normalize_description(dot_data.get("description"))
 
-    def _dot_selection_header(self) -> str:
+    def _dot_owner(self, dot: str) -> str:
+        dot_data = self.main_config.get(dot, {})
+        if not isinstance(dot_data, dict):
+            dot_data = {}
+        return str(dot_data.get("owner") or self.global_config.get("owner") or "?")
+
+    def _dot_selection_header(self, action_label: str) -> str:
         global_description = _normalize_description(self.global_config.get("description"))
         if global_description:
-            return f"dots ({global_description}) by owner = no. entries"
-        return "dots by owner = no. entries"
+            return global_description
+        owner_label = str(self.global_config.get("owner") or "?")
+        return f"{action_label} dots from {owner_label}"
 
     def _dot_selection_label(self, dot: str) -> str:
         dot_data = self.main_config.get(dot, {})
@@ -2255,7 +2262,7 @@ class DeezCLI:
         file_count = len(list(self._iter_raw_file_entries(dot_data)))
         if not file_count and dot_data.get("paths"):
             file_count = 1
-        owner = dot_data.get("owner") or self.global_config.get("owner") or "?"
+        owner = self._dot_owner(dot)
         label = f"{dot} by {owner} = {file_count}"
         description = self._dot_description(dot)
         if description:
@@ -2271,7 +2278,7 @@ class DeezCLI:
             return available
         labels = [self._dot_selection_label(dot) for dot in available]
         UI.plain("\nDiscovered dots:")
-        UI.plain(f"  {self._dot_selection_header()}")
+        UI.plain(f"  {self._dot_selection_header(action_label)}")
         selected = InteractiveMenu.choose_many(f"Select dots to {action_label}", available, labels=labels)
         if not selected:
             UI.info("Cancelled.")
