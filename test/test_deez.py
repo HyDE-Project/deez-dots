@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import importlib.util
 import io
 import os
@@ -154,6 +155,16 @@ class TestDeezCLI(unittest.TestCase):
             )
             if "action" in file_entry:
                 manifest_lines.append(f'action = "{file_entry["action"]}"')
+            for key, value in file_entry.items():
+                if key in {"src", "dst", "action"}:
+                    continue
+                if isinstance(value, bool):
+                    serialized = "true" if value else "false"
+                elif isinstance(value, int):
+                    serialized = str(value)
+                else:
+                    serialized = f'"{value}"'
+                manifest_lines.append(f"{key} = {serialized}")
             manifest_lines.append("")
         manifest_path = dots_dir / f"{section}.toml"
         manifest_path.write_text("\n".join(manifest_lines))
@@ -225,6 +236,9 @@ class TestDeezCLI(unittest.TestCase):
             "deploy_sections": None,
             "do_uninstall": False,
             "uninstall_dots": [],
+            "do_filetree": False,
+            "filetree_mode": None,
+            "do_healthcheck": False,
             "do_restore": False,
             "restore_dots": [],
             "do_downgrade": False,
@@ -482,6 +496,125 @@ class TestDeezCLI(unittest.TestCase):
         result = run_deez(["dots", "--list"], env=self.env)
         self.assertEqual(result.returncode, 0)
         self.assertIn("No dots found in the manifest.", result.stdout)
+
+    def test_dots_filetree_defaults_to_all_installed_dots(self):
+        self._write_installed_manifest(
+            "kitty",
+            files=[{"src": ".config/kitty/kitty.conf", "dst": f"{self.home_dir}/.config/kitty/kitty.conf"}],
+        )
+        self._write_installed_manifest(
+            "hyprland",
+            files=[{"src": ".config/hypr/hyprland.conf", "dst": f"{self.home_dir}/.config/hypr/hyprland.conf"}],
+        )
+
+        result = self.run_cli(["dots", "--filetree"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Tracked file tree:", result.stdout)
+        self.assertIn("kitty.conf [kitty]", result.stdout)
+        self.assertIn("hyprland.conf [hyprland]", result.stdout)
+
+    def test_dots_filetree_single_dot_focuses_one_manifest(self):
+        self._write_installed_manifest(
+            "kitty",
+            files=[{"src": ".config/kitty/kitty.conf", "dst": f"{self.home_dir}/.config/kitty/kitty.conf"}],
+        )
+        self._write_installed_manifest(
+            "hyprland",
+            files=[{"src": ".config/hypr/hyprland.conf", "dst": f"{self.home_dir}/.config/hypr/hyprland.conf"}],
+        )
+
+        result = self.run_cli(["dots", "--filetree", "kitty"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("kitty by hyde_project", result.stdout)
+        self.assertIn("kitty.conf", result.stdout)
+        self.assertNotIn("hyprland.conf", result.stdout)
+
+    def test_dots_healthcheck_reports_missing_and_changed_files(self):
+        cache_dir = Path(self.xdg_cache) / "deez" / "dots"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        bundle_stage = Path(self.tmpdir.name) / "healthcheck-stage"
+        bundle_stage.mkdir(parents=True, exist_ok=True)
+        changed_file = self.home_dir / ".config/kitty/kitty.conf"
+        changed_file.parent.mkdir(parents=True, exist_ok=True)
+        changed_file.write_text("drifted")
+        missing_file = self.home_dir / ".config/hypr/hyprland.conf"
+        bundle_path = self._make_bundle_tarball(
+            bundle_stage / "desktop.tar.gz",
+            name="desktop",
+            owner="hyde_project",
+            version="1.0",
+            files=[
+                {
+                    "src": ".config/kitty/kitty.conf",
+                    "dst": str(changed_file),
+                    "content": "expected",
+                },
+                {
+                    "src": ".config/hypr/hyprland.conf",
+                    "dst": str(missing_file),
+                    "content": "missing",
+                },
+            ],
+        )
+        bundle_hash = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+        cached_bundle = cache_dir / f"{bundle_hash}.tar.gz"
+        shutil.copy2(bundle_path, cached_bundle)
+        self._write_installed_manifest(
+            "desktop",
+            extra_meta={"hash": bundle_hash},
+            files=[
+                {
+                    "src": ".config/kitty/kitty.conf",
+                    "dst": str(changed_file),
+                },
+                {
+                    "src": ".config/hypr/hyprland.conf",
+                    "dst": str(missing_file),
+                },
+            ],
+        )
+
+        result = self.run_cli(["dots", "--healthcheck"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Healthcheck:", result.stdout)
+        self.assertIn(f"[CHANGED] {changed_file}", result.stdout)
+        self.assertIn(f"[MISSING] {missing_file}", result.stdout)
+        self.assertIn("Summary: missing=1 changed=1", result.stdout)
+
+    def test_dots_healthcheck_single_dot_focuses_one_manifest(self):
+        cache_dir = Path(self.xdg_cache) / "deez" / "dots"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        healthy_file = self.home_dir / ".config/kitty/kitty.conf"
+        healthy_file.parent.mkdir(parents=True, exist_ok=True)
+        healthy_file.write_text("expected")
+        bundle_path = self._make_bundle_tarball(
+            Path(self.tmpdir.name) / "kitty-health-single.tar.gz",
+            name="kitty",
+            owner="hyde_project",
+            version="1.0",
+            files=[{"src": ".config/kitty/kitty.conf", "dst": str(healthy_file), "content": "expected"}],
+        )
+        bundle_hash = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+        shutil.copy2(bundle_path, cache_dir / f"{bundle_hash}.tar.gz")
+        self._write_installed_manifest(
+            "kitty",
+            extra_meta={"hash": bundle_hash},
+            files=[{"src": ".config/kitty/kitty.conf", "dst": str(healthy_file)}],
+        )
+        self._write_installed_manifest(
+            "hyprland",
+            files=[{"src": ".config/hypr/hyprland.conf", "dst": f"{self.home_dir}/.config/hypr/hyprland.conf"}],
+        )
+
+        result = self.run_cli(["dots", "--healthcheck", "kitty"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("kitty by hyde_project", result.stdout)
+        self.assertNotIn("hyprland", result.stdout)
+        self.assertIn("Summary: missing=0 changed=0", result.stdout)
 
     def test_dots_uninstall_no_config(self):
         result = run_deez(["dots", "--uninstall", "kitty"], env=self.env)
@@ -2642,6 +2775,31 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("[DRY RUN] [UNINSTALL] Would remove dot 'kitty'", result.stdout)
         self.assertTrue(tracked_file.exists(), "Dry-run uninstall should not remove tracked files")
+
+    def test_dots_install_records_bundle_hash_for_healthcheck(self):
+        bundle_path = self._make_bundle_tarball(
+            Path(self.tmpdir.name) / "kitty-health.tar.gz",
+            name="kitty",
+            owner="hyde_project",
+            version="1.0",
+            files=[
+                {
+                    "src": "kitty.conf",
+                    "dst": f"{self.home_dir}/.config/kitty/kitty.conf",
+                    "content": "font_size 12",
+                }
+            ],
+        )
+
+        result = self.run_cli(["dots", "--install", str(bundle_path)])
+
+        self.assertEqual(result.returncode, 0)
+        manifest_manager = deez_module.ManifestManager(base_dir=Path(self.xdg_data) / "deez" / "dots")
+        desc = manifest_manager.load_desc("kitty")
+        entries = deez_module.ManifestManager(base_dir=Path(self.xdg_data) / "deez" / "dots").get_file_entries("kitty")
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(desc.get("hash"), hashlib.sha256(bundle_path.read_bytes()).hexdigest())
+        self.assertNotIn("content_hash", entries[0])
 
     def test_dots_uninstall_interactive_cancel(self):
         self._write_installed_manifest(

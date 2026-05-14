@@ -34,6 +34,10 @@ It supports dotfile deployment, dependency management, backup snapshots, and cac
   bundle then install in one step (equivalent to *--package* + *--install*); omit names for interactive selection or specify dot names or *all*.
 - *--uninstall* _DOT_ ...
   uninstall dots; omit names for interactive selector.
+- *--filetree* [_DOT_|all]
+  show tracked installed-file trees for one installed dot or for all installed dots when omitted or set to *all*.
+- *--healthcheck* [_DOT_|all]
+  check one installed dot or all installed dots when omitted or set to *all*; drift checks use the cached bundle when its archive is available.
 - *--restore* _DOT_ ...
   restore files from a backup snapshot; omit names for interactive selector.
 - *--downgrade* _DOT_ ...

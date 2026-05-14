@@ -1172,6 +1172,13 @@ class CacheManager:
             )
         return cached_by_dot
 
+    def bundle_path_for_hash(self, bundle_hash: str) -> Optional[Path]:
+        digest = str(bundle_hash or "").strip()
+        if not digest:
+            return None
+        candidate = self.cache_root / f"{digest}.tar.gz"
+        return candidate if candidate.is_file() else None
+
     def prune_keep(self, keep_count: int = 10, dry_run: bool = False) -> int:
         if keep_count is None:
             keep_count = 10
@@ -2520,6 +2527,284 @@ class DeezCLI:
             label = f"{colored_dot} {colored_description} by {colored_owner} with {colored_count} entries"
         return label
 
+    def _installed_dot_selection_label(self, dot: str) -> str:
+        desc = self.manifest_manager.load_desc(dot)
+        tracked_files = self.manifest_manager.get_files(dot)
+        owner = self._selection_color(str(desc.get("owner", "?")), InteractiveMenu._YELLOW)
+        colored_dot = self._selection_color(dot, InteractiveMenu._CYAN, bold=True)
+        colored_count = self._selection_color(str(len(tracked_files)), UI._GREEN, bold=True)
+        install_ts = self._selection_color(str(desc.get("installdate", "?")), UI._MAGENTA)
+        missing = sum(1 for path in tracked_files if not self._path_exists_or_link(Path(path)))
+        label = f"{colored_dot} by {owner} with {colored_count} tracked files installed {install_ts}"
+        if missing:
+            colored_missing = self._selection_color(str(missing), UI._RED, bold=True)
+            label = f"{label} ({colored_missing} missing)"
+        return label
+
+    def _restorable_dot_selection_label(self, dot: str, snapshot_count: int) -> str:
+        colored_dot = self._selection_color(dot, InteractiveMenu._CYAN, bold=True)
+        colored_count = self._selection_color(str(snapshot_count), UI._GREEN, bold=True)
+        return f"{colored_dot} with {colored_count} snapshots"
+
+    def _cache_dot_selection_label(self, dot: str, version_count: int) -> str:
+        colored_dot = self._selection_color(dot, InteractiveMenu._CYAN, bold=True)
+        colored_count = self._selection_color(str(version_count), UI._GREEN, bold=True)
+        return f"{colored_dot} with {colored_count} cached versions"
+
+    def _cache_version_selection_label(self, entry: CacheEntry) -> str:
+        version = self._selection_color(entry.version, UI._GREEN, bold=True)
+        githash = self._selection_color(entry.githash, InteractiveMenu._YELLOW)
+        builddate = self._selection_color(entry.builddate, UI._MAGENTA)
+        origin = f" [{entry.origin}]" if entry.origin else ""
+        return f"{version:<10} {githash:<8} {builddate:<16}{origin}"
+
+    @staticmethod
+    def _path_exists_or_link(path: Path) -> bool:
+        return path.exists() or path.is_symlink()
+
+    @staticmethod
+    def _path_content_hash(path: Path) -> Optional[str]:
+        try:
+            if path.is_symlink():
+                target = os.readlink(path)
+                return hashlib.sha256(f"symlink:{target}".encode("utf-8")).hexdigest()
+            if path.is_file():
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                return digest.hexdigest()
+            if path.is_dir():
+                digest = hashlib.sha256()
+                for child in sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()):
+                    rel = child.relative_to(path).as_posix()
+                    if child.is_symlink():
+                        digest.update(f"link:{rel}:{os.readlink(child)}".encode("utf-8"))
+                        continue
+                    if child.is_dir():
+                        digest.update(f"dir:{rel}".encode("utf-8"))
+                        continue
+                    digest.update(f"file:{rel}".encode("utf-8"))
+                    with child.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                return digest.hexdigest()
+        except OSError:
+            return None
+        return None
+
+    @staticmethod
+    def _bundle_entry_hash(bundle_path: Path, source_path: str) -> Optional[str]:
+        normalized = str(source_path or "").strip().replace("\\", "/")
+        if not normalized:
+            return None
+        member_name = f"data/{normalized}"
+        try:
+            with tarfile.open(bundle_path, "r:gz") as tar:
+                try:
+                    member = tar.getmember(member_name)
+                except KeyError:
+                    return None
+                if member.isdir():
+                    return hashlib.sha256(f"dir:{normalized}".encode("utf-8")).hexdigest()
+                if member.issym() or member.islnk():
+                    return hashlib.sha256(f"symlink:{member.linkname or ''}".encode("utf-8")).hexdigest()
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    return None
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: extracted.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                return digest.hexdigest()
+        except (OSError, tarfile.TarError):
+            return None
+
+    @staticmethod
+    def _display_path_parts(path_text: str) -> List[str]:
+        path = Path(path_text).expanduser()
+        home = Path.home()
+        try:
+            relative = path.relative_to(home)
+            return ["~", *relative.parts] or ["~"]
+        except ValueError:
+            parts = list(path.parts)
+            if parts and parts[0] == os.sep:
+                return ["/", *parts[1:]]
+            return parts or [str(path)]
+
+    @staticmethod
+    def _insert_tree_path(tree: Dict[str, Any], parts: List[str], *, owner: Optional[str] = None, exists: bool = True) -> None:
+        node = tree
+        for index, part in enumerate(parts):
+            children = node.setdefault("children", {})
+            child = children.setdefault(part, {"children": {}, "owners": [], "exists": True})
+            child["exists"] = child.get("exists", True) and exists
+            if index == len(parts) - 1 and owner:
+                owners = child.setdefault("owners", [])
+                if owner not in owners:
+                    owners.append(owner)
+            node = child
+
+    def _tree_node_label(self, name: str, *, is_dir: bool, exists: bool, owners: Optional[List[str]] = None) -> str:
+        owners = owners or []
+        color = UI._BLUE if is_dir else (UI._GREEN if exists else UI._RED)
+        label = self._selection_color(name, color, bold=is_dir or not exists)
+        if owners:
+            owner_text = ", ".join(sorted(owners))
+            label = f"{label} {self._selection_color(f'[{owner_text}]', InteractiveMenu._YELLOW)}"
+        return label
+
+    def _render_tree_lines(self, node: Dict[str, Any], prefix: str = "") -> List[str]:
+        def collapse_chain(name: str, child: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+            current_name = name
+            current_child = child
+            while True:
+                children = current_child.get("children", {})
+                if len(children) != 1 or current_child.get("owners"):
+                    break
+                next_name, next_child = next(iter(children.items()))
+                current_name = f"{current_name}/{next_name}"
+                current_child = next_child
+            return current_name, current_child
+
+        children = sorted(node.get("children", {}).items())
+        lines: List[str] = []
+        for index, (name, child) in enumerate(children):
+            is_last = index == len(children) - 1
+            branch = "`-- " if is_last else "|-- "
+            extension = "    " if is_last else "|   "
+            collapsed_name, collapsed_child = collapse_chain(name, child)
+            label = self._tree_node_label(
+                collapsed_name,
+                is_dir=bool(collapsed_child.get("children")),
+                exists=bool(collapsed_child.get("exists", True)),
+                owners=collapsed_child.get("owners", []),
+            )
+            lines.append(f"{prefix}{branch}{label}")
+            lines.extend(self._render_tree_lines(collapsed_child, prefix + extension))
+        return lines
+
+    def _resolve_installed_dot_targets(self, requested: Optional[str]) -> List[str]:
+        dots = sorted(self.manifest_manager.list_dots())
+        if not dots:
+            UI.plain("No dots found in the manifest.")
+            return []
+        target = str(requested or "").strip()
+        if not target or target.lower() == "all":
+            return dots
+        if target not in dots:
+            UI.error(f"Dot '{target}' not found in installed manifest.")
+            return []
+        return [target]
+
+    def _render_filetree_for_dot(self, dot: str) -> None:
+        entries = [entry for entry in self.manifest_manager.get_file_entries(dot) if entry.get("installed", True) and entry.get("dst")]
+        desc = self.manifest_manager.load_desc(dot)
+        owner = self._selection_color(str(desc.get("owner", "?")), InteractiveMenu._YELLOW)
+        colored_dot = self._selection_color(dot, InteractiveMenu._CYAN, bold=True)
+        UI.plain(f"\n{colored_dot} by {owner}")
+        if not entries:
+            UI.plain("  (no tracked files)")
+            return
+        tree: Dict[str, Any] = {"children": {}}
+        for entry in entries:
+            dst = str(entry.get("dst") or "").strip()
+            if not dst:
+                continue
+            self._insert_tree_path(tree, self._display_path_parts(dst), exists=self._path_exists_or_link(Path(dst)))
+        for line in self._render_tree_lines(tree):
+            UI.plain(f"  {line}")
+
+    def _do_filetree(self, target: Optional[str] = None) -> None:
+        dots = self._resolve_installed_dot_targets(target)
+        if not dots:
+            return
+        if len(dots) > 1:
+            UI.plain("Tracked file tree:")
+            tree: Dict[str, Any] = {"children": {}}
+            for dot in dots:
+                for entry in self.manifest_manager.get_file_entries(dot):
+                    if not entry.get("installed", True):
+                        continue
+                    dst = str(entry.get("dst") or "").strip()
+                    if not dst:
+                        continue
+                    self._insert_tree_path(tree, self._display_path_parts(dst), owner=dot, exists=self._path_exists_or_link(Path(dst)))
+            for line in self._render_tree_lines(tree):
+                UI.plain(line)
+            return
+        self._render_filetree_for_dot(dots[0])
+
+    def _healthcheck_dot(self, dot: str) -> Dict[str, Any]:
+        desc = self.manifest_manager.load_desc(dot)
+        tracked_entries = [entry for entry in self.manifest_manager.get_file_entries(dot) if entry.get("installed", True) and entry.get("dst")]
+        expected_bundle_hash = str(desc.get("hash") or "").strip()
+        bundle_path = self.cache_manager.bundle_path_for_hash(expected_bundle_hash)
+        bundle_available = False
+        if bundle_path is not None:
+            actual_bundle_hash = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+            bundle_available = actual_bundle_hash == expected_bundle_hash
+        status = {
+            "dot": dot,
+            "owner": desc.get("owner", "?"),
+            "tracked": len(tracked_entries),
+            "ok": [],
+            "missing": [],
+            "changed": [],
+            "unverified": [],
+            "bundle_available": bundle_available,
+        }
+        for entry in tracked_entries:
+            dst = str(entry.get("dst") or "").strip()
+            if not dst:
+                continue
+            path = Path(dst)
+            if not self._path_exists_or_link(path):
+                status["missing"].append(dst)
+                continue
+            expected_hash = self._bundle_entry_hash(bundle_path, entry.get("src")) if bundle_available and bundle_path else None
+            if expected_hash is not None:
+                actual_hash = self._path_content_hash(path)
+                if actual_hash != expected_hash:
+                    status["changed"].append(dst)
+                    continue
+            else:
+                status["unverified"].append(dst)
+            status["ok"].append(dst)
+        return status
+
+    def _do_healthcheck(self, target: Optional[str] = None) -> None:
+        dots = self._resolve_installed_dot_targets(target)
+        if not dots:
+            return
+        total_missing = 0
+        total_changed = 0
+        total_unverified = 0
+        UI.plain("Healthcheck:")
+        for dot in dots:
+            result = self._healthcheck_dot(dot)
+            total_missing += len(result["missing"])
+            total_changed += len(result["changed"])
+            total_unverified += len(result["unverified"])
+            owner = self._selection_color(str(result["owner"]), InteractiveMenu._YELLOW)
+            colored_dot = self._selection_color(result["dot"], InteractiveMenu._CYAN, bold=True)
+            tracked = self._selection_color(str(result["tracked"]), UI._GREEN, bold=True)
+            UI.plain(f"  {colored_dot} by {owner} with {tracked} tracked entries")
+            for missing in result["missing"]:
+                UI.plain(f"    [MISSING] {missing}")
+            for changed in result["changed"]:
+                UI.plain(f"    [CHANGED] {changed}")
+            if not result["missing"] and not result["changed"]:
+                UI.plain("    [OK] manifest matches the current filesystem state")
+            elif result["ok"]:
+                UI.plain(f"    [OK] {len(result['ok'])} tracked paths still match")
+            if result["unverified"]:
+                if result["bundle_available"]:
+                    UI.plain(f"    [warn] {len(result['unverified'])} tracked paths could not be matched in the cached bundle; only presence was checked")
+                else:
+                    UI.plain(f"    [warn] {len(result['unverified'])} tracked paths could not be verified because the cached bundle is unavailable; only presence was checked")
+        UI.plain(f"Summary: missing={total_missing} changed={total_changed} unverified={total_unverified}")
+
     def _resolve_config_dot_targets(self, action_label: str) -> List[str]:
         available = list(self.dotfile_sections)
         if not available:
@@ -3391,8 +3676,7 @@ class DeezCLI:
         if not installed:
             UI.info("No installed dots found.")
             return []
-        descriptions = {dot: self.manifest_manager.load_desc(dot) for dot in installed}
-        labels = [f"{dot:<22} owner: {descriptions[dot].get('owner', '?'):<28} files: {len(self.manifest_manager.get_files(dot)):<5} installed: {descriptions[dot].get('installdate', '?')}" for dot in installed]
+        labels = [self._installed_dot_selection_label(dot) for dot in installed]
         UI.plain("\nInstalled dots:")
         return InteractiveMenu.choose_many("Select dots to uninstall", installed, labels=labels)
 
@@ -3409,7 +3693,7 @@ class DeezCLI:
                 UI.error(f"No backups found for '{dot}' — skipping.")
             return [dot for dot in dots if dot in restorable]
         snapshot_counts = {dot: len(self._list_snapshots(dot)) for dot in restorable}
-        labels = [f"{dot:<22} snapshots: {snapshot_counts[dot]}" for dot in restorable]
+        labels = [self._restorable_dot_selection_label(dot, snapshot_counts[dot]) for dot in restorable]
         UI.plain("\nDots with backups:")
         return InteractiveMenu.choose_many("Select dots to restore", restorable, labels=labels)
 
@@ -3479,7 +3763,7 @@ class DeezCLI:
             target_dots = [s for s in dots if s in cached_by_dot]
         else:
             available = sorted(cached_by_dot.keys())
-            labels = [f"{s:<22} {len(cached_by_dot[s])} cached version(s)" for s in available]
+            labels = [self._cache_dot_selection_label(s, len(cached_by_dot[s])) for s in available]
             UI.plain("\nDots with cached bundles:")
             target_dots = InteractiveMenu.choose_many("Select dots to downgrade", available, labels=labels)
         if not target_dots:
@@ -3488,11 +3772,7 @@ class DeezCLI:
         to_install: List[str] = []
         for dot in target_dots:
             entries = cached_by_dot[dot]
-            labels = []
-            for entry in entries:
-                origin = entry.origin
-                tag = f"  [{origin}]" if origin else ""
-                labels.append(f"{entry.version:<10} {entry.githash:<8} {entry.builddate:<16}{tag}")
+            labels = [self._cache_version_selection_label(entry) for entry in entries]
             UI.plain(f"\nDot '{dot}':")
             chosen = InteractiveMenu.choose_one("Select version to install", [str(entry.path) for entry in entries], labels=labels, allow_cancel=True)
             if chosen is None:
@@ -3639,6 +3919,14 @@ class DeezCLI:
         if getattr(self.args, "do_uninstall", False):
             UI.set_loader_message("Uninstalling dots...")
             self._do_uninstall(getattr(self.args, "uninstall_dots", []) or None, getattr(self.args, "dry_run", False))
+            return
+        if getattr(self.args, "do_filetree", False):
+            UI.set_loader_message("Rendering tracked file tree...")
+            self._do_filetree(getattr(self.args, "filetree_target", "all"))
+            return
+        if getattr(self.args, "do_healthcheck", False):
+            UI.set_loader_message("Checking tracked dot health...")
+            self._do_healthcheck(getattr(self.args, "healthcheck_target", "all"))
             return
         if getattr(self.args, "do_restore", False):
             UI.set_loader_message("Restoring dots...")
@@ -3791,6 +4079,8 @@ def main() -> None:
     dots_parser.add_argument("--install", nargs="+", metavar="TARBALL", help="Install from one or more bundle tar.gz files")
     dots_parser.add_argument("--deploy", nargs="*", metavar="DOT", help="Bundle then install in one step (equivalent to --package + --install); omit names for interactive selection or specify dot names or 'all'")
     dots_parser.add_argument("--uninstall", nargs="*", metavar="DOT", help="Uninstall dots; omit names for interactive selector")
+    dots_parser.add_argument("--filetree", nargs="?", const="all", metavar="DOT|all", help="Show tracked installed-file trees for one installed dot or for all installed dots when omitted or set to 'all'")
+    dots_parser.add_argument("--healthcheck", nargs="?", const="all", metavar="DOT|all", help="Check one installed dot or all installed dots when omitted or set to 'all'; drift checks use the cached bundle when its archive is available")
     dots_parser.add_argument("--restore", nargs="*", metavar="DOT", help="Restore files from a backup snapshot; omit names for interactive selector")
     dots_parser.add_argument("--downgrade", nargs="*", metavar="DOT", help="Re-install a previously cached bundle version; omit names for interactive selector")
     dots_parser.add_argument("--list", action="store_true", help="List all tracked dots and their state")
@@ -3840,6 +4130,10 @@ def main() -> None:
     args.do_deploy = False
     args.do_uninstall = False
     args.uninstall_dots = []
+    args.do_filetree = False
+    args.filetree_target = None
+    args.do_healthcheck = False
+    args.healthcheck_target = None
     args.do_restore = False
     args.restore_dots = []
     args.do_downgrade = False
@@ -3870,12 +4164,16 @@ def main() -> None:
         action_deploy = deploy_val is not None
         uninstall_val = getattr(args, "uninstall", None)
         action_uninstall = uninstall_val is not None
+        filetree_val = getattr(args, "filetree", None)
+        action_filetree = filetree_val is not None
+        healthcheck_val = getattr(args, "healthcheck", None)
+        action_healthcheck = healthcheck_val is not None
         restore_val = getattr(args, "restore", None)
         action_restore = restore_val is not None
         downgrade_val = getattr(args, "downgrade", None)
         action_downgrade = downgrade_val is not None
         action_list = bool(getattr(args, "list", False))
-        if not any([action_package, action_export, action_install, action_deploy, action_uninstall, action_restore, action_downgrade, action_list]):
+        if not any([action_package, action_export, action_install, action_deploy, action_uninstall, action_filetree, action_healthcheck, action_restore, action_downgrade, action_list]):
             dots_parser.print_help()
             return
         args.do_package = action_package
@@ -3889,6 +4187,10 @@ def main() -> None:
         args.deploy_sections = _normalize_requested_sections(deploy_val)
         args.do_uninstall = action_uninstall
         args.uninstall_dots = list(uninstall_val) if uninstall_val else []
+        args.do_filetree = action_filetree
+        args.filetree_target = filetree_val or "all"
+        args.do_healthcheck = action_healthcheck
+        args.healthcheck_target = healthcheck_val or "all"
         args.do_restore = action_restore
         args.restore_dots = list(restore_val) if restore_val else []
         args.do_downgrade = action_downgrade
