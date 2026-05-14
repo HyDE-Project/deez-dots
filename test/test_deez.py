@@ -630,6 +630,76 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn(f"Source directory '{source_override}' does not exist and no git URL provided.", output)
 
+    def test_root_global_overrides_before_subcommand_override_config(self):
+        config_path = self._write_git_config(git_url="https://github.com/example/original.git", git_branch="main")
+        source_override = Path(self.tmpdir.name) / "root-source-override"
+        captured = {}
+
+        class FakeCLI:
+            def __init__(self, _args, main_config, source_dir, *_rest, **_kwargs):
+                captured["main_config"] = main_config
+                captured["source_dir"] = source_dir
+
+            def run(self):
+                return None
+
+        def fake_prepare_source(self, source_dir, git_url, target_branch, *, explicit_source_path=False):
+            captured["prepare_source"] = {
+                "source_dir": source_dir,
+                "git_url": git_url,
+                "target_branch": target_branch,
+                "explicit_source_path": explicit_source_path,
+            }
+            return str(source_dir)
+
+        with patch.object(deez_module, "DeezCLI", FakeCLI), patch.object(deez_module.GitHandler, "prepare_source", fake_prepare_source):
+            self.run_main(
+                [
+                    "deez",
+                    "--config",
+                    str(config_path),
+                    "--source",
+                    str(source_override),
+                    "--git",
+                    "https://github.com/example/override.git",
+                    "--git_branch",
+                    "dev",
+                    "dots",
+                    "--package",
+                ]
+            )
+
+        self.assertEqual(captured["prepare_source"]["source_dir"], str(source_override))
+        self.assertEqual(captured["prepare_source"]["git_url"], "https://github.com/example/override.git")
+        self.assertEqual(captured["prepare_source"]["target_branch"], "dev")
+        self.assertTrue(captured["prepare_source"]["explicit_source_path"])
+        self.assertEqual(captured["source_dir"], str(source_override))
+        self.assertEqual(captured["main_config"]["global"]["git"], "https://github.com/example/override.git")
+        self.assertEqual(captured["main_config"]["global"]["git_branch"], "dev")
+        self.assertEqual(captured["main_config"]["global"]["source"], str(source_override))
+
+    def test_dots_package_section_only_config_uses_cli_source_override(self):
+        source_dir = Path(self.tmpdir.name) / "section-only-source"
+        config_file = source_dir / "Configs/.config/dolphinrc"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text("singleClick=false")
+        config_path = Path(self.tmpdir.name) / "section-only.toml"
+        config_path.write_text(
+            '[dolphin]\n'
+            'version = "0.1.0"\n'
+            'owner = "The HyDE Project"\n'
+            '\n'
+            '[[dolphin.files]]\n'
+            'source_root = "Configs"\n'
+            'target_root = "${HOME}"\n'
+            'paths = [".config/dolphinrc"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path), "--source", str(source_dir)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled dolphin ->", result.stdout)
+
     def test_dots_package_without_config_shows_clear_error(self):
         result = self.run_cli(["dots", "--package"])
 

@@ -3373,15 +3373,96 @@ def _setup_logging(debug: bool = False) -> None:
     LOG.debug("Debug logging enabled")
 
 
+GLOBAL_OVERRIDE_ARGUMENTS: Tuple[Tuple[Tuple[str, ...], Dict[str, Any]], ...] = (
+    (("-c", "--config"), {"dest": "config", "type": str, "help": "Path or URL to the dots TOML configuration file"}),
+    (("--source",), {"dest": "source", "type": str, "help": "Override [global].source for package or deploy"}),
+    (("--git",), {"dest": "git", "type": str, "help": "Override [global].git"}),
+    (("--branch",), {"dest": "branch", "type": str, "help": "Override [global].branch"}),
+    (("--git-branch", "--git_branch"), {"dest": "git_branch", "type": str, "help": "Override [global].git_branch"}),
+    (("--home",), {"dest": "home", "type": str, "help": "Override [global].home"}),
+    (("--owner",), {"dest": "owner", "type": str, "help": "Override [global].owner"}),
+    (("--name",), {"dest": "name", "type": str, "help": "Override [global].name"}),
+    (("--description",), {"dest": "description", "type": str, "help": "Override [global].description"}),
+    (("--action",), {"dest": "action", "type": str, "help": "Override [global].action"}),
+    (("--distribution",), {"dest": "distribution", "type": str, "help": "Override [global].distribution"}),
+    (("--pre-command", "--pre_command"), {"dest": "pre_command", "type": str, "help": "Override [global].pre_command"}),
+    (("--post-command", "--post_command"), {"dest": "post_command", "type": str, "help": "Override [global].post_command"}),
+    (("--build-command", "--build_command"), {"dest": "build_command", "type": str, "help": "Override [global].build_command"}),
+    (("--dots",), {"dest": "global_dots", "action": "append", "metavar": "DOT[,DOT...]", "help": "Override [global].dots; repeat or comma-separate values"}),
+    (("--config-version",), {"dest": "global_version", "type": str, "help": "Override [global].version"}),
+)
+
+GLOBAL_OVERRIDE_DEST_TO_KEY: Dict[str, str] = {
+    "source": "source",
+    "git": "git",
+    "branch": "branch",
+    "git_branch": "git_branch",
+    "home": "home",
+    "owner": "owner",
+    "name": "name",
+    "description": "description",
+    "action": "action",
+    "distribution": "distribution",
+    "pre_command": "pre_command",
+    "post_command": "post_command",
+    "build_command": "build_command",
+    "global_version": "version",
+}
+
+
+def _add_global_override_arguments(parser: argparse.ArgumentParser) -> None:
+    for flags, kwargs in GLOBAL_OVERRIDE_ARGUMENTS:
+        option_kwargs = dict(kwargs)
+        option_kwargs.setdefault("default", argparse.SUPPRESS)
+        parser.add_argument(*flags, **option_kwargs)
+
+
+def _parse_dot_override_values(values: Any) -> List[str]:
+    if values is None:
+        return []
+    raw_values = values if isinstance(values, list) else [values]
+    normalized: List[str] = []
+    seen: set = set()
+    for raw_value in raw_values:
+        for part in str(raw_value).split(","):
+            candidate = part.strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            normalized.append(candidate)
+    return normalized
+
+
+def _apply_global_cli_overrides(main_config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    if not isinstance(main_config, dict):
+        main_config = {}
+    global_config = main_config.get("global")
+    if not isinstance(global_config, dict):
+        global_config = {}
+
+    for dest, key in GLOBAL_OVERRIDE_DEST_TO_KEY.items():
+        value = getattr(args, dest, None)
+        if value is not None:
+            global_config[key] = value
+
+    dot_override = _parse_dot_override_values(getattr(args, "global_dots", None))
+    if dot_override:
+        global_config["dots"] = dot_override
+
+    main_config["global"] = global_config
+    return main_config
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Deez dots manager (deez-dots)")
+    global_override_parser = argparse.ArgumentParser(add_help=False)
+    _add_global_override_arguments(global_override_parser)
+
+    parser = argparse.ArgumentParser(description="Deez dots manager (deez-dots)", parents=[global_override_parser])
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for troubleshooting (default: off)")
     parser.add_argument("--version", action="version", version=f"deez {CLI_VERSION}")
     subparsers = parser.add_subparsers(dest="command")
 
-    dots_parser = subparsers.add_parser("dots", help="Dotfile deployment operations")
-    dots_parser.add_argument("-c", "--config", dest="config", type=str, help="Path or URL to the dots TOML configuration file")
-    dots_parser.add_argument("--source", dest="source", type=str, help="Override the source directory used for package or deploy")
+    dots_parser = subparsers.add_parser("dots", parents=[global_override_parser], help="Dotfile deployment operations")
     dots_parser.add_argument("--package", action="store_true", help="Pull from git source and bundle dots into tar.gz artifacts (no live changes)")
     dots_parser.add_argument("--export", nargs="*", metavar="DOT", help="Snapshot live dots from $HOME into tar.gz bundles (reverse of --package); optionally specify dot names")
     dots_parser.add_argument("--install", nargs="+", metavar="TARBALL", help="Install from one or more bundle tar.gz files")
@@ -3397,20 +3478,19 @@ def main() -> None:
     dots_parser.add_argument("--force", action="store_true", dest="force", help="Remove an existing extracted build directory beside the output tarball before writing")
     dots_parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would happen without making live changes")
 
-    deps_parser = subparsers.add_parser("deps", help="Dependency operations")
-    deps_parser.add_argument("-c", "--config", dest="config", type=str, help="Path or URL to the dots TOML configuration file")
+    deps_parser = subparsers.add_parser("deps", parents=[global_override_parser], help="Dependency operations")
     deps_parser.add_argument("--check", action="store_true", help="Check dependency status")
     deps_parser.add_argument("--install", action="store_true", help="Install missing dependencies")
     deps_parser.add_argument("--update", action="store_true", help="Update packages via configured package managers")
     deps_parser.add_argument("--manager", action="append", help="Limit to specific manager(s), e.g. --manager yay")
 
-    backup_parser = subparsers.add_parser("backup", help="Backup operations")
+    backup_parser = subparsers.add_parser("backup", parents=[global_override_parser], help="Backup operations")
     backup_parser.add_argument("--list", action="store_true", help="List backup snapshots")
     backup_parser.add_argument("--prune", nargs="*", metavar="DOT", help="Prune old backups; optionally limit pruning to one or more dots")
     backup_parser.add_argument("--keep", type=int, default=5, help="Number of newest snapshots to keep when pruning (default: 5)")
     backup_parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would be deleted without removing files")
 
-    cache_parser = subparsers.add_parser("cache", help="Cache operations")
+    cache_parser = subparsers.add_parser("cache", parents=[global_override_parser], help="Cache operations")
     cache_parser.add_argument("--list", action="store_true", help="List cached bundle archives")
     cache_parser.add_argument("--prune", action="store_true", help="Prune old cached bundle archives")
     cache_parser.add_argument("--keep", type=int, default=10, help="Number of newest cache entries to keep when pruning (default: 10)")
@@ -3565,6 +3645,7 @@ def main() -> None:
             raise SystemExit(1)
     else:
         main_config = {"global": {}}
+    main_config = _apply_global_cli_overrides(main_config, args)
     global_config = main_config.get("global", {})
     home = os.path.expandvars(global_config.get("home", "$HOME"))
     distribution = global_config.get("distribution", "auto")
