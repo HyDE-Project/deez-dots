@@ -208,6 +208,40 @@ class TestDeezCLI(unittest.TestCase):
             "auto",
         )
 
+    def _make_dot_args(self, **overrides):
+        values = {
+            "deps_check": False,
+            "deps_update": False,
+            "install_deps": False,
+            "backup_list": False,
+            "backup_prune": False,
+            "do_package": False,
+            "package_sections": None,
+            "do_export": False,
+            "export_sections": None,
+            "do_install": False,
+            "install_tarballs": [],
+            "do_deploy": False,
+            "deploy_sections": None,
+            "do_uninstall": False,
+            "uninstall_dots": [],
+            "do_restore": False,
+            "restore_dots": [],
+            "do_downgrade": False,
+            "downgrade_dots": [],
+            "cache_prune": False,
+            "cache_list": False,
+            "list": False,
+            "no_backup": True,
+            "no_deps_checks": False,
+            "no_deps_install": False,
+            "no_compress": False,
+            "force": False,
+            "dry_run": False,
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
     def test_command_help(self):
         cases = [
             (["dots"], "usage: deez dots"),
@@ -249,6 +283,92 @@ class TestDeezCLI(unittest.TestCase):
             selected = cli._resolve_config_dot_targets("bundle")
 
         self.assertEqual(selected, ["hyde", "waybar", "hyprland"])
+
+    def test_normalize_requested_sections_preserves_explicit_all(self):
+        self.assertIsNone(deez_module._deez_module._normalize_requested_sections([]))
+        self.assertEqual(deez_module._deez_module._normalize_requested_sections(["kitty"]), ["kitty"])
+        self.assertIs(deez_module._deez_module._normalize_requested_sections(["all"]), deez_module._deez_module._ALL_SECTIONS_REQUESTED)
+
+    def test_dots_export_prompts_when_flag_has_no_sections_in_interactive_tty(self):
+        cli = self._make_cli(
+            {
+                "global": {"owner": "hyde_project", "version": "0.1.0"},
+                "kitty": {"paths": ["kitty.conf"]},
+                "hyprland": {"paths": ["hyprland.conf"]},
+            }
+        )
+        cli.args = self._make_dot_args(do_export=True)
+        captured = {}
+
+        def fake_do_export(_owner, _home, _version, sections, **_kwargs):
+            captured["sections"] = sections
+
+        output = io.StringIO()
+        with patch.object(deez_module.DeezCLI, "_can_prompt_for_selection", return_value=True), patch("builtins.input", return_value="1"), patch.object(cli, "_do_export", side_effect=fake_do_export), redirect_stdout(output):
+            cli.run()
+
+        self.assertEqual(captured["sections"], ["kitty"])
+        self.assertIn("Discovered dots:", output.getvalue())
+
+    def test_dots_export_all_skips_prompt_in_interactive_tty(self):
+        cli = self._make_cli(
+            {
+                "global": {"owner": "hyde_project", "version": "0.1.0"},
+                "kitty": {"paths": ["kitty.conf"]},
+                "hyprland": {"paths": ["hyprland.conf"]},
+            }
+        )
+        cli.args = self._make_dot_args(do_export=True, export_sections=deez_module._deez_module._ALL_SECTIONS_REQUESTED)
+        captured = {}
+
+        def fake_do_export(_owner, _home, _version, sections, **_kwargs):
+            captured["sections"] = sections
+
+        with patch.object(deez_module.DeezCLI, "_can_prompt_for_selection", return_value=True), patch("builtins.input", side_effect=AssertionError("interactive prompt should not be used")), patch.object(cli, "_do_export", side_effect=fake_do_export):
+            cli.run()
+
+        self.assertEqual(captured["sections"], ["kitty", "hyprland"])
+
+    def test_dots_package_all_skips_prompt_in_interactive_tty(self):
+        cli = self._make_cli(
+            {
+                "global": {"owner": "hyde_project", "version": "0.1.0"},
+                "kitty": {"paths": ["kitty.conf"]},
+                "hyprland": {"paths": ["hyprland.conf"]},
+            }
+        )
+        cli.args = self._make_dot_args(do_package=True, package_sections=deez_module._deez_module._ALL_SECTIONS_REQUESTED)
+        captured = {}
+
+        def fake_do_package(*_args, **kwargs):
+            captured["sections"] = kwargs["sections"]
+            return []
+
+        with patch.object(deez_module.DeezCLI, "_can_prompt_for_selection", return_value=True), patch("builtins.input", side_effect=AssertionError("interactive prompt should not be used")), patch.object(cli, "_do_package", side_effect=fake_do_package):
+            cli.run()
+
+        self.assertEqual(captured["sections"], ["kitty", "hyprland"])
+
+    def test_dots_deploy_all_skips_prompt_in_interactive_tty(self):
+        cli = self._make_cli(
+            {
+                "global": {"owner": "hyde_project", "version": "0.1.0"},
+                "kitty": {"paths": ["kitty.conf"]},
+                "hyprland": {"paths": ["hyprland.conf"]},
+            }
+        )
+        cli.args = self._make_dot_args(do_deploy=True, deploy_sections=deez_module._deez_module._ALL_SECTIONS_REQUESTED)
+        captured = {}
+
+        def fake_do_package(*_args, **kwargs):
+            captured["sections"] = kwargs["sections"]
+            return [str(Path(self.tmpdir.name) / "kitty.tar.gz")]
+
+        with patch.object(deez_module.DeezCLI, "_can_prompt_for_selection", return_value=True), patch("builtins.input", side_effect=AssertionError("interactive prompt should not be used")), patch.object(cli, "_resolve_config_dependencies", return_value=None), patch.object(cli, "_do_package", side_effect=fake_do_package), patch.object(cli, "_do_install", return_value=None):
+            cli.run()
+
+        self.assertEqual(captured["sections"], ["kitty", "hyprland"])
+
     def test_resolve_config_dot_targets_renders_dot_descriptions(self):
         cli = self._make_cli(
             {

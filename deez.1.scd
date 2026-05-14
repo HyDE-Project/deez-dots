@@ -24,14 +24,14 @@ It supports dotfile deployment, dependency management, backup snapshots, and cac
 ## dots
 - *-c*, *--config* _CONFIG_
   path to the dots TOML configuration file.
-- *--package*
-  pull from git source and bundle dots into tar.gz artifacts (no live changes).
+- *--package* _DOT_ ...
+  pull from git source and bundle dots into tar.gz artifacts (no live changes); omit names for interactive selection or specify dot names or *all*.
 - *--export* _DOT_ ...
-  snapshot live dots from $HOME into tar.gz bundles; optionally specify dot names.
+  snapshot live dots from $HOME into tar.gz bundles; omit names for interactive selection or specify dot names or *all*.
 - *--install* _TARBALL_ ...
   install from one or more bundle tar.gz files.
-- *--deploy*
-  bundle then install in one step (equivalent to *--package* + *--install*).
+- *--deploy* _DOT_ ...
+  bundle then install in one step (equivalent to *--package* + *--install*); omit names for interactive selection or specify dot names or *all*.
 - *--uninstall* _DOT_ ...
   uninstall dots; omit names for interactive selector.
 - *--restore* _DOT_ ...

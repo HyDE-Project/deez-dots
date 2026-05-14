@@ -31,10 +31,20 @@ LOG = logging.getLogger("deez-dots")
 LOG.setLevel(logging.NOTSET)
 CLI_VERSION = "v0.1.0"
 
+
+class _AllSectionsRequested:
+    pass
+
+
+_ALL_SECTIONS_REQUESTED = _AllSectionsRequested()
+RequestedSections = Optional[Union[List[str], _AllSectionsRequested]]
+
+
 def _normalize_description(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return " ".join(value.split())
+
 
 class UI:
     """Render user-facing status lines without changing testable output."""
@@ -2526,17 +2536,32 @@ class DeezCLI:
             return []
         return selected
 
-    def _resolve_requested_config_dot_targets(self, requested: Optional[List[str]], action_label: str) -> List[str]:
+    def _resolve_requested_config_dot_targets(self, requested: RequestedSections, action_label: str) -> List[str]:
+        allow_installed_fallback = action_label == "export"
         if requested is None:
             return self._resolve_config_dot_targets(action_label)
         available = list(self.dotfile_sections)
-        if not available:
+        installed = self.manifest_manager.list_dots() if allow_installed_fallback else []
+        if requested is _ALL_SECTIONS_REQUESTED:
+            if available:
+                return available
+            if installed:
+                return installed
             UI.error("No dot sections found in the config.")
             return []
-        invalid = [dot for dot in requested if dot not in available]
+        if not available and not installed:
+            UI.error("No dot sections found in the config.")
+            return []
+        eligible = set(available)
+        if allow_installed_fallback:
+            eligible.update(installed)
+        invalid = [dot for dot in requested if dot not in eligible]
         for dot in invalid:
-            UI.error(f"Dot '{dot}' not found in config.")
-        return [dot for dot in requested if dot in available]
+            if allow_installed_fallback:
+                UI.error(f"Dot '{dot}' not found in config or installed manifest.")
+            else:
+                UI.error(f"Dot '{dot}' not found in config.")
+        return [dot for dot in requested if dot in eligible]
 
     def _backup_user_base(self) -> Path:
         xdg_data = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share"))
@@ -3109,7 +3134,7 @@ class DeezCLI:
     def _do_export(self, global_owner: str, global_home: str, global_version: str, sections: Optional[List[str]] = None, compress: bool = True, overwrite_existing: bool = False, dry_run: bool = False) -> None:
         writer = WriteDots()
         available_sections = self.dotfile_sections or self.manifest_manager.list_dots()
-        selected_sections = available_sections if not sections else sections
+        selected_sections = available_sections if sections is None else sections
         hook_cwd = self._hook_cwd(self.source_dir)
         for dot_section in selected_sections:
             UI.set_loader_message(f"Exporting {dot_section}...")
@@ -3566,12 +3591,15 @@ class DeezCLI:
             return
         if getattr(self.args, "do_export", False):
             compress = not getattr(self.args, "no_compress", False)
+            selected_sections = self._resolve_requested_config_dot_targets(getattr(self.args, "export_sections", None), "export")
+            if not selected_sections:
+                return
             if dry_run:
                 self._announce_dry_run_pre_command(global_pre_command, scope_label="global")
             else:
                 self._require_pre_command(global_pre_command, scope_label="global", cwd=hook_cwd)
             UI.set_loader_message("Exporting dots...")
-            self._do_export(global_owner, global_home, global_version, getattr(self.args, "export_sections", None), compress=compress, overwrite_existing=getattr(self.args, "force", False), dry_run=dry_run)
+            self._do_export(global_owner, global_home, global_version, selected_sections, compress=compress, overwrite_existing=getattr(self.args, "force", False), dry_run=dry_run)
             return
         if getattr(self.args, "do_install", False):
             if dry_run:
@@ -3717,12 +3745,14 @@ def _parse_dot_override_values(values: Any) -> List[str]:
     return normalized
 
 
-def _normalize_requested_sections(values: Any) -> Optional[List[str]]:
+def _normalize_requested_sections(values: Any) -> RequestedSections:
     if values is None:
         return None
     sections = [str(value).strip() for value in values if str(value).strip()]
-    if not sections or any(section.lower() == "all" for section in sections):
+    if not sections:
         return None
+    if any(section.lower() == "all" for section in sections):
+        return _ALL_SECTIONS_REQUESTED
     return sections
 
 
@@ -3756,10 +3786,10 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command")
 
     dots_parser = subparsers.add_parser("dots", parents=[global_override_parser], help="Dotfile deployment operations")
-    dots_parser.add_argument("--package", nargs="*", metavar="DOT", help="Pull from git source and bundle dots into tar.gz artifacts (no live changes); optionally specify dot names or 'all'")
-    dots_parser.add_argument("--export", nargs="*", metavar="DOT", help="Snapshot live dots from $HOME into tar.gz bundles (reverse of --package); optionally specify dot names or 'all'")
+    dots_parser.add_argument("--package", nargs="*", metavar="DOT", help="Pull from git source and bundle dots into tar.gz artifacts (no live changes); omit names for interactive selection or specify dot names or 'all'")
+    dots_parser.add_argument("--export", nargs="*", metavar="DOT", help="Snapshot live dots from $HOME into tar.gz bundles (reverse of --package); omit names for interactive selection or specify dot names or 'all'")
     dots_parser.add_argument("--install", nargs="+", metavar="TARBALL", help="Install from one or more bundle tar.gz files")
-    dots_parser.add_argument("--deploy", nargs="*", metavar="DOT", help="Bundle then install in one step (equivalent to --package + --install); optionally specify dot names or 'all'")
+    dots_parser.add_argument("--deploy", nargs="*", metavar="DOT", help="Bundle then install in one step (equivalent to --package + --install); omit names for interactive selection or specify dot names or 'all'")
     dots_parser.add_argument("--uninstall", nargs="*", metavar="DOT", help="Uninstall dots; omit names for interactive selector")
     dots_parser.add_argument("--restore", nargs="*", metavar="DOT", help="Restore files from a backup snapshot; omit names for interactive selector")
     dots_parser.add_argument("--downgrade", nargs="*", metavar="DOT", help="Re-install a previously cached bundle version; omit names for interactive selector")
@@ -3953,11 +3983,7 @@ def main() -> None:
     source_override = getattr(args, "source", None)
     source_dir = source_override or global_config.get("source")
     explicit_source_path = bool(source_dir)
-    has_dot_level_source = any(
-        isinstance(dot_data, dict) and dot_data.get("source")
-        for name, dot_data in main_config.items()
-        if name != "global"
-    )
+    has_dot_level_source = any(isinstance(dot_data, dict) and dot_data.get("source") for name, dot_data in main_config.items() if name != "global")
     if not source_dir:
         xdg_cache = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
         if not owner or not name:
@@ -3967,13 +3993,8 @@ def main() -> None:
                 owner, name = "unknown", "unknown"
         source_dir = GitHandler.source_cache_path(xdg_cache, owner, name, target_branch)
     source_dir = os.path.expandvars(os.path.expanduser(source_dir))
-    skip_global_source_prepare = bool(
-        has_dot_level_source and not source_override and not global_config.get("source") and not git_url
-    )
-    need_source = bool(
-        ((args.do_package or args.do_deploy) and not skip_global_source_prepare)
-        or (args.do_install and not args.from_stage)
-    )
+    skip_global_source_prepare = bool(has_dot_level_source and not source_override and not global_config.get("source") and not git_url)
+    need_source = bool(((args.do_package or args.do_deploy) and not skip_global_source_prepare) or (args.do_install and not args.from_stage))
 
     loader_started = False
     if UI.can_use_loader(debug=bool(getattr(args, "debug", False))):

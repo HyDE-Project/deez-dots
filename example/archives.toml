@@ -1,24 +1,63 @@
 # A test to install archives
-
-
+# Tarball list to be extracted to target directory
+# Font_CascadiaCove|$HOME/.local/share/fonts
+# Font_MaterialDesign|$HOME/.local/share/fonts
+# Font_JetBrainsMono|$HOME/.local/share/fonts
+# Font_MapleNerd|$HOME/.local/share/fonts
+# Font_MononokiNerd|$HOME/.local/share/fonts
+# Font_NotoSansCJK|$HOME/.local/share/fonts
+# Font_NotoSansCJK|/usr/local/share/fonts
+# Cursor_BibataIce|/usr/local/share/icons
+# Cursor_BibataIce|$HOME/.local/share/icons
+# Gtk_Wallbash|$HOME/.local/share/themes
+# Icon_Wallbash|$HOME/.local/share/icons
 [global] #  This is used to define global variables use for default fallbacks
-owner = "The HyDE Project"                       # Owner of the configuration file
-description = "Archive installer"
-version = "0.1.0"                                # Version of the configuration file // Follows Semantic Versioning
-action= "sync"                       # Actions can either be sync or preserve
-# git = "https://github.com/HyDE-Project/HyDE.git"
-# git_branch = "dev"
-source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Cursor_BibataIce.tar.gz"
-# dots =[
-    # "kitty","hyprland",
-# ] # List of dots to be used in the configuration file
-# pre_command = "echo 'starting deployment'"
-# post_command = "notify-send 'deez done'"
+owner = "The HyDE Project" # Owner of the configuration file
+description = "Archived fonts and icons"
+version = "0.1.0" # Version of the configuration file // Follows Semantic Versioning
+action = "sync" # Actions can either be sync or preserve
 
+[Font_CascadiaCove]
+source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Font_CascadiaCove.tar.gz"
+target_root = "${XDG_DATA_HOME}/fonts/CascadiaCove"
+paths = "."
+
+[Font_MaterialDesign]
+source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Font_MaterialDesign.tar.gz"
+target_root = "${XDG_DATA_HOME}/fonts/MaterialDesign"
+paths = "."
+
+[Font_JetBrainsMono]
+source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Font_JetBrainsMono.tar.gz"
+target_root = "${XDG_DATA_HOME}/fonts/JetBrainsMono"
+paths = "."
+
+[Font_MapleNerd]
+source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Font_MapleNerd.tar.gz"
+target_root = "${XDG_DATA_HOME}/fonts/MapleNerd"
+paths = "."
+
+[Font_MononokiNerd]
+source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Font_MononokiNerd.tar.gz"
+target_root = "${XDG_DATA_HOME}/fonts/MononokiNerd"
+paths = "."
+
+[Font_NotoSansCJK]
+source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Font_NotoSansCJK.tar.gz"
+target_root = "${XDG_DATA_HOME}/fonts/NotoSansCJK"
+paths = "."
 
 [Cursor_BibataIce]
 source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Cursor_BibataIce.tar.gz"
-source_root = "."
-target_root = "${XDG_DATA_HOME}/icons"
+target_root = "${XDG_DATA_HOME}/icons/BibataIce"
 paths = "."
 
+[Gtk_Wallbash]
+source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Gtk_Wallbash.tar.gz"
+target_root = "${XDG_DATA_HOME}/themes/Wallbash"
+paths = "."
+
+[Icon_Wallbash]
+source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Icon_Wallbash.tar.gz"
+target_root = "${XDG_DATA_HOME}/icons/Wallbash"
+paths = "."
