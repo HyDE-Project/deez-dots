@@ -1456,6 +1456,7 @@ class WriteDots:
             "branch",
             "dependency",
             "depends",
+            "conflicts",
             "pre_command",
             "post_command",
             "build_command",
@@ -1726,6 +1727,7 @@ class WriteDots:
         source_url: str = "",
         branch: str = "",
         dependency: Optional[Any] = None,
+        conflicts: Optional[List[str]] = None,
         compress: bool = True,
         out_dir: Optional[str] = None,
         pre_command: Optional[str] = None,
@@ -1756,6 +1758,8 @@ class WriteDots:
             normalized_dependency = DeezUtils.normalize_dependency_blocks(dependency)
             if normalized_dependency:
                 desc_data["dependency"] = normalized_dependency
+            if conflicts:
+                desc_data["conflicts"] = conflicts
             if pre_command:
                 desc_data["pre_command"] = pre_command
             if post_command:
@@ -2242,6 +2246,31 @@ class DeezCLI:
             return ""
         return _normalize_description(dot_data.get("description"))
 
+    @staticmethod
+    def _normalize_conflict_names(value: Any) -> List[str]:
+        if not value:
+            return []
+        values = value if isinstance(value, list) else [value]
+        normalized: List[str] = []
+        for item in values:
+            name = str(item or "").strip()
+            if name and name not in normalized:
+                normalized.append(name)
+        return normalized
+
+    @staticmethod
+    def _normalize_conflicted_paths(value: Any) -> List[str]:
+        if not value:
+            return []
+        expanded = DeezUtils.expand(value)
+        values = expanded if isinstance(expanded, list) else [expanded]
+        normalized: List[str] = []
+        for item in values:
+            path_text = str(item or "").strip()
+            if path_text and path_text not in normalized:
+                normalized.append(path_text)
+        return normalized
+
     def _dot_owner(self, dot: str) -> str:
         dot_data = self.main_config.get(dot, {})
         if not isinstance(dot_data, dict):
@@ -2605,7 +2634,7 @@ class DeezCLI:
         dot_data: Dict[str, Any],
         file_entry: Dict[str, Any],
         default_target_root: str,
-    ) -> Tuple[str, str, List[str], List[str], str, bool]:
+    ) -> Tuple[str, str, List[str], List[str], str, bool, List[str]]:
         source_root_value = file_entry.get("source_root")
         if source_root_value:
             expanded_source_root = DeezUtils.expand(source_root_value)
@@ -2623,7 +2652,8 @@ class DeezCLI:
             ignored_paths = [ignored_paths]
         action = DeezUtils.normalize_action(file_entry.get("action") or dot_data.get("action") or self.main_config.get("global", {}).get("action"))
         clean_target = bool(file_entry.get("clean_target", dot_data.get("clean_target", False)))
-        return source_root, target_root, relative_paths, ignored_paths, action, clean_target
+        conflicted_paths = self._normalize_conflicted_paths(file_entry.get("conflicted_paths"))
+        return source_root, target_root, relative_paths, ignored_paths, action, clean_target, conflicted_paths
 
     def _iter_file_entries(self, dot_section: str, global_owner: str, global_home: str, global_version: str):
         dot_data = self.main_config.get(dot_section, {})
@@ -2646,7 +2676,13 @@ class DeezCLI:
         for file_entry in self._iter_raw_file_entries(dot_data):
             yield self._resolve_file_entry(dot_data, file_entry, section_home) + (section_owner, section_version)
 
-    def _check_conflicts_from_bundle(self, dot: str, new_owner: str, file_pairs: List[Tuple[str, str]]) -> Tuple[bool, List[Tuple[str, str]]]:
+    def _check_conflicts_from_bundle(
+        self,
+        dot: str,
+        new_owner: str,
+        bundle_entries: List[Dict[str, Any]],
+        bundle_conflicts: Optional[List[str]] = None,
+    ) -> Tuple[bool, List[Tuple[str, str]]]:
         existing_desc = self.manifest_manager.load_desc(dot)
         if existing_desc:
             existing_owner = existing_desc.get("owner", "unknown")
@@ -2654,12 +2690,29 @@ class DeezCLI:
                 UI.error(f"Conflict: dot '{dot}' is already installed by '{existing_owner}'.")
                 UI.info("Uninstall the dot first, then re-run install.")
                 return False, []
+        installed_dots = set(self.manifest_manager.list_dots())
+        for conflicting_dot in self._normalize_conflict_names(bundle_conflicts):
+            if conflicting_dot in installed_dots and conflicting_dot != dot:
+                UI.error(f"Dot conflict: '{dot}' conflicts with installed dot '{conflicting_dot}'.")
+                return False, []
         owner_index = self.manifest_manager.build_owner_index()
         kept_pairs: List[Tuple[str, str]] = []
-        for src_rel, dst_abs in file_pairs:
+        for bundle_entry in bundle_entries:
+            src_rel = bundle_entry.get("src")
+            dst_abs = bundle_entry.get("dst")
+            if not src_rel or not dst_abs:
+                continue
             owner_dot = owner_index.get(dst_abs)
             if owner_dot and owner_dot != dot:
                 UI.error(f"File conflict: {dst_abs} (owned by {owner_dot})")
+                continue
+            conflict_hit = False
+            for conflict_path in self._normalize_conflicted_paths(bundle_entry.get("conflicted_paths")):
+                owner_dot = owner_index.get(conflict_path)
+                if owner_dot and owner_dot != dot:
+                    UI.error(f"File conflict: {conflict_path} (owned by {owner_dot})")
+                    conflict_hit = True
+            if conflict_hit:
                 continue
             kept_pairs.append((src_rel, dst_abs))
         return True, kept_pairs
@@ -2704,7 +2757,12 @@ class DeezCLI:
         if not file_pairs:
             UI.error(f"{bundle_path}: manifest.toml has no [[files]]")
             return None
-        ok, kept_pairs = self._check_conflicts_from_bundle(dot, bundle.get("owner", ""), file_pairs)
+        ok, kept_pairs = self._check_conflicts_from_bundle(
+            dot,
+            bundle.get("owner", ""),
+            bundle_entries,
+            bundle.get("conflicts"),
+        )
         if not ok or not kept_pairs:
             UI.info(f"'{dot}' skipped due to conflict.")
             return None
@@ -2729,6 +2787,7 @@ class DeezCLI:
             section_owner = dot_data.get("owner", global_owner)
             section_version = dot_data.get("version", global_version)
             dependency = DeezUtils.normalize_dependency_blocks(dot_data.get("dependency") or dot_data.get("depends"))
+            conflicts = self._normalize_conflict_names(dot_data.get("conflicts"))
             LOG.debug("[PACKAGE] Packaging dot: %s", dot_section)
             pre_command = dot_data.get("pre_command")
             post_command = dot_data.get("post_command")
@@ -2754,7 +2813,7 @@ class DeezCLI:
                 entry_build_command = file_entry.get("build_command")
                 if entry_build_command:
                     writer.execute_commands([entry_build_command], cwd=self.source_dir)
-                source_root, target_root, relative_paths, ignored_paths, action, clean_target = self._resolve_file_entry(
+                source_root, target_root, relative_paths, ignored_paths, action, clean_target, conflicted_paths = self._resolve_file_entry(
                     dot_data,
                     file_entry,
                     section_home,
@@ -2769,6 +2828,7 @@ class DeezCLI:
                         "entry_metadata": {
                             "source_root": file_entry.get("source_root") or "",
                             "dependency": DeezUtils.normalize_dependency_blocks(file_entry.get("dependency") or file_entry.get("depends")) or None,
+                            "conflicted_paths": [str(Path(target_root) / path) for path in conflicted_paths] or None,
                         },
                         "action": action,
                         "clean_target": clean_target,
@@ -2783,6 +2843,7 @@ class DeezCLI:
                 source_url=git_url,
                 branch=target_branch,
                 dependency=dependency,
+                conflicts=conflicts,
                 compress=compress,
                 out_dir=out_dir,
                 pre_command=pre_command,
@@ -2817,6 +2878,7 @@ class DeezCLI:
                     "source": dot_data.get("git") or self.main_config.get("global", {}).get("git"),
                     "branch": dot_data.get("branch") or dot_data.get("git_branch") or self.main_config.get("global", {}).get("branch") or self.main_config.get("global", {}).get("git_branch"),
                     "dependency": DeezUtils.normalize_dependency_blocks(dot_data.get("dependency") or dot_data.get("depends")) or None,
+                    "conflicts": self._normalize_conflict_names(dot_data.get("conflicts")) or None,
                     "pre_command": dot_data.get("pre_command"),
                     "post_command": dot_data.get("post_command"),
                     "build_command": dot_data.get("build_command"),
@@ -2832,7 +2894,7 @@ class DeezCLI:
                         "action": dot_data.get("action"),
                         "clean_target": dot_data.get("clean_target", False),
                     }
-                    _source_root, tgt_root, rel_paths, ignored_paths, action, clean_target = self._resolve_file_entry(
+                    _source_root, tgt_root, rel_paths, ignored_paths, action, clean_target, conflicted_paths = self._resolve_file_entry(
                         dot_data,
                         legacy_entry,
                         section_home,
@@ -2847,6 +2909,7 @@ class DeezCLI:
                             "entry_metadata": {
                                 "source_root": legacy_entry.get("source_root") or "",
                                 "dependency": DeezUtils.normalize_dependency_blocks(legacy_entry.get("dependency") or legacy_entry.get("depends")) or None,
+                                "conflicted_paths": [str(Path(tgt_root) / path) for path in conflicted_paths] or None,
                             },
                             "action": action,
                             "clean_target": clean_target,
@@ -2854,7 +2917,7 @@ class DeezCLI:
                     )
                 else:
                     for raw_file_entry in self._iter_raw_file_entries(dot_data):
-                        _source_root, tgt_root, rel_paths, ignored_paths, action, clean_target = self._resolve_file_entry(
+                        _source_root, tgt_root, rel_paths, ignored_paths, action, clean_target, conflicted_paths = self._resolve_file_entry(
                             dot_data,
                             raw_file_entry,
                             section_home,
@@ -2869,6 +2932,7 @@ class DeezCLI:
                                 "entry_metadata": {
                                     "source_root": raw_file_entry.get("source_root") or "",
                                     "dependency": DeezUtils.normalize_dependency_blocks(raw_file_entry.get("dependency") or raw_file_entry.get("depends")) or None,
+                                    "conflicted_paths": [str(Path(tgt_root) / path) for path in conflicted_paths] or None,
                                 },
                                 "action": action,
                                 "clean_target": clean_target,

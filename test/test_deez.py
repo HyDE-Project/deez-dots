@@ -1974,6 +1974,55 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("owned by other-dot", result.stdout)
         self.assertIn("'kitty' skipped due to conflict.", result.stdout)
 
+    def test_dots_install_dry_run_reports_declared_dot_conflict(self):
+        self._write_installed_manifest(
+            "hyprland",
+            files=[{"src": ".config/hypr/hyprland.conf", "dst": f"{self.home_dir}/.config/hypr/hyprland.conf"}],
+        )
+        bundle_path = self._make_bundle_tarball(
+            Path(self.tmpdir.name) / "hyprland-legacy-conflict.tar.gz",
+            name="hyprland-legacy",
+            owner="hyde_project",
+            version="1.0",
+            files=[{"src": "hyprland.conf", "dst": f"{self.home_dir}/.config/hypr/hyprland-legacy.conf"}],
+            extra_meta={"conflicts": ["hyprland"]},
+        )
+
+        result = self.run_cli(["dots", "--install", str(bundle_path), "--dry-run"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Dot conflict:", result.stdout)
+        self.assertIn("conflicts with installed dot 'hyprland'", result.stdout)
+        self.assertIn("'hyprland-legacy' skipped due to conflict.", result.stdout)
+
+    def test_dots_install_dry_run_reports_conflicted_paths_conflict(self):
+        conflict_path = f"{self.home_dir}/.config/hypr/hyprland.conf"
+        self._write_installed_manifest(
+            "hyprland",
+            files=[{"src": ".config/hypr/hyprland.conf", "dst": conflict_path}],
+        )
+        bundle_path = self._make_bundle_tarball(
+            Path(self.tmpdir.name) / "kitty-conflicted-path.tar.gz",
+            name="kitty",
+            owner="hyde_project",
+            version="1.0",
+            files=[
+                {
+                    "src": "kitty.conf",
+                    "dst": f"{self.home_dir}/.config/kitty/kitty.conf",
+                    "conflicted_paths": [conflict_path],
+                }
+            ],
+        )
+
+        result = self.run_cli(["dots", "--install", str(bundle_path), "--dry-run"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("File conflict:", result.stdout)
+        self.assertIn(conflict_path, result.stdout)
+        self.assertIn("owned by hyprland", result.stdout)
+        self.assertIn("'kitty' skipped due to conflict.", result.stdout)
+
     def test_dots_uninstall_dry_run(self):
         section = "kitty"
         self._write_installed_manifest(
