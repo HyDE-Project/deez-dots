@@ -198,6 +198,14 @@ class TestDeezCLI(unittest.TestCase):
                 self.assertEqual(result.returncode, 0)
                 self.assertIn(expected, result.stdout)
 
+    def test_dots_trailing_double_dash_is_ignored(self):
+        config_path = self._write_package_config()
+
+        result = self.run_cli(["dots", "--config", str(config_path), "--"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("usage: deez dots", result.stdout)
+
     def test_interactive_menu_choose_many_supports_ranges(self):
         with patch("builtins.input", return_value="1-2,4"), redirect_stdout(io.StringIO()):
             selected = deez_module.InteractiveMenu.choose_many("Select dots", ["hyde", "kitty", "waybar", "hyprland"])
@@ -219,6 +227,22 @@ class TestDeezCLI(unittest.TestCase):
             selected = cli._resolve_config_dot_targets("bundle")
 
         self.assertEqual(selected, ["hyde", "waybar", "hyprland"])
+    def test_resolve_config_dot_targets_renders_dot_descriptions(self):
+        cli = self._make_cli(
+            {
+                "global": {"owner": "hyde_project"},
+                "kitty": {"paths": ["kitty.conf"], "description": "Kitty terminal config"},
+                "hyprland": {"paths": ["hyprland.conf"], "description": "Hyprland compositor config"},
+            }
+        )
+
+        output = io.StringIO()
+        with patch.object(deez_module.DeezCLI, "_can_prompt_for_selection", return_value=True), patch("builtins.input", return_value="1"), redirect_stdout(output):
+            selected = cli._resolve_config_dot_targets("bundle")
+
+        self.assertEqual(selected, ["kitty"])
+        self.assertIn("Kitty terminal config", output.getvalue())
+        self.assertIn("Hyprland compositor config", output.getvalue())
 
     def test_cache_list_no_cache(self):
         result = run_deez(["cache"], env=self.env)
@@ -450,6 +474,22 @@ class TestDeezCLI(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
+    def test_config_load_prints_global_description(self):
+        config_path = Path(self.tmpdir.name) / "described-dots.toml"
+        config_path.write_text(
+            '[global]\n'
+            'description = "Shared desktop config for HyDE test fixtures"\n'
+            'version = "0.1.0"\n'
+            'owner = "hyde_project"\n'
+            '\n'
+            '[kitty]\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+        )
+
+        result = self.run_cli(["deps", "--check", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Config description: Shared desktop config for HyDE test fixtures", result.stdout)
 
     def test_dots_source_override_uses_existing_non_git_path(self):
         config_path = self._write_git_config()
@@ -814,6 +854,21 @@ class TestDeezCLI(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(tgt_file.read_text(), "existing")
 
+    def test_write_dots_copy_with_action_preserves_symlink(self):
+        writer = deez_module.WriteDots()
+        src_dir = Path(self.tmpdir.name) / "src-link"
+        tgt_dir = Path(self.tmpdir.name) / "home-link"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        tgt_dir.mkdir(parents=True, exist_ok=True)
+        src_link = src_dir / "kitty-current"
+        os.symlink("kitty.conf", src_link)
+
+        result = writer._copy_with_action(str(src_link), str(tgt_dir / "kitty-current"), "sync")
+
+        self.assertTrue(result)
+        self.assertTrue((tgt_dir / "kitty-current").is_symlink())
+        self.assertEqual(os.readlink(tgt_dir / "kitty-current"), "kitty.conf")
+
     def test_write_dots_stage_ignores_globbed_paths(self):
         writer = deez_module.WriteDots()
         src_dir = Path(self.tmpdir.name) / "src"
@@ -953,6 +1008,28 @@ class TestDeezCLI(unittest.TestCase):
 
         self.assertFalse((Path(self.xdg_cache) / "deez" / "stage" / "kitty-export-123").exists())
 
+    def test_write_dots_export_preserves_symlink_loop(self):
+        writer = deez_module.WriteDots()
+        icons_dir = self.home_dir / ".local/share/icons/Wallbash-Icon/distro"
+        icons_dir.mkdir(parents=True, exist_ok=True)
+        loop_path = icons_dir / "hyde.png"
+        os.symlink("hyde.png", loop_path)
+
+        pkg_path = writer.export(
+            rel_paths=[".local/share/icons/Wallbash-Icon/distro"],
+            tgt_root=str(self.home_dir),
+            dot="icons",
+            owner="hyde_project",
+            version="0.1.0",
+        )
+
+        with tarfile.open(pkg_path, "r:gz") as tar:
+            manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
+            link_member = tar.getmember("data/.local/share/icons/Wallbash-Icon/distro/hyde.png")
+        self.assertIn('src = ".local/share/icons/Wallbash-Icon/distro/hyde.png"', manifest_text)
+        self.assertTrue(link_member.issym())
+        self.assertEqual(link_member.linkname, "hyde.png")
+
     def test_dots_export_with_config(self):
         config_path = Path(self.tmpdir.name) / "dots.toml"
         config_path.write_text(
@@ -973,6 +1050,40 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.stdout.count("[ok] Exported kitty ->"), 1)
         self.assertTrue((SCRIPT_DIR / "build").exists())
         self.assertTrue(any("kitty" in p for p in os.listdir(SCRIPT_DIR / "build")))
+
+    def test_dots_install_preserves_symlink_from_bundle(self):
+        bundle_path = Path(self.tmpdir.name) / "kitty-symlink.tar.gz"
+        with tempfile.TemporaryDirectory(prefix="deez-symlink-bundle-") as stage_dir:
+            stage_root = Path(stage_dir)
+            data_dir = stage_root / "data" / ".config/kitty"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            (data_dir / "kitty.conf").write_text("font_size 12")
+            os.symlink("kitty.conf", data_dir / "current")
+            (stage_root / "manifest.toml").write_text(
+                'name = "kitty"\n'
+                'owner = "hyde_project"\n'
+                'version = "1.0"\n'
+                '\n'
+                '[[files]]\n'
+                'src = ".config/kitty/current"\n'
+                f'dst = "{self.home_dir}/.config/kitty/current"\n'
+                'action = "sync"\n'
+                '\n'
+                '[[files]]\n'
+                'src = ".config/kitty/kitty.conf"\n'
+                f'dst = "{self.home_dir}/.config/kitty/kitty.conf"\n'
+                'action = "sync"\n'
+            )
+            with tarfile.open(bundle_path, "w:gz") as tar:
+                tar.add(stage_root / "manifest.toml", arcname="manifest.toml")
+                tar.add(stage_root / "data", arcname="data")
+
+        result = self.run_cli(["dots", "--install", str(bundle_path), "--no-backup"])
+
+        self.assertEqual(result.returncode, 0)
+        installed_link = self.home_dir / ".config/kitty/current"
+        self.assertTrue(installed_link.is_symlink())
+        self.assertEqual(os.readlink(installed_link), "kitty.conf")
 
     def test_dots_export_with_config_merges_multiple_file_entries(self):
         config_path = Path(self.tmpdir.name) / "hyprland.toml"
@@ -1438,6 +1549,11 @@ class TestDeezCLI(unittest.TestCase):
                     exit_code, output = self.run_entrypoint(argv)
                 self.assertEqual(exit_code, 1)
                 self.assertIn("Cancelled.", output)
+
+    def test_pyproject_console_entrypoint_uses_run_entrypoint(self):
+        pyproject = (SCRIPT_DIR / "pyproject.toml").read_text()
+
+        self.assertIn('deez = "deez:run_entrypoint"', pyproject)
 
     # ------------------------------------------------------------------ helpers
     def _make_backup_tarball(self, section, owner, version, timestamp, files):

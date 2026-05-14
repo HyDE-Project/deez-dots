@@ -4,6 +4,7 @@
 [global] #  This is used to define global variables use for default fallbacks
 version = "0.1.0"                                # Version of the configuration file // Follows Semantic Versioning
 owner = "The HyDE Project"                       # Owner of the configuration file
+description = "Main HyDE deployment profile shown when the config is loaded."
 action= "preserve"                       # Actions can either be sync or preserve
 git = "https://github.com/HyDE-Project/HyDE.git"
 git_branch = "dev"
@@ -166,6 +167,7 @@ target_root = "${HOME}/.local/lib"
 paths = "hyde/wallbash.dunst.sh"
 
 [kitty]
+description = "Kitty terminal configuration and theme assets."
 pre_command = "echo 'Pre commands '"    # Pre commands
 post_command = "echo 'HyDE backed up!'" # Post commands
 

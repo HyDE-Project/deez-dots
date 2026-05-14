@@ -30,6 +30,10 @@ LOG = logging.getLogger("deez-dots")
 LOG.setLevel(logging.NOTSET)
 CLI_VERSION = "v0.1.0"
 
+def _normalize_description(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())
 
 class UI:
     """Render user-facing status lines without changing testable output."""
@@ -1277,18 +1281,12 @@ class WriteDots:
                 if not dst_abs:
                     continue
                 dst_path = Path(dst_abs)
-                if not dst_path.exists():
+                if not self._path_exists_or_link(dst_path):
                     continue
                 rel = dst_path.as_posix().lstrip("/")
                 dest_in_stage = data_dir / rel
-                dest_in_stage.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    if dst_path.is_dir():
-                        if dest_in_stage.exists():
-                            shutil.rmtree(dest_in_stage)
-                        shutil.copytree(dst_path, dest_in_stage)
-                    else:
-                        shutil.copy2(dst_path, dest_in_stage)
+                    self._copy_path_to_stage(dst_path, dest_in_stage)
                 except Exception as e:
                     LOG.warning("Backup failed for %s: %s", dst_abs, e)
                     continue
@@ -1322,25 +1320,61 @@ class WriteDots:
     @staticmethod
     def _expand_files(root_path: Union[str, Path]) -> List[str]:
         p = Path(root_path)
+        if p.is_symlink():
+            return [str(p)]
         if p.is_file():
             return [str(p)]
         result: List[str] = []
-        for dirpath, _dirs, filenames in os.walk(p):
+        for dirpath, dirnames, filenames in os.walk(p):
+            current_dir = Path(dirpath)
+            for dirname in dirnames:
+                candidate = current_dir / dirname
+                if candidate.is_symlink():
+                    result.append(str(candidate))
             for fname in filenames:
-                result.append(str(Path(dirpath) / fname))
+                result.append(str(current_dir / fname))
         return result
+
+    @staticmethod
+    def _path_exists_or_link(candidate_path: Union[str, Path]) -> bool:
+        candidate = Path(candidate_path)
+        try:
+            return candidate.exists() or candidate.is_symlink()
+        except OSError:
+            return candidate.is_symlink()
+
+    @staticmethod
+    def _remove_existing_path(candidate_path: Union[str, Path]) -> None:
+        candidate = Path(candidate_path)
+        if candidate.is_symlink() or candidate.is_file():
+            candidate.unlink()
+            return
+        if candidate.exists():
+            shutil.rmtree(candidate)
+
+    @staticmethod
+    def _copy_symlink(source_path: Union[str, Path], staged_path: Union[str, Path]) -> None:
+        source = Path(source_path)
+        staged = Path(staged_path)
+        if staged.exists() or staged.is_symlink():
+            WriteDots._remove_existing_path(staged)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(os.readlink(source), staged)
 
     @staticmethod
     def _copy_path_to_stage(source_path: Union[str, Path], staged_path: Union[str, Path]) -> bool:
         source = Path(source_path)
         staged = Path(staged_path)
-        if not source.exists():
+        if not WriteDots._path_exists_or_link(source):
             return False
+        if source.is_symlink():
+            WriteDots._copy_symlink(source, staged)
+            return True
         staged.parent.mkdir(parents=True, exist_ok=True)
         if source.is_dir():
-            if staged.exists():
-                shutil.rmtree(staged)
-            shutil.copytree(source, staged)
+            if staged.exists() or staged.is_symlink():
+                WriteDots._remove_existing_path(staged)
+            shutil.copytree(source, staged, symlinks=True)
         else:
             shutil.copy2(source, staged)
         return True
@@ -1369,7 +1403,7 @@ class WriteDots:
                     matches.append((rel_path, relative_match))
                 continue
             candidate = root / rel_path
-            if candidate.exists() and rel_path not in seen:
+            if WriteDots._path_exists_or_link(candidate) and rel_path not in seen:
                 seen.add(rel_path)
                 matches.append((rel_path, rel_path))
         return matches
@@ -1485,14 +1519,14 @@ class WriteDots:
             relative = candidate.relative_to(data_root).as_posix()
             if not self._matches_ignored_path(relative, ignored_paths):
                 continue
-            if candidate.is_dir():
-                shutil.rmtree(candidate, ignore_errors=True)
-            else:
+            if candidate.is_symlink() or candidate.is_file():
                 candidate.unlink()
+            elif candidate.is_dir():
+                shutil.rmtree(candidate, ignore_errors=True)
         for candidate in sorted(staged.rglob("*"), key=lambda path: len(path.parts), reverse=True):
-            if candidate.is_dir() and not any(candidate.iterdir()):
+            if candidate.is_dir() and not candidate.is_symlink() and not any(candidate.iterdir()):
                 candidate.rmdir()
-        if staged != data_root and staged.exists() and staged.is_dir() and not any(staged.iterdir()):
+        if staged != data_root and staged.exists() and staged.is_dir() and not staged.is_symlink() and not any(staged.iterdir()):
             staged.rmdir()
 
     @staticmethod
@@ -1513,6 +1547,25 @@ class WriteDots:
         action = DeezUtils.normalize_action(action)
         src = Path(src_path)
         tgt = Path(tgt_path)
+        if src.is_symlink():
+            if action == "preserve" and (tgt.exists() or tgt.is_symlink()):
+                return False
+            if tgt.exists() or tgt.is_symlink():
+                if tgt.is_dir() and not tgt.is_symlink() and clean_target:
+                    backup_parent = tgt.parent
+                    backup_name = tgt.name + ".old"
+                    backup_path = backup_parent / backup_name
+                    counter = 1
+                    while backup_path.exists():
+                        backup_path = backup_parent / f"{backup_name}.{counter}"
+                        counter += 1
+                    shutil.move(str(tgt), str(backup_path))
+                    LOG.debug("Clean build: moved existing %s -> %s", tgt, backup_path)
+                else:
+                    WriteDots._remove_existing_path(tgt)
+            tgt.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(os.readlink(src), tgt)
+            return True
         if src.is_dir():
             if action == "sync":
                 if tgt.exists() and clean_target:
@@ -1614,7 +1667,7 @@ class WriteDots:
             clean_target = bool(entry.get("clean_target", False))
             entry_metadata = dict(entry.get("entry_metadata") or {})
             entry_stage_root = data_dir / archive_root if archive_root else data_dir
-            if not src_root.exists():
+            if not self._path_exists_or_link(src_root):
                 LOG.debug("Stage: source root missing %s", src_root)
                 if warn_on_missing:
                     UI.warn(f"Source root missing: {src_root}")
@@ -1636,8 +1689,8 @@ class WriteDots:
             for rel_pattern, rel_path in expanded_paths:
                 src_path = src_root / rel_path
                 dest_path = entry_stage_root / rel_path
-                source_file_count = len(self._expand_files(src_path)) if src_path.exists() else 0
-                if not src_path.exists():
+                source_file_count = len(self._expand_files(src_path)) if self._path_exists_or_link(src_path) else 0
+                if not self._path_exists_or_link(src_path):
                     LOG.debug("Stage: source missing %s", src_path)
                     if warn_on_missing:
                         UI.warn(f"Source path missing: {src_path}")
@@ -2162,8 +2215,9 @@ class DeezCLI:
         self.available_package_managers = available_package_managers
         self.distribution = distribution
         global_config = main_config.get("global", {})
-        self._has_explicit_dot_selection = "dots" in global_config
-        global_dots = global_config.get("dots")
+        self.global_config = global_config if isinstance(global_config, dict) else {}
+        self._has_explicit_dot_selection = "dots" in self.global_config
+        global_dots = self.global_config.get("dots")
         if self._has_explicit_dot_selection:
             self.dotfile_sections = [dot for dot in (global_dots or []) if dot in main_config and isinstance(main_config.get(dot), dict)]
         else:
@@ -2181,6 +2235,25 @@ class DeezCLI:
             return bool(stdin and stdout and stdin.isatty() and stdout.isatty())
         except Exception:
             return False
+    def _dot_description(self, dot: str) -> str:
+        dot_data = self.main_config.get(dot, {})
+        if not isinstance(dot_data, dict):
+            return ""
+        return _normalize_description(dot_data.get("description"))
+
+    def _dot_selection_label(self, dot: str) -> str:
+        dot_data = self.main_config.get(dot, {})
+        if not isinstance(dot_data, dict):
+            dot_data = {}
+        file_count = len(list(self._iter_raw_file_entries(dot_data)))
+        if not file_count and dot_data.get("paths"):
+            file_count = 1
+        owner = dot_data.get("owner") or self.global_config.get("owner") or "?"
+        label = f"{dot:<22} owner: {owner:<28} file entries: {file_count}"
+        description = self._dot_description(dot)
+        if description:
+            label = f"{label}  desc: {description}"
+        return label
 
     def _resolve_config_dot_targets(self, action_label: str) -> List[str]:
         available = list(self.dotfile_sections)
@@ -2189,14 +2262,7 @@ class DeezCLI:
             return []
         if self._has_explicit_dot_selection or len(available) <= 1 or not self._can_prompt_for_selection():
             return available
-        labels: List[str] = []
-        for dot in available:
-            dot_data = self.main_config.get(dot, {})
-            file_count = len(list(self._iter_raw_file_entries(dot_data)))
-            if not file_count and dot_data.get("paths"):
-                file_count = 1
-            owner = dot_data.get("owner") or self.main_config.get("global", {}).get("owner") or "?"
-            labels.append(f"{dot:<22} owner: {owner:<28} file entries: {file_count}")
+        labels = [self._dot_selection_label(dot) for dot in available]
         UI.plain("\nDiscovered dots:")
         selected = InteractiveMenu.choose_many(f"Select dots to {action_label}", available, labels=labels)
         if not selected:
@@ -2885,7 +2951,7 @@ class DeezCLI:
                     destination_path = file_entry.get("dst")
                     entry_action = DeezUtils.normalize_action(file_entry.get("action"))
                     source_path = bundle_data_dir / source_rel_path
-                    if not source_path.exists():
+                    if not writer._path_exists_or_link(source_path):
                         LOG.debug("Missing in bundle: %s", source_rel_path)
                         continue
                     if writer._copy_with_action(source_path, destination_path, entry_action, clean_target=clean_target):
@@ -3262,7 +3328,10 @@ def main() -> None:
     cache_parser.add_argument("--keep", type=int, default=10, help="Number of newest cache entries to keep when pruning (default: 10)")
     cache_parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would be deleted without removing files")
 
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    if argv and argv[-1] == "--":
+        argv = argv[:-1]
+    args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
         return
@@ -3408,6 +3477,11 @@ def main() -> None:
             raise SystemExit(1)
     else:
         main_config = {"global": {}}
+    loaded_global_config = main_config.get("global", {})
+    if isinstance(loaded_global_config, dict):
+        config_description = _normalize_description(loaded_global_config.get("description"))
+        if config_description:
+            UI.info(f"Config description: {config_description}")
 
     global_config = main_config.get("global", {})
     home = os.path.expandvars(global_config.get("home", "$HOME"))
