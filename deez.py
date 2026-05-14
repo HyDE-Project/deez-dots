@@ -2247,6 +2247,76 @@ class DeezCLI:
         return _normalize_description(dot_data.get("description"))
 
     @staticmethod
+    def _hook_cwd(source_dir: Optional[Union[str, Path]]) -> Optional[str]:
+        if not source_dir:
+            return None
+        path = Path(source_dir).expanduser()
+        return str(path) if path.exists() else None
+
+    @staticmethod
+    def _file_entry_label(dot: str, file_entry: Dict[str, Any]) -> str:
+        label_source = file_entry.get("src") or file_entry.get("paths") or file_entry.get("dst") or file_entry.get("source_root") or "file entry"
+        if isinstance(label_source, list):
+            parts = [str(item).strip() for item in label_source if str(item).strip()]
+            preview = ", ".join(parts[:2])
+            if len(parts) > 2:
+                preview = f"{preview}, ..."
+        else:
+            preview = str(label_source).strip()
+        return f"file entry in '{dot}' ({preview or 'file entry'})"
+
+    def _run_scoped_pre_command(
+        self,
+        command: Optional[str],
+        *,
+        scope_label: str,
+        cwd: Optional[Union[str, Path]] = None,
+    ) -> Optional[str]:
+        if not command:
+            return None
+        writer = WriteDots()
+        try:
+            writer.execute_commands([command], cwd=cwd, soft_fail=False)
+        except Exception as exc:
+            message = str(exc).strip() or "command failed"
+            LOG.warning("[PRE] %s failed: %s", scope_label, message)
+            return message
+        LOG.debug("[PRE] %s passed", scope_label)
+        return None
+
+    def _require_pre_command(
+        self,
+        command: Optional[str],
+        *,
+        scope_label: str,
+        cwd: Optional[Union[str, Path]] = None,
+    ) -> None:
+        failure = self._run_scoped_pre_command(command, scope_label=scope_label, cwd=cwd)
+        if failure is None:
+            return
+        UI.error(f"{scope_label} pre_command failed: {command}: {failure}")
+        raise SystemExit(1)
+
+    def _skip_on_failed_pre_command(
+        self,
+        command: Optional[str],
+        *,
+        scope_label: str,
+        cwd: Optional[Union[str, Path]] = None,
+    ) -> bool:
+        failure = self._run_scoped_pre_command(command, scope_label=scope_label, cwd=cwd)
+        if failure is None:
+            return False
+        UI.warn(f"Skipping {scope_label}: pre_command failed: {command}: {failure}")
+        return True
+
+    @staticmethod
+    def _announce_dry_run_pre_command(command: Optional[str], *, scope_label: str) -> None:
+        if not command:
+            return
+        UI.plain(f"[DRY RUN] Would run {scope_label} pre_command: {command} (assuming success)")
+
+    @staticmethod
     def _normalize_conflict_names(value: Any) -> List[str]:
         if not value:
             return []
@@ -2775,12 +2845,13 @@ class DeezCLI:
                 remaining_pairs.remove(entry_key)
         return dot, bundle_entries, filtered_entries, kept_pairs
 
-    def _do_package(self, global_owner: str, global_home: str, global_version: str, git_url: str = "", target_branch: str = "", compress: bool = True, out_dir: Optional[str] = None, overwrite_existing: bool = False, sections: Optional[List[str]] = None) -> List[str]:
+    def _do_package(self, global_owner: str, global_home: str, global_version: str, git_url: str = "", target_branch: str = "", compress: bool = True, out_dir: Optional[str] = None, overwrite_existing: bool = False, sections: Optional[List[str]] = None, dry_run: bool = False) -> List[str]:
         writer = WriteDots()
         git_handler = GitHandler(self.main_config)
         githash = git_handler.get_githash(self.source_dir)
         pkg_paths: List[str] = []
         selected_sections = sections if sections is not None else self.dotfile_sections
+        hook_cwd = self._hook_cwd(self.source_dir)
         for dot_section in selected_sections:
             UI.set_loader_message(f"Bundling {dot_section}...")
             dot_data = self.main_config.get(dot_section, {})
@@ -2792,6 +2863,10 @@ class DeezCLI:
             pre_command = dot_data.get("pre_command")
             post_command = dot_data.get("post_command")
             build_command = dot_data.get("build_command")
+            if dry_run:
+                self._announce_dry_run_pre_command(pre_command, scope_label=f"dot '{dot_section}'")
+            elif self._skip_on_failed_pre_command(pre_command, scope_label=f"dot '{dot_section}'", cwd=hook_cwd):
+                continue
             if build_command:
                 writer.execute_commands([build_command], cwd=self.source_dir)
             section_home = os.path.expandvars(dot_data.get("home", global_home))
@@ -2810,6 +2885,11 @@ class DeezCLI:
                     }
                 ]
             for file_entry in raw_file_entries:
+                entry_pre_command = file_entry.get("pre_command")
+                if dry_run:
+                    self._announce_dry_run_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, file_entry))
+                elif self._skip_on_failed_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, file_entry), cwd=hook_cwd):
+                    continue
                 entry_build_command = file_entry.get("build_command")
                 if entry_build_command:
                     writer.execute_commands([entry_build_command], cwd=self.source_dir)
@@ -2829,6 +2909,7 @@ class DeezCLI:
                             "source_root": file_entry.get("source_root") or "",
                             "dependency": DeezUtils.normalize_dependency_blocks(file_entry.get("dependency") or file_entry.get("depends")) or None,
                             "conflicted_paths": [str(Path(target_root) / path) for path in conflicted_paths] or None,
+                            "pre_command": entry_pre_command,
                         },
                         "action": action,
                         "clean_target": clean_target,
@@ -2860,10 +2941,11 @@ class DeezCLI:
             UI.info("Bundling complete")
         return pkg_paths
 
-    def _do_export(self, global_owner: str, global_home: str, global_version: str, sections: Optional[List[str]] = None, compress: bool = True, overwrite_existing: bool = False) -> None:
+    def _do_export(self, global_owner: str, global_home: str, global_version: str, sections: Optional[List[str]] = None, compress: bool = True, overwrite_existing: bool = False, dry_run: bool = False) -> None:
         writer = WriteDots()
         available_sections = self.dotfile_sections or self.manifest_manager.list_dots()
         selected_sections = available_sections if not sections else sections
+        hook_cwd = self._hook_cwd(self.source_dir)
         for dot_section in selected_sections:
             UI.set_loader_message(f"Exporting {dot_section}...")
             if dot_section in self.main_config:
@@ -2871,6 +2953,10 @@ class DeezCLI:
                 section_owner = dot_data.get("owner", global_owner)
                 section_version = dot_data.get("version", global_version)
                 section_home = os.path.expandvars(dot_data.get("home", global_home))
+                if dry_run:
+                    self._announce_dry_run_pre_command(dot_data.get("pre_command"), scope_label=f"dot '{dot_section}'")
+                elif self._skip_on_failed_pre_command(dot_data.get("pre_command"), scope_label=f"dot '{dot_section}'", cwd=hook_cwd):
+                    continue
                 manifest_meta = {
                     "name": dot_section,
                     "owner": section_owner,
@@ -2917,6 +3003,11 @@ class DeezCLI:
                     )
                 else:
                     for raw_file_entry in self._iter_raw_file_entries(dot_data):
+                        entry_pre_command = raw_file_entry.get("pre_command")
+                        if dry_run:
+                            self._announce_dry_run_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, raw_file_entry))
+                        elif self._skip_on_failed_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, raw_file_entry), cwd=hook_cwd):
+                            continue
                         _source_root, tgt_root, rel_paths, ignored_paths, action, clean_target, conflicted_paths = self._resolve_file_entry(
                             dot_data,
                             raw_file_entry,
@@ -2933,6 +3024,7 @@ class DeezCLI:
                                     "source_root": raw_file_entry.get("source_root") or "",
                                     "dependency": DeezUtils.normalize_dependency_blocks(raw_file_entry.get("dependency") or raw_file_entry.get("depends")) or None,
                                     "conflicted_paths": [str(Path(tgt_root) / path) for path in conflicted_paths] or None,
+                                    "pre_command": entry_pre_command,
                                 },
                                 "action": action,
                                 "clean_target": clean_target,
@@ -3007,7 +3099,10 @@ class DeezCLI:
                 prepared_bundle = self._prepare_bundle_install(bundle_path, bundle)
                 if prepared_bundle is None:
                     continue
-                dot, _bundle_entries, _filtered_entries, kept_pairs = prepared_bundle
+                dot, _bundle_entries, filtered_entries, kept_pairs = prepared_bundle
+                self._announce_dry_run_pre_command(bundle.get("pre_command"), scope_label=f"dot '{dot}'")
+                for file_entry in filtered_entries:
+                    self._announce_dry_run_pre_command(file_entry.get("pre_command"), scope_label=self._file_entry_label(dot, file_entry))
                 UI.plain(f"[DRY RUN] [INSTALL] '{dot}' would be installed ({len(kept_pairs)} files).")
                 continue
             temp_install_dir = Path(tempfile.mkdtemp(prefix="deez-install-"))
@@ -3024,12 +3119,20 @@ class DeezCLI:
                 if prepared_bundle is None:
                     continue
                 dot, bundle_entries, filtered_entries, _kept_pairs = prepared_bundle
+                if self._skip_on_failed_pre_command(bundle.get("pre_command"), scope_label=f"dot '{dot}'"):
+                    continue
+                install_entries: List[Dict[str, Any]] = []
+                for file_entry in filtered_entries:
+                    if self._skip_on_failed_pre_command(file_entry.get("pre_command"), scope_label=self._file_entry_label(dot, file_entry)):
+                        continue
+                    install_entries.append(file_entry)
+                filtered_entries = install_entries
+                if not filtered_entries:
+                    UI.info(f"'{dot}' skipped — all file entries failed pre_command.")
+                    continue
                 if not no_backup:
                     backup_desc = self.manifest_manager.load_desc(dot) or {k: v for k, v in bundle.items() if k != "files"}
                     writer.backup_to_tarball(dot, filtered_entries, desc_data=backup_desc)
-                dot_pre = bundle.get("pre_command")
-                if dot_pre:
-                    writer.execute_commands([dot_pre])
                 deployed_pairs: List[Dict[str, Any]] = []
                 adopted_pairs: List[Dict[str, Any]] = []
                 bundle_data_dir = temp_install_dir / "data"
@@ -3277,6 +3380,8 @@ class DeezCLI:
         global_pre_command = global_config.get("pre_command")
         global_post_command = global_config.get("post_command")
         global_build_command = global_config.get("build_command")
+        hook_cwd = self._hook_cwd(self.source_dir)
+        dry_run = bool(getattr(self.args, "dry_run", False))
         _hook_runner = WriteDots()
         if getattr(self.args, "do_package", False):
             if git_url:
@@ -3285,17 +3390,29 @@ class DeezCLI:
             selected_sections = self._resolve_config_dot_targets("bundle")
             if not selected_sections:
                 return
+            if dry_run:
+                self._announce_dry_run_pre_command(global_pre_command, scope_label="global")
+            else:
+                self._require_pre_command(global_pre_command, scope_label="global", cwd=hook_cwd)
             UI.set_loader_message("Bundling selected dots...")
             if global_build_command:
                 _hook_runner.execute_commands([global_build_command], cwd=self.source_dir)
-            self._do_package(global_owner, global_home, global_version, git_url=git_url, target_branch=target_branch, compress=compress, overwrite_existing=getattr(self.args, "force", False), sections=selected_sections)
+            self._do_package(global_owner, global_home, global_version, git_url=git_url, target_branch=target_branch, compress=compress, overwrite_existing=getattr(self.args, "force", False), sections=selected_sections, dry_run=dry_run)
             return
         if getattr(self.args, "do_export", False):
             compress = not getattr(self.args, "no_compress", False)
+            if dry_run:
+                self._announce_dry_run_pre_command(global_pre_command, scope_label="global")
+            else:
+                self._require_pre_command(global_pre_command, scope_label="global", cwd=hook_cwd)
             UI.set_loader_message("Exporting dots...")
-            self._do_export(global_owner, global_home, global_version, getattr(self.args, "export_sections", None), compress=compress, overwrite_existing=getattr(self.args, "force", False))
+            self._do_export(global_owner, global_home, global_version, getattr(self.args, "export_sections", None), compress=compress, overwrite_existing=getattr(self.args, "force", False), dry_run=dry_run)
             return
         if getattr(self.args, "do_install", False):
+            if dry_run:
+                self._announce_dry_run_pre_command(global_pre_command, scope_label="global")
+            else:
+                self._require_pre_command(global_pre_command, scope_label="global", cwd=hook_cwd)
             UI.set_loader_message("Installing bundles...")
             self._do_install(self.args.install_tarballs, getattr(self.args, "dry_run", False))
             return
@@ -3309,10 +3426,12 @@ class DeezCLI:
             self._resolve_config_dependencies(selected_sections)
             tmp_dir = tempfile.mkdtemp(prefix="deez-deploy-")
             try:
-                if global_pre_command:
-                    _hook_runner.execute_commands([global_pre_command], cwd=self.source_dir)
+                if dry_run:
+                    self._announce_dry_run_pre_command(global_pre_command, scope_label="global")
+                else:
+                    self._require_pre_command(global_pre_command, scope_label="global", cwd=hook_cwd)
                 UI.set_loader_message("Bundling selected dots...")
-                pkg_paths = self._do_package(global_owner, global_home, global_version, git_url=git_url, target_branch=target_branch, out_dir=tmp_dir, sections=selected_sections)
+                pkg_paths = self._do_package(global_owner, global_home, global_version, git_url=git_url, target_branch=target_branch, out_dir=tmp_dir, sections=selected_sections, dry_run=dry_run)
                 if not pkg_paths:
                     UI.error("Deploy failed: bundling produced no bundles.")
                     raise SystemExit(1)

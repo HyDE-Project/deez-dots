@@ -700,6 +700,120 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled dolphin ->", result.stdout)
 
+    def test_dots_package_global_pre_command_failure_aborts(self):
+        source_dir = Path(self.tmpdir.name) / "source-global-pre"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        config_path = Path(self.tmpdir.name) / "global-pre.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            'pre_command = "false"\n'
+            '\n'
+            '[kitty]\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("global pre_command failed", result.stdout)
+        self.assertNotIn("Bundled kitty", result.stdout)
+
+    def test_dots_package_dry_run_announces_global_pre_command_and_assumes_success(self):
+        source_dir = Path(self.tmpdir.name) / "source-global-pre-dry-run"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        config_path = Path(self.tmpdir.name) / "global-pre-dry-run.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            'pre_command = "false"\n'
+            '\n'
+            '[kitty]\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--dry-run", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[DRY RUN] Would run global pre_command: false (assuming success)", result.stdout)
+        self.assertIn("[ok] Bundled kitty ->", result.stdout)
+
+    def test_dots_package_dot_pre_command_failure_skips_only_that_dot(self):
+        source_dir = Path(self.tmpdir.name) / "source-dot-pre"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/waybar").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        (source_dir / ".config/waybar/config.jsonc").write_text("{}")
+        config_path = Path(self.tmpdir.name) / "dot-pre.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            'pre_command = "false"\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+            '\n'
+            '[waybar]\n'
+            'paths = [".config/waybar/config.jsonc"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Skipping dot 'kitty': pre_command failed", result.stdout)
+        self.assertIn("[ok] Bundled waybar ->", result.stdout)
+        self.assertNotIn("[ok] Bundled kitty ->", result.stdout)
+
+    def test_dots_package_file_pre_command_failure_skips_only_that_entry(self):
+        source_dir = Path(self.tmpdir.name) / "source-file-pre"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        (source_dir / ".config/kitty/theme.conf").write_text("include theme")
+        bundle_path = SCRIPT_DIR / "build" / "kitty-file-pre-2.0.0.tar.gz"
+        if bundle_path.exists():
+            bundle_path.unlink()
+        config_path = Path(self.tmpdir.name) / "file-pre.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "2.0.0"\n'
+            '\n'
+            '[kitty-file-pre]\n'
+            '[[kitty-file-pre.files]]\n'
+            'pre_command = "false"\n'
+            'source_root = ".config/kitty"\n'
+            'target_root = "$HOME/.config/kitty"\n'
+            'paths = ["theme.conf"]\n'
+            '\n'
+            '[[kitty-file-pre.files]]\n'
+            'source_root = ".config/kitty"\n'
+            'target_root = "$HOME/.config/kitty"\n'
+            'paths = ["kitty.conf"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Skipping file entry in 'kitty-file-pre' (theme.conf): pre_command failed", result.stdout)
+        self.assertTrue(bundle_path.exists())
+        with tarfile.open(bundle_path, "r:gz") as tar:
+            manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
+        self.assertIn('src = ".config/kitty/kitty.conf"', manifest_text)
+        self.assertNotIn('src = ".config/kitty/theme.conf"', manifest_text)
+
     def test_dots_package_without_config_shows_clear_error(self):
         result = self.run_cli(["dots", "--package"])
 
@@ -1798,6 +1912,54 @@ class TestDeezCLI(unittest.TestCase):
         result = self.run_cli(["dots", "--install", str(bundle_path), "--dry-run"])
         self.assertEqual(result.returncode, 0)
         self.assertIn("[DRY RUN] [INSTALL] 'kitty' would be installed (1 files).", result.stdout)
+
+    def test_dots_install_pre_command_skips_bundle_and_file_scope(self):
+        bundle_skip = self._make_bundle_tarball(
+            Path(self.tmpdir.name) / "kitty-bundle-pre.tar.gz",
+            name="kitty-bundle-pre",
+            owner="hyde_project",
+            version="1.0",
+            files=[{"src": "kitty.conf", "dst": f"{self.home_dir}/.config/kitty/kitty.conf"}],
+            extra_meta={"pre_command": "false"},
+        )
+        bundle_partial = self._make_bundle_tarball(
+            Path(self.tmpdir.name) / "kitty-file-pre.tar.gz",
+            name="kitty-file-pre-install",
+            owner="hyde_project",
+            version="1.0",
+            files=[
+                {"src": "theme.conf", "dst": f"{self.home_dir}/.config/kitty/theme.conf", "pre_command": "false"},
+                {"src": "kitty.conf", "dst": f"{self.home_dir}/.config/kitty/kitty.conf"},
+            ],
+        )
+
+        result = self.run_cli(["dots", "--install", str(bundle_skip), str(bundle_partial), "--no-backup"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Skipping dot 'kitty-bundle-pre': pre_command failed", result.stdout)
+        self.assertIn("Skipping file entry in 'kitty-file-pre-install' (theme.conf): pre_command failed", result.stdout)
+        self.assertTrue((self.home_dir / ".config/kitty/kitty.conf").exists())
+        self.assertFalse((self.home_dir / ".config/kitty/theme.conf").exists())
+
+    def test_dots_install_dry_run_announces_bundle_and_file_pre_commands(self):
+        bundle_path = self._make_bundle_tarball(
+            Path(self.tmpdir.name) / "kitty-install-dry-pre.tar.gz",
+            name="kitty-install-dry-pre",
+            owner="hyde_project",
+            version="1.0",
+            files=[
+                {"src": "theme.conf", "dst": f"{self.home_dir}/.config/kitty/theme.conf", "pre_command": "false"},
+                {"src": "kitty.conf", "dst": f"{self.home_dir}/.config/kitty/kitty.conf"},
+            ],
+            extra_meta={"pre_command": "false"},
+        )
+
+        result = self.run_cli(["dots", "--install", str(bundle_path), "--dry-run"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[DRY RUN] Would run dot 'kitty-install-dry-pre' pre_command: false (assuming success)", result.stdout)
+        self.assertIn("[DRY RUN] Would run file entry in 'kitty-install-dry-pre' (theme.conf) pre_command: false (assuming success)", result.stdout)
+        self.assertIn("[DRY RUN] [INSTALL] 'kitty-install-dry-pre' would be installed (2 files).", result.stdout)
 
     def test_dots_install_installs_missing_dependencies_before_copy(self):
         bundle_path = self._make_bundle_tarball(
