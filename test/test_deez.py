@@ -770,6 +770,73 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
 
+    def test_dots_package_supports_dot_level_tarball_source_legacy_entry(self):
+        archive_path = self._make_source_archive(
+            Path(self.tmpdir.name) / "cursor-theme.tar.gz",
+            {"theme/cursor.theme": "cursor theme"},
+        )
+        config_path = Path(self.tmpdir.name) / "dot-level-source-legacy.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[cursor_theme]\n'
+            f'source = "{archive_path}"\n'
+            'source_root = "theme"\n'
+            'target_root = "$HOME/.local/share/icons"\n'
+            'paths = "cursor.theme"\n'
+        )
+        bundle_path = SCRIPT_DIR / "build" / "cursor_theme-0.1.0.tar.gz"
+        if bundle_path.exists():
+            bundle_path.unlink()
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled cursor_theme ->", result.stdout)
+        with tarfile.open(bundle_path, "r:gz") as tar:
+            manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
+        self.assertIn(f'source = "{archive_path}"', manifest_text)
+        self.assertIn('src = "theme/cursor.theme"', manifest_text)
+
+    def test_dots_package_file_entries_inherit_dot_level_source(self):
+        global_source = Path(self.tmpdir.name) / "global-source"
+        (global_source / ".config/global").mkdir(parents=True, exist_ok=True)
+        (global_source / ".config/global/global.conf").write_text("global setting")
+        archive_path = self._make_source_archive(
+            Path(self.tmpdir.name) / "dot-source-files.tar.gz",
+            {".config/kitty/kitty.conf": "font_size 12"},
+        )
+        config_path = Path(self.tmpdir.name) / "dot-level-source-files.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{global_source}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            f'source = "{archive_path}"\n'
+            '[[kitty.files]]\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty/kitty.conf"]\n'
+        )
+        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
+        if bundle_path.exists():
+            bundle_path.unlink()
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled kitty ->", result.stdout)
+        with tarfile.open(bundle_path, "r:gz") as tar:
+            manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
+        self.assertIn(f'source = "{archive_path}"', manifest_text)
+        self.assertIn('src = ".config/kitty/kitty.conf"', manifest_text)
+
     def test_dots_package_supports_file_url_tarball_source_override(self):
         archive_path = self._make_source_archive(
             Path(self.tmpdir.name) / "assets-url.tar.gz",

@@ -1,0 +1,24 @@
+# A test to install archives
+
+
+[global] #  This is used to define global variables use for default fallbacks
+owner = "The HyDE Project"                       # Owner of the configuration file
+description = "Archive installer"
+version = "0.1.0"                                # Version of the configuration file // Follows Semantic Versioning
+action= "sync"                       # Actions can either be sync or preserve
+# git = "https://github.com/HyDE-Project/HyDE.git"
+# git_branch = "dev"
+source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Cursor_BibataIce.tar.gz"
+# dots =[
+    # "kitty","hyprland",
+# ] # List of dots to be used in the configuration file
+# pre_command = "echo 'starting deployment'"
+# post_command = "notify-send 'deez done'"
+
+
+[Cursor_BibataIce]
+source = "https://github.com/HyDE-Project/HyDE/raw/refs/heads/master/Source/arcs/Cursor_BibataIce.tar.gz"
+source_root = "."
+target_root = "${XDG_DATA_HOME}/icons"
+paths = "."
+

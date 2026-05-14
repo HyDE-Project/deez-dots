@@ -2844,18 +2844,35 @@ class DeezCLI:
                     if isinstance(nested_entry, dict):
                         yield nested_entry
 
+    def _resolve_dot_source(
+        self,
+        dot_data: Dict[str, Any],
+        git_handler: "GitHandler",
+        default_source_url: str,
+        target_branch: str,
+    ) -> Tuple[str, str, str]:
+        dot_source = dot_data.get("source")
+        if not dot_source:
+            return self.source_dir, default_source_url, target_branch
+        source_text = DeezUtils.expand(dot_source)
+        dot_branch = dot_data.get("branch") or dot_data.get("git_branch") or target_branch
+        source_dir = git_handler.prepare_source(source_text, None, dot_branch, explicit_source_path=True)
+        return source_dir, source_text, dot_branch
+
     def _resolve_file_entry(
         self,
         dot_data: Dict[str, Any],
         file_entry: Dict[str, Any],
         default_target_root: str,
+        source_dir: Optional[str] = None,
     ) -> Tuple[str, str, List[str], List[str], str, bool, List[str]]:
+        resolved_source_dir = source_dir or self.source_dir
         source_root_value = file_entry.get("source_root")
         if source_root_value:
             expanded_source_root = DeezUtils.expand(source_root_value)
-            source_root = expanded_source_root if os.path.isabs(expanded_source_root) else os.path.join(self.source_dir, expanded_source_root)
+            source_root = expanded_source_root if os.path.isabs(expanded_source_root) else os.path.join(resolved_source_dir, expanded_source_root)
         else:
-            source_root = self.source_dir
+            source_root = resolved_source_dir
         target_root = DeezUtils.expand(file_entry.get("target_root") or default_target_root)
         relative_paths = file_entry.get("paths")
         relative_paths = DeezUtils.expand(relative_paths) if relative_paths else []
@@ -2870,7 +2887,7 @@ class DeezCLI:
         conflicted_paths = self._normalize_conflicted_paths(file_entry.get("conflicted_paths"))
         return source_root, target_root, relative_paths, ignored_paths, action, clean_target, conflicted_paths
 
-    def _iter_file_entries(self, dot_section: str, global_owner: str, global_home: str, global_version: str):
+    def _iter_file_entries(self, dot_section: str, global_owner: str, global_home: str, global_version: str, source_dir: Optional[str] = None):
         dot_data = self.main_config.get(dot_section, {})
         section_owner = DeezUtils.normalize_owner(dot_data.get("owner", global_owner))
         section_version = dot_data.get("version", global_version)
@@ -2885,11 +2902,11 @@ class DeezCLI:
                 "action": dot_data.get("action"),
                 "clean_target": dot_data.get("clean_target", False),
             }
-            yield self._resolve_file_entry(dot_data, legacy_entry, section_home) + (section_owner, section_version)
+            yield self._resolve_file_entry(dot_data, legacy_entry, section_home, source_dir) + (section_owner, section_version)
             return
 
         for file_entry in self._iter_raw_file_entries(dot_data):
-            yield self._resolve_file_entry(dot_data, file_entry, section_home) + (section_owner, section_version)
+            yield self._resolve_file_entry(dot_data, file_entry, section_home, source_dir) + (section_owner, section_version)
 
     def _check_conflicts_from_bundle(
         self,
@@ -2993,13 +3010,15 @@ class DeezCLI:
     def _do_package(self, global_owner: str, global_home: str, global_version: str, git_url: str = "", target_branch: str = "", compress: bool = True, out_dir: Optional[str] = None, overwrite_existing: bool = False, sections: Optional[List[str]] = None, dry_run: bool = False) -> List[str]:
         writer = WriteDots()
         git_handler = GitHandler(self.main_config)
-        githash = git_handler.get_githash(self.source_dir)
         pkg_paths: List[str] = []
         selected_sections = sections if sections is not None else self.dotfile_sections
-        hook_cwd = self._hook_cwd(self.source_dir)
+        default_source_url = self.global_config.get("source") or git_url
         for dot_section in selected_sections:
             UI.set_loader_message(f"Bundling {dot_section}...")
             dot_data = self.main_config.get(dot_section, {})
+            dot_source_dir, dot_source_url, dot_target_branch = self._resolve_dot_source(dot_data, git_handler, default_source_url, target_branch)
+            githash = git_handler.get_githash(dot_source_dir)
+            hook_cwd = self._hook_cwd(dot_source_dir)
             section_owner = dot_data.get("owner", global_owner)
             section_version = dot_data.get("version", global_version)
             dependency = DeezUtils.normalize_dependency_blocks(dot_data.get("dependency") or dot_data.get("depends"))
@@ -3013,7 +3032,7 @@ class DeezCLI:
             elif self._skip_on_failed_pre_command(pre_command, scope_label=f"dot '{dot_section}'", cwd=hook_cwd):
                 continue
             if build_command:
-                writer.execute_commands([build_command], cwd=self.source_dir)
+                writer.execute_commands([build_command], cwd=dot_source_dir)
             section_home = os.path.expandvars(dot_data.get("home", global_home))
 
             file_entries: List[Dict[str, Any]] = []
@@ -3037,11 +3056,12 @@ class DeezCLI:
                     continue
                 entry_build_command = file_entry.get("build_command")
                 if entry_build_command:
-                    writer.execute_commands([entry_build_command], cwd=self.source_dir)
+                    writer.execute_commands([entry_build_command], cwd=dot_source_dir)
                 source_root, target_root, relative_paths, ignored_paths, action, clean_target, conflicted_paths = self._resolve_file_entry(
                     dot_data,
                     file_entry,
                     section_home,
+                    dot_source_dir,
                 )
                 file_entries.append(
                     {
@@ -3066,8 +3086,8 @@ class DeezCLI:
                 owner=section_owner,
                 version=section_version,
                 githash=githash,
-                source_url=git_url,
-                branch=target_branch,
+                source_url=dot_source_url,
+                branch=dot_target_branch,
                 dependency=dependency,
                 conflicts=conflicts,
                 compress=compress,
@@ -3933,6 +3953,11 @@ def main() -> None:
     source_override = getattr(args, "source", None)
     source_dir = source_override or global_config.get("source")
     explicit_source_path = bool(source_dir)
+    has_dot_level_source = any(
+        isinstance(dot_data, dict) and dot_data.get("source")
+        for name, dot_data in main_config.items()
+        if name != "global"
+    )
     if not source_dir:
         xdg_cache = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
         if not owner or not name:
@@ -3942,7 +3967,13 @@ def main() -> None:
                 owner, name = "unknown", "unknown"
         source_dir = GitHandler.source_cache_path(xdg_cache, owner, name, target_branch)
     source_dir = os.path.expandvars(os.path.expanduser(source_dir))
-    need_source = bool(args.do_package or args.do_deploy or (args.do_install and not args.from_stage))
+    skip_global_source_prepare = bool(
+        has_dot_level_source and not source_override and not global_config.get("source") and not git_url
+    )
+    need_source = bool(
+        ((args.do_package or args.do_deploy) and not skip_global_source_prepare)
+        or (args.do_install and not args.from_stage)
+    )
 
     loader_started = False
     if UI.can_use_loader(debug=bool(getattr(args, "debug", False))):
