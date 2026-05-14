@@ -2250,10 +2250,15 @@ class DeezCLI:
 
     def _dot_selection_header(self, action_label: str) -> str:
         global_description = _normalize_description(self.global_config.get("description"))
-        if global_description:
-            return global_description
         owner_label = str(self.global_config.get("owner") or "?")
-        return f"{action_label} dots from {owner_label}"
+        raw = global_description if global_description else f"{action_label} dots from {owner_label}"
+        return self._selection_color(raw, UI._MAGENTA, bold=True)
+
+    def _selection_color(self, text: str, color: str, *, bold: bool = False) -> str:
+        if not UI._colors_enabled():
+            return text
+        prefix = f"{InteractiveMenu._BOLD}{color}" if bold else color
+        return f"{prefix}{text}{InteractiveMenu._RESET}"
 
     def _dot_selection_label(self, dot: str) -> str:
         dot_data = self.main_config.get(dot, {})
@@ -2263,10 +2268,14 @@ class DeezCLI:
         if not file_count and dot_data.get("paths"):
             file_count = 1
         owner = self._dot_owner(dot)
-        label = f"{dot} by {owner} with {file_count} entries"
+        colored_dot = self._selection_color(dot, InteractiveMenu._CYAN, bold=True)
+        colored_owner = self._selection_color(owner, InteractiveMenu._YELLOW)
+        colored_count = self._selection_color(str(file_count), UI._GREEN, bold=True)
+        label = f"{colored_dot} by {colored_owner} with {colored_count} entries"
         description = self._dot_description(dot)
         if description:
-            label = f"{dot} ({description}) by {owner} with {file_count} entries"
+            colored_description = self._selection_color(f"({description})", UI._MAGENTA)
+            label = f"{colored_dot} {colored_description} by {colored_owner} with {colored_count} entries"
         return label
 
     def _resolve_config_dot_targets(self, action_label: str) -> List[str]:
