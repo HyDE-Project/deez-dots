@@ -2263,10 +2263,10 @@ class DeezCLI:
         if not file_count and dot_data.get("paths"):
             file_count = 1
         owner = self._dot_owner(dot)
-        label = f"{dot} by {owner} = {file_count}"
+        label = f"{dot} by {owner} with {file_count} entries"
         description = self._dot_description(dot)
         if description:
-            label = f"{dot} ({description}) by {owner} = {file_count} entries"
+            label = f"{dot} ({description}) by {owner} with {file_count} entries"
         return label
 
     def _resolve_config_dot_targets(self, action_label: str) -> List[str]:
