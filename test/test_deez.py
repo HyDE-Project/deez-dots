@@ -443,6 +443,109 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
         self.assertIn("[ok] Bundled hyprland ->", result.stdout)
 
+    def test_dots_package_accepts_named_sections_after_flag(self):
+        source_dir = Path(self.tmpdir.name) / "source-package-named"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/hypr").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        (source_dir / ".config/hypr/hyprland.conf").write_text("monitor = eDP-1")
+        config_path = Path(self.tmpdir.name) / "named-package.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'name = "dots"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty/kitty.conf"]\n'
+            '\n'
+            '[hyprland]\n'
+            '[[hyprland.files]]\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["hypr/hyprland.conf"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "kitty", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled kitty ->", result.stdout)
+        self.assertNotIn("[ok] Bundled hyprland ->", result.stdout)
+
+    def test_dots_package_accepts_all_keyword(self):
+        source_dir = Path(self.tmpdir.name) / "source-package-all"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/hypr").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        (source_dir / ".config/hypr/hyprland.conf").write_text("monitor = eDP-1")
+        config_path = Path(self.tmpdir.name) / "all-package.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'name = "dots"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty/kitty.conf"]\n'
+            '\n'
+            '[hyprland]\n'
+            '[[hyprland.files]]\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["hypr/hyprland.conf"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "all", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled kitty ->", result.stdout)
+        self.assertIn("[ok] Bundled hyprland ->", result.stdout)
+
+    def test_dots_deploy_accepts_named_sections_after_flag(self):
+        source_dir = Path(self.tmpdir.name) / "source-deploy-named"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/hypr").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        (source_dir / ".config/hypr/hyprland.conf").write_text("monitor = eDP-1")
+        config_path = Path(self.tmpdir.name) / "named-deploy.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'name = "dots"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty/kitty.conf"]\n'
+            '\n'
+            '[hyprland]\n'
+            '[[hyprland.files]]\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["hypr/hyprland.conf"]\n'
+        )
+
+        result = self.run_cli(["dots", "--deploy", "kitty", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Deploy complete", result.stdout)
+        self.assertTrue((self.home_dir / ".config/kitty/kitty.conf").exists())
+        self.assertFalse((self.home_dir / ".config/hypr/hyprland.conf").exists())
+
     def test_read_meta_supports_file_url(self):
         config_path = self._write_package_config()
 

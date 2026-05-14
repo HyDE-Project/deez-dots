@@ -2393,6 +2393,18 @@ class DeezCLI:
             return []
         return selected
 
+    def _resolve_requested_config_dot_targets(self, requested: Optional[List[str]], action_label: str) -> List[str]:
+        if requested is None:
+            return self._resolve_config_dot_targets(action_label)
+        available = list(self.dotfile_sections)
+        if not available:
+            UI.error("No dot sections found in the config.")
+            return []
+        invalid = [dot for dot in requested if dot not in available]
+        for dot in invalid:
+            UI.error(f"Dot '{dot}' not found in config.")
+        return [dot for dot in requested if dot in available]
+
     def _backup_user_base(self) -> Path:
         xdg_data = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share"))
         return xdg_data / "deez" / "backup" / "user"
@@ -3387,7 +3399,7 @@ class DeezCLI:
             if git_url:
                 LOG.debug("Source: %s/%s branch=%s", global_owner, global_name, target_branch)
             compress = not getattr(self.args, "no_compress", False)
-            selected_sections = self._resolve_config_dot_targets("bundle")
+            selected_sections = self._resolve_requested_config_dot_targets(getattr(self.args, "package_sections", None), "bundle")
             if not selected_sections:
                 return
             if dry_run:
@@ -3419,7 +3431,7 @@ class DeezCLI:
         if getattr(self.args, "do_deploy", False):
             if git_url:
                 LOG.debug("Source: %s/%s branch=%s", global_owner, global_name, target_branch)
-            selected_sections = self._resolve_config_dot_targets("deploy")
+            selected_sections = self._resolve_requested_config_dot_targets(getattr(self.args, "deploy_sections", None), "deploy")
             if not selected_sections:
                 return
             UI.set_loader_message("Resolving dependencies...")
@@ -3552,6 +3564,15 @@ def _parse_dot_override_values(values: Any) -> List[str]:
     return normalized
 
 
+def _normalize_requested_sections(values: Any) -> Optional[List[str]]:
+    if values is None:
+        return None
+    sections = [str(value).strip() for value in values if str(value).strip()]
+    if not sections or any(section.lower() == "all" for section in sections):
+        return None
+    return sections
+
+
 def _apply_global_cli_overrides(main_config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
     if not isinstance(main_config, dict):
         main_config = {}
@@ -3582,10 +3603,10 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command")
 
     dots_parser = subparsers.add_parser("dots", parents=[global_override_parser], help="Dotfile deployment operations")
-    dots_parser.add_argument("--package", action="store_true", help="Pull from git source and bundle dots into tar.gz artifacts (no live changes)")
-    dots_parser.add_argument("--export", nargs="*", metavar="DOT", help="Snapshot live dots from $HOME into tar.gz bundles (reverse of --package); optionally specify dot names")
+    dots_parser.add_argument("--package", nargs="*", metavar="DOT", help="Pull from git source and bundle dots into tar.gz artifacts (no live changes); optionally specify dot names or 'all'")
+    dots_parser.add_argument("--export", nargs="*", metavar="DOT", help="Snapshot live dots from $HOME into tar.gz bundles (reverse of --package); optionally specify dot names or 'all'")
     dots_parser.add_argument("--install", nargs="+", metavar="TARBALL", help="Install from one or more bundle tar.gz files")
-    dots_parser.add_argument("--deploy", action="store_true", help="Bundle then install in one step (equivalent to --package + --install)")
+    dots_parser.add_argument("--deploy", nargs="*", metavar="DOT", help="Bundle then install in one step (equivalent to --package + --install); optionally specify dot names or 'all'")
     dots_parser.add_argument("--uninstall", nargs="*", metavar="DOT", help="Uninstall dots; omit names for interactive selector")
     dots_parser.add_argument("--restore", nargs="*", metavar="DOT", help="Restore files from a backup snapshot; omit names for interactive selector")
     dots_parser.add_argument("--downgrade", nargs="*", metavar="DOT", help="Re-install a previously cached bundle version; omit names for interactive selector")
@@ -3656,12 +3677,14 @@ def main() -> None:
 
     cmd = args.command
     if cmd == "dots":
-        action_package = bool(getattr(args, "package", False))
+        package_val = getattr(args, "package", None)
+        action_package = package_val is not None
         export_val = getattr(args, "export", None)
         action_export = export_val is not None
         install_tarballs = getattr(args, "install", None) or []
         action_install = bool(install_tarballs)
-        action_deploy = bool(getattr(args, "deploy", False))
+        deploy_val = getattr(args, "deploy", None)
+        action_deploy = deploy_val is not None
         uninstall_val = getattr(args, "uninstall", None)
         action_uninstall = uninstall_val is not None
         restore_val = getattr(args, "restore", None)
@@ -3674,11 +3697,13 @@ def main() -> None:
             return
         args.do_package = action_package
         args.do_export = action_export
-        args.export_sections = [str(s).strip() for s in export_val if str(s).strip()] if export_val is not None else None
+        args.package_sections = _normalize_requested_sections(package_val)
+        args.export_sections = _normalize_requested_sections(export_val)
         args.do_install = action_install
         args.install_tarballs = [str(Path(t).expanduser().resolve()) for t in install_tarballs]
         args.from_stage = action_install
         args.do_deploy = action_deploy
+        args.deploy_sections = _normalize_requested_sections(deploy_val)
         args.do_uninstall = action_uninstall
         args.uninstall_dots = list(uninstall_val) if uninstall_val else []
         args.do_restore = action_restore
