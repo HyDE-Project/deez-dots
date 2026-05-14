@@ -1,0 +1,46 @@
+[global] #  This is used to define global variables use for default fallbacks
+version = "0.1.0"                                # Version of the configuration file // Follows Semantic Versioning
+owner = "The HyDE Project"                       # Owner of the configuration file
+action= "preserve"                       # Actions can either be sync or preserve
+git = "https://github.com/HyDE-Project/HyDE.git"
+git_branch = "dev"
+dots =[
+    "hyprland",
+] # List of dots to be used in the configuration file
+pre_command = "echo 'starting deployment'"
+post_command = "notify-send 'deez done'"
+
+[[hyprland.dependency]]
+yay = ["hyprland-git"]
+paru = ["hyprland-git"]
+
+[hyprland]
+pre_command = "echo 'Pre commands '"
+post_command = "echo 'HyDE backed up!'"
+
+
+
+[[hyprland.files]]
+action = "preserve"
+source_root = "Configs/.config/hypr"
+target_root = "${XDG_CONFIG_HOME}/hypr"
+paths = [
+    "hyprland.lua",
+    "lua"
+]
+
+[[hyprland.files]]
+action = "sync"
+source_root = "Configs/.local/share/hypr"
+target_root = "${XDG_DATA_HOME}/hypr"
+paths = "." # sync all files in the source directory
+ignored_paths = [
+    "*.vscode",
+    "*.conf"
+]
+
+[[hyprland.files]]
+action = "[preserve]"
+source_root = "Configs/.local/state/hyde/lua_state"
+target_root = "${XDG_STATE_HOME}/hyde/lua_state"
+paths = "*.lua"

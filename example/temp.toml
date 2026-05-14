@@ -1,0 +1,14 @@
+# Minimal safe test fixture for deez-dots
+[global]
+version = "0.0.1"
+owner = "Test"
+home = "/tmp/test/home"
+# No git source needed for config-only operations
+# This config is used by tests that exercise deps and config loading only.
+
+dots = ["kitty"]
+
+[kitty]
+source_root = "Configs/.config"
+target_root = "/tmp/test/home/.config"
+paths = "kitty"
