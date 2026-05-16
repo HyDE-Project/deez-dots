@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import itertools
+import os
+import shutil
+import sys
+import threading
+from typing import Optional
+
+class UI:
+    """Render user-facing status lines without changing testable output."""
+
+    _RESET = "\033[0m"
+    _GREEN = "\033[32m"
+    _RED = "\033[31m"
+    _BLUE = "\033[34m"
+    _YELLOW = "\033[33m"
+    _MAGENTA = "\033[35m"
+    _CYAN = "\033[36m"
+    _loader: Optional["Loader"] = None
+    _output_lock = threading.RLock()
+
+    @classmethod
+    def _colors_enabled(cls) -> bool:
+        term = os.getenv("TERM", "")
+        return bool(sys.stdout.isatty() and term and term.lower() != "dumb" and "NO_COLOR" not in os.environ)
+
+    @classmethod
+    def can_use_loader(cls, debug: bool = False) -> bool:
+        if debug:
+            return False
+        stdin = getattr(sys, "stdin", None)
+        stdout = getattr(sys, "stdout", None)
+        try:
+            return bool(stdin and stdout and stdin.isatty() and stdout.isatty())
+        except Exception:
+            return False
+
+    @classmethod
+    def _prefix(cls, label: str, color: str) -> str:
+        if not cls._colors_enabled():
+            return label
+        return f"{color}{label}{cls._RESET}"
+
+    @classmethod
+    def _emit(cls, label: str, msg: str, color: str) -> None:
+        with cls._output_lock:
+            if cls._loader and cls._loader.is_running():
+                cls._loader._clear_line_locked()
+            print(f"{cls._prefix(label, color)} {msg}")
+            if cls._loader and cls._loader.is_running() and not cls._loader.is_paused():
+                cls._loader._redraw_locked()
+
+    @classmethod
+    def plain(cls, msg: str = "") -> None:
+        with cls._output_lock:
+            if cls._loader and cls._loader.is_running():
+                cls._loader._clear_line_locked()
+            print(msg)
+            if cls._loader and cls._loader.is_running() and not cls._loader.is_paused():
+                cls._loader._redraw_locked()
+
+    @classmethod
+    def start_loader(cls, message: str = "Working...") -> bool:
+        if cls._loader and cls._loader.is_running():
+            cls._loader.set_message(message)
+            return False
+        cls._loader = Loader(message)
+        cls._loader.start()
+        return True
+
+    @classmethod
+    def stop_loader(cls) -> None:
+        if not cls._loader:
+            return
+        loader = cls._loader
+        loader.stop()
+        cls._loader = None
+
+    @classmethod
+    def set_loader_message(cls, message: str) -> None:
+        if cls._loader and cls._loader.is_running():
+            cls._loader.set_message(message)
+
+    @classmethod
+    def pause_loader(cls) -> bool:
+        if cls._loader and cls._loader.is_running() and not cls._loader.is_paused():
+            cls._loader.pause()
+            return True
+        return False
+
+    @classmethod
+    def resume_loader(cls, was_paused: bool) -> None:
+        if was_paused and cls._loader and cls._loader.is_running():
+            cls._loader.resume()
+
+    @classmethod
+    def read_input(cls, prompt: str) -> str:
+        was_paused = cls.pause_loader()
+        try:
+            return input(prompt)
+        finally:
+            cls.resume_loader(was_paused)
+
+    @classmethod
+    def progress(cls, msg: str) -> None:
+        if cls._loader and cls._loader.is_running():
+            cls._loader.set_message(msg)
+            return
+        cls.info(msg)
+
+    @classmethod
+    def success(cls, msg: str) -> None:
+        cls._emit("[ok]", msg, cls._GREEN)
+
+    @classmethod
+    def error(cls, msg: str) -> None:
+        # Kept on stdout to preserve existing CLI and test behavior.
+        cls._emit("[err]", msg, cls._RED)
+
+    @classmethod
+    def info(cls, msg: str) -> None:
+        cls._emit("[..]", msg, cls._BLUE)
+
+    @classmethod
+    def warn(cls, msg: str) -> None:
+        cls._emit("[warn]", msg, cls._YELLOW)
+
+
+class Loader:
+    """A lightweight spinner used only for interactive, non-debug sessions."""
+
+    def __init__(self, message: str = "Working..."):
+        self.message = message
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._paused = threading.Event()
+        self._spinner = itertools.cycle(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+        self._colors = itertools.cycle([UI._GREEN, UI._BLUE, UI._YELLOW, UI._MAGENTA, UI._CYAN, UI._RED])
+        self._last_frame = ""
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._stop_event.clear()
+        self._running = True
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if not self._running:
+            return
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+        with UI._output_lock:
+            self._clear_line_locked()
+        self._running = False
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def is_paused(self) -> bool:
+        return self._paused.is_set()
+
+    def set_message(self, new_message: str) -> None:
+        self.message = new_message
+        with UI._output_lock:
+            if not self.is_paused():
+                self._redraw_locked()
+
+    def pause(self) -> None:
+        self._paused.set()
+        with UI._output_lock:
+            self._clear_line_locked()
+
+    def resume(self) -> None:
+        self._paused.clear()
+        with UI._output_lock:
+            self._redraw_locked()
+
+    def _line_width(self) -> int:
+        return max(80, shutil.get_terminal_size(fallback=(80, 20)).columns)
+
+    def _clear_line_locked(self) -> None:
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.flush()
+
+    def _redraw_locked(self) -> None:
+        if self._last_frame:
+            sys.stdout.write("\r" + self._last_frame)
+            sys.stdout.flush()
+
+    def _format_frame(self, spinner: str) -> str:
+        if UI._colors_enabled():
+            color = next(self._colors)
+            return f"{color}{spinner} {self.message}{UI._RESET}"
+        return f"{spinner} {self.message}"
+
+    def _animate(self) -> None:
+        while not self._stop_event.is_set():
+            if self.is_paused():
+                self._stop_event.wait(0.05)
+                continue
+            frame = self._format_frame(next(self._spinner))
+            with UI._output_lock:
+                self._last_frame = frame
+                sys.stdout.write("\r" + frame)
+                sys.stdout.flush()
+            self._stop_event.wait(0.1)
+
+

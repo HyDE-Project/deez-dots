@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Thin launcher for the installable deez Python module."""
 
-import deez as _deez_module
-from deez import *  # noqa: F401,F403
+import deez_dots as _deez_module
+from deez_dots import *  # noqa: F401,F403
 
 
 def main() -> None:

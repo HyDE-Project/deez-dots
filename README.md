@@ -53,6 +53,21 @@ deez --version
 deez dots --config ./example/dots.toml --deploy
 ```
 
+## PEX Release
+
+You can build a single-file executable using `pex`:
+
+```bash
+python3 -m pip install pex
+python3 -m pex . -e deez:run_entrypoint -o target/deez.pex
+```
+
+Run the generated release file directly:
+
+```bash
+./target/deez.pex --version
+```
+
 ## Man Page
 
 Generate the complete single-page manual with:
