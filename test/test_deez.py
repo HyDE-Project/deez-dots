@@ -7,6 +7,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 import subprocess
 import urllib.error
@@ -2526,6 +2527,13 @@ class TestDeezCLI(unittest.TestCase):
         pyproject = (SCRIPT_DIR / "pyproject.toml").read_text()
 
         self.assertIn('deez = "deez:run_entrypoint"', pyproject)
+
+    def test_pyproject_package_discovery_includes_command_subpackages(self):
+        pyproject = tomllib.loads((SCRIPT_DIR / "pyproject.toml").read_text())
+
+        package_find = pyproject["tool"]["setuptools"]["packages"]["find"]
+        self.assertIn("deez_dots", package_find["include"])
+        self.assertIn("deez_dots.*", package_find["include"])
 
     # ------------------------------------------------------------------ helpers
     def _make_backup_tarball(self, section, owner, version, timestamp, files):

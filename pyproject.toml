@@ -24,5 +24,7 @@ Source = "https://github.com/HyDE-Project/deez-dots"
 deez = "deez:run_entrypoint"
 
 [tool.setuptools]
-packages = ["deez_dots"]
 py-modules = ["deez"]
+
+[tool.setuptools.packages.find]
+include = ["deez_dots", "deez_dots.*"]
