@@ -8,6 +8,19 @@ from .cli import (
     _normalize_requested_sections,
     _parse_dot_override_values,
 )
+from .commands import (
+    BACKUP_COMMAND,
+    CACHE_COMMAND,
+    COMMAND_MODULES,
+    DEPS_COMMAND,
+    DOTS_COMMAND,
+    CommandModule,
+    execute_command,
+    infer_command_name,
+    iter_command_modules,
+    resolve_command_module,
+    register_subcommands,
+)
 from .core import (
     CLI_VERSION,
     DeezCLI,
@@ -46,6 +59,17 @@ from .ui import Loader, UI
 __all__ = [
     'main',
     'run_entrypoint',
+    'CommandModule',
+    'COMMAND_MODULES',
+    'DOTS_COMMAND',
+    'DEPS_COMMAND',
+    'BACKUP_COMMAND',
+    'CACHE_COMMAND',
+    'execute_command',
+    'infer_command_name',
+    'iter_command_modules',
+    'resolve_command_module',
+    'register_subcommands',
     'CLI_VERSION',
     'DeezCLI',
     'DeezUtils',

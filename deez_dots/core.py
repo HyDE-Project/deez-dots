@@ -36,6 +36,7 @@ class _AllSectionsRequested:
 
 _ALL_SECTIONS_REQUESTED = _AllSectionsRequested()
 RequestedSections = Optional[Union[List[str], _AllSectionsRequested]]
+RunResult = Tuple[bool, str, str]
 
 
 def _normalize_description(value: Any) -> str:
@@ -52,6 +53,7 @@ def default_run_command(
     capture_output: bool = True,
     text: bool = True,
     stream_output: bool = False,
+    passthrough_output: bool = False,
     retries: int = 1,
     check: bool = False,
 ) -> RunResult:
@@ -59,7 +61,30 @@ def default_run_command(
     cwd_path = str(cwd) if cwd is not None else None
     for attempt in range(1, retries + 1):
         try:
-            if stream_output:
+            if stream_output and passthrough_output:
+                if shell and isinstance(cmd, str):
+                    proc = subprocess.run(
+                        cmd,
+                        shell=True,
+                        cwd=cwd_path,
+                        capture_output=False,
+                        text=text,
+                        check=False,
+                    )
+                else:
+                    args = cmd if isinstance(cmd, list) else (cmd.split() if isinstance(cmd, str) else cmd)
+                    proc = subprocess.run(
+                        args,
+                        shell=False,
+                        cwd=cwd_path,
+                        capture_output=False,
+                        text=text,
+                        check=False,
+                    )
+                return_code = proc.returncode
+                stdout = ""
+                stderr = ""
+            elif stream_output:
                 if shell and isinstance(cmd, str):
                     proc = subprocess.Popen(
                         cmd,
@@ -367,6 +392,7 @@ class PackageManager:
                 ["sudo", "-v"],
                 capture_output=False,
                 stream_output=True,
+                passthrough_output=True,
                 retries=1,
             )
         finally:
@@ -389,6 +415,7 @@ class PackageManager:
                 retries=1,
                 capture_output=not live_output,
                 stream_output=live_output,
+                passthrough_output=live_output,
             )
         finally:
             UI.resume_loader(was_paused)
@@ -729,7 +756,12 @@ class ReadMeta:
         merged_config: Dict[str, Any] = {}
         for include_location in self._global_include_entries(data):
             resolved_include = self._resolve_include_location(include_location, normalized_location)
-            included_config = self.read_location(resolved_include, loading_stack)
+            try:
+                included_config = self.read_location(resolved_include, loading_stack)
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to load included config '{resolved_include}' referenced from '{normalized_location}': {exc}"
+                ) from exc
             merged_config = self.merge_configs(merged_config, included_config)
 
         current_config = self._strip_loader_keys(data)
@@ -3862,149 +3894,9 @@ class DeezCLI:
 
     def run(self) -> None:
         """Run the CLI command flow based on parsed args and config state."""
-        global_config = self.main_config.get("global", {})
-        global_owner = DeezUtils.normalize_owner(global_config.get("owner", "unknown"))
-        global_name = global_config.get("name", "unknown")
-        global_version = global_config.get("version")
-        global_home = global_config.get("home", os.path.expandvars("$HOME"))
-        git_url = global_config.get("git")
-        target_branch = global_config.get("branch") or global_config.get("git_branch", "main")
-        if not global_owner or not global_name:
-            if git_url:
-                global_owner, global_name = GitHandler.get_git_owner_name(git_url)
-                global_owner = DeezUtils.normalize_owner(global_owner)
-        if getattr(self.args, "deps_check", False) or getattr(self.args, "deps_update", False) or getattr(self.args, "install_deps", False):
-            selected_managers = self._resolve_dep_managers()
-            if selected_managers is None:
-                os._exit(1)
-        else:
-            selected_managers = None
-        if getattr(self.args, "deps_check", False):
-            self._deps_check(selected_managers)
-            return
-        if getattr(self.args, "deps_update", False):
-            code = self._deps_update(selected_managers)
-            if code:
-                os._exit(code)
-            return
-        if getattr(self.args, "install_deps", False):
-            _, missing = self._collect_missing_dependencies(selected_managers)
-            if not missing:
-                UI.success("Deps: nothing to install.")
-                return
-            self.package_manager_instance.install_packages(missing)
-            return
-        if getattr(self.args, "backup_list", False):
-            self._backup_list()
-            return
-        if getattr(self.args, "backup_prune", False):
-            code = self._backup_prune_keep(self.args.keep, getattr(self.args, "sections", None), getattr(self.args, "dry_run", False))
-            if code:
-                os._exit(code)
-            return
-        global_pre_command = global_config.get("pre_command")
-        global_post_command = global_config.get("post_command")
-        global_build_command = global_config.get("build_command")
-        hook_cwd = self._hook_cwd(self.source_dir)
-        dry_run = bool(getattr(self.args, "dry_run", False))
-        _hook_runner = WriteDots()
-        if getattr(self.args, "do_package", False):
-            if git_url:
-                LOG.debug("Source: %s/%s branch=%s", global_owner, global_name, target_branch)
-            compress = not getattr(self.args, "no_compress", False)
-            selected_sections = self._resolve_requested_config_dot_targets(getattr(self.args, "package_sections", None), "bundle")
-            if not selected_sections:
-                return
-            if dry_run:
-                self._announce_dry_run_pre_command(global_pre_command, scope_label="global")
-            else:
-                self._require_pre_command(global_pre_command, scope_label="global", cwd=hook_cwd)
-            UI.set_loader_message("Bundling selected dots...")
-            if global_build_command:
-                _hook_runner.execute_commands([global_build_command], cwd=self.source_dir)
-            self._do_package(global_owner, global_home, global_version, git_url=git_url, target_branch=target_branch, compress=compress, overwrite_existing=getattr(self.args, "force", False), sections=selected_sections, dry_run=dry_run)
-            return
-        if getattr(self.args, "do_export", False):
-            compress = not getattr(self.args, "no_compress", False)
-            selected_sections = self._resolve_requested_config_dot_targets(getattr(self.args, "export_sections", None), "export")
-            if not selected_sections:
-                return
-            if dry_run:
-                self._announce_dry_run_pre_command(global_pre_command, scope_label="global")
-            else:
-                self._require_pre_command(global_pre_command, scope_label="global", cwd=hook_cwd)
-            UI.set_loader_message("Exporting dots...")
-            self._do_export(global_owner, global_home, global_version, selected_sections, compress=compress, overwrite_existing=getattr(self.args, "force", False), dry_run=dry_run)
-            return
-        if getattr(self.args, "do_install", False):
-            if dry_run:
-                self._announce_dry_run_pre_command(global_pre_command, scope_label="global")
-            else:
-                self._require_pre_command(global_pre_command, scope_label="global", cwd=hook_cwd)
-            UI.set_loader_message("Installing bundles...")
-            self._do_install(self.args.install_tarballs, getattr(self.args, "dry_run", False))
-            return
-        if getattr(self.args, "do_deploy", False):
-            if git_url:
-                LOG.debug("Source: %s/%s branch=%s", global_owner, global_name, target_branch)
-            selected_sections = self._resolve_requested_config_dot_targets(getattr(self.args, "deploy_sections", None), "deploy")
-            if not selected_sections:
-                return
-            UI.set_loader_message("Resolving dependencies...")
-            self._resolve_config_dependencies(selected_sections)
-            tmp_dir = tempfile.mkdtemp(prefix="deez-deploy-")
-            try:
-                if dry_run:
-                    self._announce_dry_run_pre_command(global_pre_command, scope_label="global")
-                else:
-                    self._require_pre_command(global_pre_command, scope_label="global", cwd=hook_cwd)
-                UI.set_loader_message("Bundling selected dots...")
-                pkg_paths = self._do_package(global_owner, global_home, global_version, git_url=git_url, target_branch=target_branch, out_dir=tmp_dir, sections=selected_sections, dry_run=dry_run)
-                if not pkg_paths:
-                    UI.error("Deploy failed: bundling produced no bundles.")
-                    raise SystemExit(1)
-                UI.set_loader_message("Installing bundled dots...")
-                self._do_install(pkg_paths, getattr(self.args, "dry_run", False), prechecked_dependencies=True)
-                if global_post_command:
-                    _hook_runner.execute_commands([global_post_command], cwd=self.source_dir)
-            finally:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            UI.success("Deploy complete")
-            return
-        if getattr(self.args, "do_uninstall", False):
-            UI.set_loader_message("Uninstalling dots...")
-            self._do_uninstall(getattr(self.args, "uninstall_dots", []) or None, getattr(self.args, "dry_run", False))
-            return
-        if getattr(self.args, "do_filetree", False):
-            UI.set_loader_message("Rendering tracked file tree...")
-            self._do_filetree(getattr(self.args, "filetree_target", "all"))
-            return
-        if getattr(self.args, "do_healthcheck", False):
-            UI.set_loader_message("Checking tracked dot health...")
-            self._do_healthcheck(getattr(self.args, "healthcheck_target", "all"))
-            return
-        if getattr(self.args, "do_restore", False):
-            UI.set_loader_message("Restoring dots...")
-            self._do_restore(getattr(self.args, "restore_dots", []) or None, getattr(self.args, "dry_run", False))
-            return
-        if getattr(self.args, "do_downgrade", False):
-            UI.set_loader_message("Downgrading dots...")
-            self._do_downgrade(getattr(self.args, "downgrade_dots", []) or None, getattr(self.args, "dry_run", False))
-            return
-        if getattr(self.args, "cache_prune", False):
-            UI.set_loader_message("Pruning cache...")
-            code = self._cache_prune_keep(getattr(self.args, "cache_keep", 10), getattr(self.args, "dry_run", False))
-            if code:
-                os._exit(code)
-            return
-        if getattr(self.args, "cache_list", False):
-            UI.set_loader_message("Listing cache...")
-            self._cache_list()
-            return
-        if getattr(self.args, "list", False):
-            UI.set_loader_message("Listing installed dots...")
-            self._do_list()
-            return
+        from .commands import execute_command
+
+        execute_command(self)
 
 
 def create_deez_cli(

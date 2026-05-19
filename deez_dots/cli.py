@@ -5,7 +5,10 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+
+from .commands import COMMAND_MODULES, register_subcommands
+from .commands.base import normalize_requested_sections
 
 from .core import (
     CLI_VERSION,
@@ -13,8 +16,6 @@ from .core import (
     LOG,
     PackageManager,
     ReadMeta,
-    _ALL_SECTIONS_REQUESTED,
-    RequestedSections,
 )
 from .ui import UI
 
@@ -107,16 +108,9 @@ def _parse_dot_override_values(values: Any) -> List[str]:
     return normalized
 
 
-def _normalize_requested_sections(values: Any) -> RequestedSections:
-    """Normalize requested dot section values into explicit section names or the special all token."""
-    if values is None:
-        return None
-    sections = [str(value).strip() for value in values if str(value).strip()]
-    if not sections:
-        return None
-    if any(section.lower() == "all" for section in sections):
-        return _ALL_SECTIONS_REQUESTED
-    return sections
+def _normalize_requested_sections(values: Any):
+    """Normalize requested dot section values into explicit names or the all token."""
+    return normalize_requested_sections(values)
 
 
 def _apply_global_cli_overrides(main_config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
@@ -140,62 +134,8 @@ def _apply_global_cli_overrides(main_config: Dict[str, Any], args: argparse.Name
     return main_config
 
 
-def main() -> None:
-    """Parse CLI arguments and execute deez-dots commands."""
-    global_override_parser = argparse.ArgumentParser(add_help=False)
-    _add_global_override_arguments(global_override_parser)
-
-    parser = argparse.ArgumentParser(prog="deez", description="Deez dots manager (deez-dots)", parents=[global_override_parser])
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging for troubleshooting (default: off)")
-    parser.add_argument("--version", action="version", version=f"deez {CLI_VERSION}")
-    subparsers = parser.add_subparsers(dest="command")
-
-    dots_parser = subparsers.add_parser("dots", parents=[global_override_parser], help="Dotfile deployment operations")
-    dots_parser.add_argument("--package", nargs="*", metavar="DOT", help="Pull from git source and bundle dots into tar.gz artifacts (no live changes); omit names for interactive selection or specify dot names or 'all'")
-    dots_parser.add_argument("--export", nargs="*", metavar="DOT", help="Snapshot live dots from $HOME into tar.gz bundles (reverse of --package); omit names for interactive selection or specify dot names or 'all'")
-    dots_parser.add_argument("--install", nargs="+", metavar="TARBALL", help="Install from one or more bundle tar.gz files")
-    dots_parser.add_argument("--deploy", nargs="*", metavar="DOT", help="Bundle then install in one step (equivalent to --package + --install); omit names for interactive selection or specify dot names or 'all'")
-    dots_parser.add_argument("--uninstall", nargs="*", metavar="DOT", help="Uninstall dots; omit names for interactive selector")
-    dots_parser.add_argument("--filetree", nargs="?", const="all", metavar="DOT|all", help="Show tracked installed-file trees for one installed dot or for all installed dots when omitted or set to 'all'")
-    dots_parser.add_argument("--healthcheck", nargs="?", const="all", metavar="DOT|all", help="Check one installed dot or all installed dots when omitted or set to 'all'; drift checks use the cached bundle when its archive is available")
-    dots_parser.add_argument("--restore", nargs="*", metavar="DOT", help="Restore files from a backup snapshot; omit names for interactive selector")
-    dots_parser.add_argument("--downgrade", nargs="*", metavar="DOT", help="Re-install a previously cached bundle version; omit names for interactive selector")
-    dots_parser.add_argument("--list", action="store_true", help="List all tracked dots and their state")
-    dots_parser.add_argument("--no-backup", action="store_true", dest="no_backup", help="Skip backup when deploying or uninstalling")
-    dots_parser.add_argument("--no-deps-checks", action="store_true", dest="no_deps_checks", help="Skip dependency checks before install or deploy")
-    dots_parser.add_argument("--no-deps-install", action="store_true", dest="no_deps_install", help="Check dependencies but do not auto-install missing ones before install or deploy")
-    dots_parser.add_argument("--no-compress", action="store_true", dest="no_compress", help="Skip tar.gz packing; leave output as a plain directory (for inspection)")
-    dots_parser.add_argument("--force", action="store_true", dest="force", help="Remove an existing extracted build directory beside the output tarball before writing")
-    dots_parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would happen without making live changes")
-
-    deps_parser = subparsers.add_parser("deps", parents=[global_override_parser], help="Dependency operations")
-    deps_parser.add_argument("--check", action="store_true", help="Check dependency status")
-    deps_parser.add_argument("--install", action="store_true", help="Install missing dependencies")
-    deps_parser.add_argument("--update", action="store_true", help="Update packages via configured package managers")
-    deps_parser.add_argument("--manager", action="append", help="Limit to specific manager(s), e.g. --manager yay")
-
-    backup_parser = subparsers.add_parser("backup", parents=[global_override_parser], help="Backup operations")
-    backup_parser.add_argument("--list", action="store_true", help="List backup snapshots")
-    backup_parser.add_argument("--prune", nargs="*", metavar="DOT", help="Prune old backups; optionally limit pruning to one or more dots")
-    backup_parser.add_argument("--keep", type=int, default=5, help="Number of newest snapshots to keep when pruning (default: 5)")
-    backup_parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would be deleted without removing files")
-
-    cache_parser = subparsers.add_parser("cache", parents=[global_override_parser], help="Cache operations")
-    cache_parser.add_argument("--list", action="store_true", help="List cached bundle archives")
-    cache_parser.add_argument("--prune", action="store_true", help="Prune old cached bundle archives")
-    cache_parser.add_argument("--keep", type=int, default=10, help="Number of newest cache entries to keep when pruning (default: 10)")
-    cache_parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would be deleted without removing files")
-
-    argv = sys.argv[1:]
-    if argv and argv[-1] == "--":
-        argv = argv[:-1]
-    args = parser.parse_args(argv)
-    if args.command is None:
-        parser.print_help()
-        return
-
-    _setup_logging(debug=bool(getattr(args, "debug", False)))
-
+def _initialize_command_state(args: argparse.Namespace) -> None:
+    """Populate the normalized runtime flags expected by DeezCLI."""
     args.install_deps = False
     args.deps_check = False
     args.deps_update = False
@@ -229,86 +169,33 @@ def main() -> None:
     args.force = getattr(args, "force", False)
     args.dry_run = getattr(args, "dry_run", False)
 
+
+def main() -> None:
+    """Parse CLI arguments and execute deez-dots commands."""
+    global_override_parser = argparse.ArgumentParser(add_help=False)
+    _add_global_override_arguments(global_override_parser)
+
+    parser = argparse.ArgumentParser(prog="deez", description="Deez dots manager (deez-dots)", parents=[global_override_parser])
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging for troubleshooting (default: off)")
+    parser.add_argument("--version", action="version", version=f"deez {CLI_VERSION}")
+    subparsers = parser.add_subparsers(dest="command")
+    command_parsers = register_subcommands(subparsers, parents=[global_override_parser])
+
+    argv = sys.argv[1:]
+    if argv and argv[-1] == "--":
+        argv = argv[:-1]
+    args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help()
+        return
+
+    _setup_logging(debug=bool(getattr(args, "debug", False)))
+    _initialize_command_state(args)
+
     cmd = args.command
-    if cmd == "dots":
-        package_val = getattr(args, "package", None)
-        action_package = package_val is not None
-        export_val = getattr(args, "export", None)
-        action_export = export_val is not None
-        install_tarballs = getattr(args, "install", None) or []
-        action_install = bool(install_tarballs)
-        deploy_val = getattr(args, "deploy", None)
-        action_deploy = deploy_val is not None
-        uninstall_val = getattr(args, "uninstall", None)
-        action_uninstall = uninstall_val is not None
-        filetree_val = getattr(args, "filetree", None)
-        action_filetree = filetree_val is not None
-        healthcheck_val = getattr(args, "healthcheck", None)
-        action_healthcheck = healthcheck_val is not None
-        restore_val = getattr(args, "restore", None)
-        action_restore = restore_val is not None
-        downgrade_val = getattr(args, "downgrade", None)
-        action_downgrade = downgrade_val is not None
-        action_list = bool(getattr(args, "list", False))
-        if not any([action_package, action_export, action_install, action_deploy, action_uninstall, action_filetree, action_healthcheck, action_restore, action_downgrade, action_list]):
-            dots_parser.print_help()
-            return
-        args.do_package = action_package
-        args.do_export = action_export
-        args.package_sections = _normalize_requested_sections(package_val)
-        args.export_sections = _normalize_requested_sections(export_val)
-        args.do_install = action_install
-        args.install_tarballs = [str(Path(t).expanduser().resolve()) for t in install_tarballs]
-        args.from_stage = action_install
-        args.do_deploy = action_deploy
-        args.deploy_sections = _normalize_requested_sections(deploy_val)
-        args.do_uninstall = action_uninstall
-        args.uninstall_dots = list(uninstall_val) if uninstall_val else []
-        args.do_filetree = action_filetree
-        args.filetree_target = filetree_val or "all"
-        args.do_healthcheck = action_healthcheck
-        args.healthcheck_target = healthcheck_val or "all"
-        args.do_restore = action_restore
-        args.restore_dots = list(restore_val) if restore_val else []
-        args.do_downgrade = action_downgrade
-        args.downgrade_dots = list(downgrade_val) if downgrade_val else []
-        args.list = action_list
-    elif cmd == "deps":
-        action_install = bool(getattr(args, "install", False))
-        action_check = bool(getattr(args, "check", False))
-        action_update = bool(getattr(args, "update", False))
-        if not any([action_install, action_check, action_update]):
-            deps_parser.print_help()
-            return
-        args.install_deps = action_install
-        args.deps_check = action_check
-        args.deps_update = action_update
-        args.deps_managers = getattr(args, "manager", []) or []
-    elif cmd == "backup":
-        args.backup_list = bool(getattr(args, "list", False))
-        args.backup_prune = getattr(args, "prune", None) is not None
-        args.keep = getattr(args, "keep", None)
-        args.dry_run = getattr(args, "dry_run", False)
-        prune_sections = getattr(args, "prune", None)
-        if prune_sections is None:
-            args.sections = None
-        elif not prune_sections or any(str(s).strip().lower() == "all" for s in prune_sections):
-            args.sections = None
-        else:
-            args.sections = [str(s).strip() for s in prune_sections if str(s).strip()]
-        if not any([args.backup_list, args.backup_prune]):
-            backup_parser.print_help()
-            return
-    elif cmd == "cache":
-        args.cache_list = bool(getattr(args, "list", False))
-        args.cache_prune = bool(getattr(args, "prune", False))
-        args.cache_keep = getattr(args, "keep", 10)
-        args.dry_run = getattr(args, "dry_run", False)
-        if not any([args.cache_list, args.cache_prune]):
-            args.cache_list = True
-        if not any([args.cache_list, args.cache_prune]):
-            cache_parser.print_help()
-            return
+    command_module = COMMAND_MODULES[cmd]
+    if not command_module.normalize_args(args, command_parsers[cmd]):
+        return
 
     config_reader = ReadMeta()
     config_value = getattr(args, "config", None)
@@ -320,23 +207,13 @@ def main() -> None:
     else:
         config_file_path = None
         default_config_path = Path.cwd() / "dots.toml"
-        should_auto_discover_config = bool(
-            (cmd == "dots" and (getattr(args, "do_package", False) or getattr(args, "do_deploy", False)))
-            or (cmd == "dots" and getattr(args, "do_export", False) and not getattr(args, "export_sections", None))
-            or (cmd == "deps" and (getattr(args, "install_deps", False) or getattr(args, "deps_check", False) or getattr(args, "deps_update", False)))
-        )
+        should_auto_discover_config = command_module.should_auto_discover_config(args)
         if should_auto_discover_config and default_config_path.is_file():
             config_file_path = str(default_config_path.resolve())
             auto_discovered_config = True
             LOG.debug("Auto-discovered config from current directory: %s", config_file_path)
 
-    config_error = None
-    if cmd == "dots" and getattr(args, "do_export", False) and not getattr(args, "export_sections", None) and not config_file_path:
-        config_error = "Blank --export requires a config file. Use --config or run it from a directory containing dots.toml."
-    elif (cmd == "dots" and (getattr(args, "do_package", False) or getattr(args, "do_deploy", False))) and not config_file_path:
-        config_error = "No config file provided. Use --config or place dots.toml in the current directory."
-    elif (cmd == "deps" and (getattr(args, "install_deps", False) or getattr(args, "deps_check", False) or getattr(args, "deps_update", False))) and not config_file_path:
-        config_error = "No config file provided. Use --config or place dots.toml in the current directory."
+    config_error = command_module.config_error(args, config_file_path)
     if config_error:
         UI.error(config_error)
         raise SystemExit(1)
@@ -377,13 +254,7 @@ def main() -> None:
 
     loader_started = False
     if UI.can_use_loader(debug=bool(getattr(args, "debug", False))):
-        initial_message = {
-            "dots": "Processing dots...",
-            "deps": "Processing dependencies...",
-            "backup": "Processing backups...",
-            "cache": "Processing cache...",
-        }.get(cmd, "Working...")
-        loader_started = UI.start_loader(initial_message)
+        loader_started = UI.start_loader(command_module.loader_message)
 
     target_root = home
     try:

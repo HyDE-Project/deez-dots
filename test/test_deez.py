@@ -9,10 +9,13 @@ import tarfile
 import tempfile
 import unittest
 import subprocess
+import urllib.error
 from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
+
+import deez_dots.commands as command_modules
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 DEEZ_MODULE_PATH = SCRIPT_DIR / "deez"
@@ -1004,6 +1007,43 @@ class TestDeezCLI(unittest.TestCase):
 
         self.assertEqual(loaded["global"]["version"], "0.1.0")
         self.assertEqual(loaded["kitty"]["paths"], [".config/kitty/kitty.conf"])
+
+    def test_read_meta_reports_missing_include_with_context(self):
+        config_dir = Path(self.tmpdir.name) / "config-include-missing"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        root_path = config_dir / "dots.toml"
+        root_path.write_text(
+            '[global]\n'
+            'include = ["missing.toml"]\n'
+            'version = "0.1.0"\n'
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            deez_module.ReadMeta().read_location(root_path)
+
+        missing_path = str((config_dir / "missing.toml").resolve())
+        self.assertIn(f"Failed to load included config '{missing_path}'", str(ctx.exception))
+        self.assertIn(f"referenced from '{root_path.resolve()}'", str(ctx.exception))
+
+    def test_cli_reports_remote_missing_include_with_context(self):
+        root_url = "https://example.test/dots.toml"
+        missing_url = "https://example.test/dots/missing.toml"
+
+        def fake_read_url(self, config_url):
+            if config_url == root_url:
+                return {
+                    "global": {"include": ["dots/missing.toml"], "version": "0.1.0"},
+                    "kitty": {"paths": [".config/kitty/kitty.conf"]},
+                }
+            raise urllib.error.HTTPError(config_url, 404, "Not Found", hdrs=None, fp=None)
+
+        with patch.object(deez_module.ReadMeta, "read_url", new=fake_read_url):
+            exit_code, output = self.run_entrypoint(["deez", "--config", root_url, "dots", "--list"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn(f"Failed to load included config '{missing_url}'", output)
+        self.assertIn(f"referenced from '{root_url}'", output)
+        self.assertIn("HTTP Error 404: Not Found", output)
 
     def test_dots_package_supports_config_file_url(self):
         config_path = self._write_package_config()
@@ -2226,6 +2266,23 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("prompt: done", out)
         self.assertIn("prompt: done", output.getvalue())
 
+    def test_default_run_command_passthrough_uses_inherited_tty(self):
+        completed = subprocess.CompletedProcess(["echo", "ok"], 0)
+
+        with patch("subprocess.run", return_value=completed) as mocked_run:
+            success, out, err = deez_module.default_run_command(
+                ["echo", "ok"],
+                stream_output=True,
+                passthrough_output=True,
+                retries=1,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
+        self.assertEqual(mocked_run.call_count, 1)
+        self.assertFalse(mocked_run.call_args.kwargs["capture_output"])
+
     def test_package_manager_update_primes_sudo_and_streams_live_output(self):
         calls = []
 
@@ -2242,9 +2299,63 @@ class TestDeezCLI(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(calls[0][0], ["sudo", "-v"])
         self.assertTrue(calls[0][1]["stream_output"])
+        self.assertTrue(calls[0][1]["passthrough_output"])
         self.assertEqual(calls[1][0], "sudo pacman -Syu")
         self.assertTrue(calls[1][1]["stream_output"])
+        self.assertTrue(calls[1][1]["passthrough_output"])
         self.assertFalse(calls[1][1]["capture_output"])
+
+    def test_command_modules_are_importable_for_interop(self):
+        self.assertEqual(list(command_modules.COMMAND_MODULES.keys()), ["dots", "deps", "backup", "cache"])
+        self.assertEqual(command_modules.DOTS_COMMAND.description, "Dotfile deployment operations")
+        self.assertEqual(command_modules.DEPS_COMMAND.loader_message, "Processing dependencies...")
+
+        parser = argparse.ArgumentParser(prog="deez deps")
+        command_modules.DEPS_COMMAND.add_arguments(parser)
+        args = parser.parse_args(["--check"])
+
+        self.assertTrue(command_modules.DEPS_COMMAND.normalize_args(args, parser))
+        self.assertTrue(args.deps_check)
+        self.assertFalse(args.deps_update)
+
+    def test_command_modules_can_infer_command_name_from_normalized_args(self):
+        args = argparse.Namespace(cache_list=True, cache_prune=False, command=None)
+
+        self.assertEqual(command_modules.infer_command_name(args), "cache")
+        self.assertEqual(command_modules.resolve_command_module(args), command_modules.CACHE_COMMAND)
+
+    def test_deez_cli_run_dispatches_through_command_registry(self):
+        cli = self._make_cli({"global": {"owner": "hyde_project"}})
+        cli.args.command = "deps"
+
+        with patch("deez_dots.commands.execute_command") as mocked_execute:
+            cli.run()
+
+        mocked_execute.assert_called_once_with(cli)
+
+    def test_deps_command_updates_loader_messages(self):
+        cli = self._make_cli({"global": {"owner": "hyde_project"}})
+        cli.args = argparse.Namespace(command="deps", deps_check=True, deps_update=False, install_deps=False)
+        cli._resolve_dep_managers = lambda: ["pacman"]
+        cli._deps_check = lambda selected: None
+
+        with patch("deez_dots.commands.deps.UI.set_loader_message") as mocked_loader:
+            command_modules.DEPS_COMMAND.execute(cli)
+
+        self.assertEqual(
+            [call.args[0] for call in mocked_loader.call_args_list],
+            ["Resolving dependency managers...", "Checking dependencies..."],
+        )
+
+    def test_backup_command_updates_loader_messages(self):
+        cli = self._make_cli({"global": {"owner": "hyde_project"}})
+        cli.args = argparse.Namespace(command="backup", backup_list=True, backup_prune=False)
+        cli._backup_list = lambda: None
+
+        with patch("deez_dots.commands.backup.UI.set_loader_message") as mocked_loader:
+            command_modules.BACKUP_COMMAND.execute(cli)
+
+        mocked_loader.assert_called_once_with("Listing backups...")
 
     def test_dots_package_warns_about_stale_extracted_build_dir(self):
         source_dir = Path(self.tmpdir.name) / "source"
