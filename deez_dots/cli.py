@@ -20,6 +20,7 @@ from .ui import UI
 
 
 def _resolve_deez_cli_class():
+    """Resolve the DeezCLI class from the loaded package or fall back to the default."""
     package = sys.modules.get("deez") or sys.modules.get("deez_dots")
     if package is not None and hasattr(package, "DeezCLI"):
         return getattr(package, "DeezCLI")
@@ -28,11 +29,7 @@ def _resolve_deez_cli_class():
     return DefaultDeezCLI
 
 def _setup_logging(debug: bool = False) -> None:
-    """Configure root logging for either quiet CLI mode or debug mode.
-
-    Args:
-        debug: When true, enable verbose debug logging with timestamps.
-    """
+    """Configure CLI logging mode."""
     root = logging.getLogger()
     root.handlers.clear()
     handler = logging.StreamHandler()
@@ -86,6 +83,7 @@ GLOBAL_OVERRIDE_DEST_TO_KEY: Dict[str, str] = {
 
 
 def _add_global_override_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add global CLI override arguments to a parser."""
     for flags, kwargs in GLOBAL_OVERRIDE_ARGUMENTS:
         option_kwargs = dict(kwargs)
         option_kwargs.setdefault("default", argparse.SUPPRESS)
@@ -93,6 +91,7 @@ def _add_global_override_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _parse_dot_override_values(values: Any) -> List[str]:
+    """Normalize dot override input values into a list of unique dot names."""
     if values is None:
         return []
     raw_values = values if isinstance(values, list) else [values]
@@ -109,6 +108,7 @@ def _parse_dot_override_values(values: Any) -> List[str]:
 
 
 def _normalize_requested_sections(values: Any) -> RequestedSections:
+    """Normalize requested dot section values into explicit section names or the special all token."""
     if values is None:
         return None
     sections = [str(value).strip() for value in values if str(value).strip()]
@@ -120,6 +120,7 @@ def _normalize_requested_sections(values: Any) -> RequestedSections:
 
 
 def _apply_global_cli_overrides(main_config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    """Apply CLI global option overrides onto the parsed main configuration."""
     if not isinstance(main_config, dict):
         main_config = {}
     global_config = main_config.get("global")
@@ -140,6 +141,7 @@ def _apply_global_cli_overrides(main_config: Dict[str, Any], args: argparse.Name
 
 
 def main() -> None:
+    """Parse CLI arguments and execute deez-dots commands."""
     global_override_parser = argparse.ArgumentParser(add_help=False)
     _add_global_override_arguments(global_override_parser)
 
@@ -432,6 +434,7 @@ def main() -> None:
 
 
 def run_entrypoint() -> None:
+    """Run the CLI entrypoint and handle user cancellation cleanly."""
     try:
         main()
     except KeyboardInterrupt:

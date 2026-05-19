@@ -219,6 +219,137 @@ class TestDeezCLI(unittest.TestCase):
             "auto",
         )
 
+    def test_query_installed_dots_returns_structured_data(self):
+        config_path = self._write_installed_manifest(
+            "kitty",
+            owner="hyde_project",
+            version="0.1.0",
+            files=[{"src": "payload/.config/kitty/kitty.conf", "dst": str(self.home_dir / ".config/kitty/kitty.conf")}],
+        )
+        dot_path = self.home_dir / ".config/kitty/kitty.conf"
+        dot_path.parent.mkdir(parents=True, exist_ok=True)
+        dot_path.write_text("test")
+
+        result = deez_module.query_installed_dots(
+            {},
+            manifest_manager=deez_module.ManifestManager(base_dir=self.xdg_data / "deez" / "dots"),
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["dot"], "kitty")
+        self.assertEqual(result[0]["owner"], "hyde_project")
+        self.assertEqual(result[0]["file_count"], 1)
+        self.assertEqual(result[0]["missing"], [])
+
+    def test_query_config_sections_returns_dot_list(self):
+        config = {
+            "global": {"owner": "hyde_project", "name": "dots"},
+            "kitty": {"paths": [".config/kitty/kitty.conf"]},
+            "icons": {"paths": [".config/icons"]},
+        }
+        result = deez_module.query_config_sections(config)
+        self.assertEqual(result["sections"], ["icons", "kitty"])
+        self.assertEqual(result["global"].get("owner"), "hyde_project")
+        self.assertFalse(result["explicit_selection"])
+
+    def test_query_selectable_config_dots_returns_labels(self):
+        config = {
+            "global": {"owner": "hyde_project", "name": "dots"},
+            "kitty": {"paths": [".config/kitty/kitty.conf"]},
+            "icons": {"paths": [".config/icons"]},
+        }
+        result = deez_module.query_selectable_config_dots(config, action_label="deploy")
+        self.assertEqual({item["dot"] for item in result}, {"kitty", "icons"})
+        self.assertTrue(all("label" in item for item in result))
+        self.assertTrue(all(item["action"] == "deploy" for item in result))
+
+    def test_query_selectable_installed_and_cache_options(self):
+        file_path = self.home_dir / ".config/kitty/kitty.conf"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("content")
+        self._write_installed_manifest(
+            "kitty",
+            owner="hyde_project",
+            version="0.1.0",
+            files=[{"src": "payload/.config/kitty/kitty.conf", "dst": str(file_path)}],
+        )
+        selectable = deez_module.query_selectable_installed_dots(
+            {},
+            manifest_manager=deez_module.ManifestManager(base_dir=self.xdg_data / "deez" / "dots"),
+        )
+        self.assertEqual(selectable, [{"dot": "kitty", "label": selectable[0]["label"]}])
+
+        cache_dir = self.xdg_cache / "deez" / "dots"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        result = deez_module.query_selectable_cache_dots(
+            {},
+            cache_manager=deez_module.CacheManager(cache_root=cache_dir),
+        )
+        self.assertEqual(result, [])
+
+    def test_query_selectable_cache_versions_returns_empty_for_unknown_dot(self):
+        cache_dir = self.xdg_cache / "deez" / "dots"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        result = deez_module.query_selectable_cache_versions(
+            {},
+            "kitty",
+            cache_manager=deez_module.CacheManager(cache_root=cache_dir),
+        )
+        self.assertEqual(result, [])
+
+    def test_query_cache_entries_returns_empty_list_when_cache_missing(self):
+        cache_dir = self.xdg_cache / "deez" / "dots"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        result = deez_module.query_cache_entries(
+            {},
+            cache_manager=deez_module.CacheManager(cache_root=cache_dir),
+        )
+        self.assertEqual(result, [])
+
+    def test_query_filetree_returns_nested_tree(self):
+        file_path = self.home_dir / ".config/kitty/kitty.conf"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("content")
+        self._write_installed_manifest(
+            "kitty",
+            owner="hyde_project",
+            version="0.1.0",
+            files=[{"src": "payload/.config/kitty/kitty.conf", "dst": str(file_path)}],
+        )
+
+        result = deez_module.query_filetree(
+            {},
+            target="kitty",
+            target_root=str(self.home_dir),
+            manifest_manager=deez_module.ManifestManager(base_dir=self.xdg_data / "deez" / "dots"),
+        )
+        self.assertEqual(result["target"], "kitty")
+        self.assertEqual(result["dots"], ["kitty"])
+        self.assertIn("children", result["tree"])
+        self.assertIn("~", result["tree"]["children"])
+        home_node = result["tree"]["children"]["~"]
+        self.assertIn("children", home_node)
+        self.assertIn(".config", home_node["children"])
+
+    def test_query_healthcheck_reports_missing_paths(self):
+        file_path = self.home_dir / ".config/kitty/kitty.conf"
+        self._write_installed_manifest(
+            "kitty",
+            owner="hyde_project",
+            version="0.1.0",
+            files=[{"src": "payload/.config/kitty/kitty.conf", "dst": str(file_path)}],
+        )
+
+        result = deez_module.query_healthcheck(
+            {},
+            target="kitty",
+            manifest_manager=deez_module.ManifestManager(base_dir=self.xdg_data / "deez" / "dots"),
+        )
+        self.assertEqual(result["target"], "kitty")
+        self.assertEqual(result["dots"], ["kitty"])
+        status = result["status"]["kitty"]
+        self.assertEqual(status["missing"], [str(file_path)])
+        self.assertEqual(status["ok"], [])
+
     def _make_dot_args(self, **overrides):
         values = {
             "deps_check": False,

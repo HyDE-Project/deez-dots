@@ -27,6 +27,7 @@ class UI:
 
     @classmethod
     def can_use_loader(cls, debug: bool = False) -> bool:
+        """Return True if a loader animation can be used in the current terminal session."""
         if debug:
             return False
         stdin = getattr(sys, "stdin", None)
@@ -53,6 +54,7 @@ class UI:
 
     @classmethod
     def plain(cls, msg: str = "") -> None:
+        """Print a plain message to stdout, preserving loader output if active."""
         with cls._output_lock:
             if cls._loader and cls._loader.is_running():
                 cls._loader._clear_line_locked()
@@ -62,6 +64,7 @@ class UI:
 
     @classmethod
     def start_loader(cls, message: str = "Working...") -> bool:
+        """Start the spinner loader and return True if a new loader was created."""
         if cls._loader and cls._loader.is_running():
             cls._loader.set_message(message)
             return False
@@ -71,6 +74,7 @@ class UI:
 
     @classmethod
     def stop_loader(cls) -> None:
+        """Stop any active spinner loader and clean up its state."""
         if not cls._loader:
             return
         loader = cls._loader
@@ -79,11 +83,13 @@ class UI:
 
     @classmethod
     def set_loader_message(cls, message: str) -> None:
+        """Update the active loader message without restarting the loader."""
         if cls._loader and cls._loader.is_running():
             cls._loader.set_message(message)
 
     @classmethod
     def pause_loader(cls) -> bool:
+        """Pause the active loader and return True if it was paused."""
         if cls._loader and cls._loader.is_running() and not cls._loader.is_paused():
             cls._loader.pause()
             return True
@@ -91,11 +97,13 @@ class UI:
 
     @classmethod
     def resume_loader(cls, was_paused: bool) -> None:
+        """Resume the loader if it was previously paused."""
         if was_paused and cls._loader and cls._loader.is_running():
             cls._loader.resume()
 
     @classmethod
     def read_input(cls, prompt: str) -> str:
+        """Read input from the user, temporarily pausing the loader if active."""
         was_paused = cls.pause_loader()
         try:
             return input(prompt)
@@ -104,6 +112,7 @@ class UI:
 
     @classmethod
     def progress(cls, msg: str) -> None:
+        """Log progress text, using the loader if available or plain output otherwise."""
         if cls._loader and cls._loader.is_running():
             cls._loader.set_message(msg)
             return
@@ -111,19 +120,22 @@ class UI:
 
     @classmethod
     def success(cls, msg: str) -> None:
+        """Render a success message to the user."""
         cls._emit("[ok]", msg, cls._GREEN)
 
     @classmethod
     def error(cls, msg: str) -> None:
-        # Kept on stdout to preserve existing CLI and test behavior.
+        """Render an error message to stdout while preserving CLI output behavior."""
         cls._emit("[err]", msg, cls._RED)
 
     @classmethod
     def info(cls, msg: str) -> None:
+        """Render an informational message to the user."""
         cls._emit("[..]", msg, cls._BLUE)
 
     @classmethod
     def warn(cls, msg: str) -> None:
+        """Render a warning message to the user."""
         cls._emit("[warn]", msg, cls._YELLOW)
 
 
@@ -141,6 +153,7 @@ class Loader:
         self._last_frame = ""
 
     def start(self) -> None:
+        """Start the loader animation thread if it is not already running."""
         if self._running:
             return
         self._stop_event.clear()
@@ -149,6 +162,7 @@ class Loader:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop the loader animation and clear any spinner output."""
         if not self._running:
             return
         self._stop_event.set()
@@ -159,23 +173,28 @@ class Loader:
         self._running = False
 
     def is_running(self) -> bool:
+        """Return True if the loader animation is currently running."""
         return self._running
 
     def is_paused(self) -> bool:
+        """Return True if the loader is currently paused."""
         return self._paused.is_set()
 
     def set_message(self, new_message: str) -> None:
+        """Update the loader message and redraw it if active."""
         self.message = new_message
         with UI._output_lock:
             if not self.is_paused():
                 self._redraw_locked()
 
     def pause(self) -> None:
+        """Pause the loader animation and clear its current frame."""
         self._paused.set()
         with UI._output_lock:
             self._clear_line_locked()
 
     def resume(self) -> None:
+        """Resume the loader animation after a pause."""
         self._paused.clear()
         with UI._output_lock:
             self._redraw_locked()

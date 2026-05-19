@@ -55,21 +55,7 @@ def default_run_command(
     retries: int = 1,
     check: bool = False,
 ) -> RunResult:
-    """Execute a subprocess command and normalize the result.
-
-    Args:
-        cmd: Shell command string or argument list.
-        shell: Whether to run the command through a shell.
-        cwd: Working directory for the command.
-        capture_output: Whether to capture stdout and stderr.
-        text: Whether subprocess output should be decoded as text.
-        stream_output: Whether to forward combined command output live to stdout.
-        retries: Number of attempts before returning failure.
-        check: Whether subprocess should raise on non-zero exit status.
-
-    Returns:
-        Tuple[bool, str, str]: Success flag, stdout, and stderr.
-    """
+    """Run a subprocess and normalize its output."""
     cwd_path = str(cwd) if cwd is not None else None
     for attempt in range(1, retries + 1):
         try:
@@ -156,14 +142,23 @@ def default_run_command(
 
 
 class DeezUtils:
+    """Utility helpers for normalizing config values and dot metadata.
+
+    This class contains static helper methods used by the CLI and API layers
+    for owner normalization, action normalization, timestamps, and config
+    environment expansion.
+    """
+
     @staticmethod
     def normalize_owner(owner: Optional[str]) -> str:
+        """Normalize a dot owner string into a canonical lowercase identifier."""
         if not owner:
             return "unknown"
         return owner.strip().lower().replace(" ", "_")
 
     @staticmethod
     def normalize_action(action: Optional[str]) -> str:
+        """Normalize a dot file transfer action name to a supported action."""
         if not action:
             return "preserve"
         normalized = str(action).strip().lower()
@@ -175,10 +170,12 @@ class DeezUtils:
 
     @staticmethod
     def get_timestamp() -> str:
+        """Return the current timestamp formatted for backup and package metadata."""
         return datetime.now().strftime("%Y-%m-%dT%H:%M:%S%z")
 
     @staticmethod
     def expand_env(val: Any) -> Any:
+        """Expand environment variables for a string or recursively for lists."""
         if isinstance(val, str):
             return os.path.expandvars(val)
         if isinstance(val, list):
@@ -187,10 +184,12 @@ class DeezUtils:
 
     @staticmethod
     def expand(val: Any) -> Any:
+        """Expand environment variables in strings and lists for config values."""
         return DeezUtils.expand_env(val)
 
     @staticmethod
     def normalize_dependency_blocks(dep_block: Any) -> List[Dict[str, List[str]]]:
+        """Normalize dependency block declarations into a manager-to-packages map."""
         def normalize_packages(packages: Any) -> List[str]:
             if isinstance(packages, str):
                 package_name = packages.strip()
@@ -238,6 +237,7 @@ class DeezUtils:
 
     @staticmethod
     def merge_dependency_blocks(*dep_blocks: Any) -> Dict[str, List[str]]:
+        """Merge one or more dependency blocks into a unified dependency map."""
         merged: Dict[str, List[str]] = {}
         seen_by_manager: Dict[str, set] = {}
         for dep_block in dep_blocks:
@@ -254,6 +254,13 @@ class DeezUtils:
 
 
 class PackageManager:
+    """Resolve and manage available package managers and package operations.
+
+    This helper class loads package manager command templates from config,
+    filters dependencies, and provides a pluggable runner for package queries,
+    installs, uninstalls, and updates.
+    """
+
     config_keys: Tuple[str, ...] = ("package_managers", "pm", "package_manager")
     command_keys: Tuple[str, ...] = ("query", "install", "uninstall", "update")
     package_manager_commands: Dict[str, Dict[str, str]] = {
@@ -297,6 +304,7 @@ class PackageManager:
 
     @classmethod
     def load_pm(cls, global_config: Any) -> Dict[str, Dict[str, str]]:
+        """Load package manager command definitions from global config."""
         parsed: Dict[str, Dict[str, str]] = {}
         if not isinstance(global_config, dict):
             return parsed
@@ -320,6 +328,7 @@ class PackageManager:
 
     @classmethod
     def package_manager_commands_from_global_config(cls, global_config: Any) -> Dict[str, Dict[str, str]]:
+        """Return package manager command templates from global config."""
         return cls.load_pm(global_config)
 
     def __init__(
@@ -327,6 +336,7 @@ class PackageManager:
         runner: Callable[..., RunResult] = default_run_command,
         custom_commands: Optional[Dict[str, Dict[str, str]]] = None,
     ):
+        """Initialize package manager support with a command runner and overrides."""
         self.runner = runner
         self.package_manager_commands = {name: commands.copy() for name, commands in type(self).package_manager_commands.items()}
         for name, commands in (custom_commands or {}).items():
@@ -387,6 +397,7 @@ class PackageManager:
         return success, out, err
 
     def available_managers(self) -> List[str]:
+        """Return the list of detected package managers available on the system."""
         found: List[str] = []
         for manager in self.package_manager_commands:
             if shutil.which(manager):
@@ -395,6 +406,7 @@ class PackageManager:
         return found
 
     def query_installed(self, manager: str, package: str) -> bool:
+        """Query whether a package is installed using the configured manager."""
         query_cmd = self.package_manager_commands.get(manager, {}).get("query")
         if not query_cmd:
             return False
@@ -403,6 +415,7 @@ class PackageManager:
         return bool(out.strip()) if success else False
 
     def install(self, manager: str, packages: List[str]) -> bool:
+        """Install a list of packages using the configured package manager."""
         install_cmd = self.package_manager_commands.get(manager, {}).get("install")
         if not install_cmd or not packages:
             LOG.debug("No install command or packages for manager=%s", manager)
@@ -421,6 +434,7 @@ class PackageManager:
         return success
 
     def update(self, manager: str) -> bool:
+        """Update packages for the specified package manager."""
         update_cmd = self.package_manager_commands.get(manager, {}).get("update")
         if not update_cmd:
             LOG.debug("No update command for manager=%s", manager)
@@ -435,6 +449,7 @@ class PackageManager:
         return success
 
     def install_packages(self, dependencies: Dict[str, List[str]]) -> bool:
+        """Install a mapping of package dependencies across supported managers."""
         success = True
         for manager, packages in dependencies.items():
             if not packages:
@@ -454,6 +469,7 @@ class PackageManager:
         dependency: Dict[str, List[str]],
         filtered_deps: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, List[str]]:
+        """Filter dependencies to only those applicable to the chosen managers."""
         if filtered_deps is None:
             filtered_deps = {}
         seen_packages: set = set()
@@ -476,6 +492,7 @@ class PackageManager:
         return {k: v for k, v in filtered_deps.items() if v}
 
     def fetch_all_deps(self, data: Dict[str, Any]) -> Dict[str, List[str]]:
+        """Collect all dependency declarations from config into a deduplicated map."""
         def add_dep_block(acc: Dict[str, List[str]], dep_block: Any) -> None:
             merged = DeezUtils.merge_dependency_blocks(dep_block)
             for manager, packages in merged.items():
@@ -516,6 +533,7 @@ class PackageManager:
         return all_deps
 
     def collect_dependency_blocks(self, data: Dict[str, Any]) -> List[Dict[str, List[str]]]:
+        """Collect normalized dependency blocks from config sections and file entries."""
         def append_blocks(acc: List[Dict[str, List[str]]], dep_block: Any) -> None:
             acc.extend(DeezUtils.normalize_dependency_blocks(dep_block))
 
@@ -549,6 +567,7 @@ class PackageManager:
         dependency_blocks: List[Dict[str, List[str]]],
         available_managers: List[str],
     ) -> Tuple[Dict[str, List[str]], List[Dict[str, List[str]]]]:
+        """Resolve dependency blocks into manager-specific install plans and unresolved blocks."""
         selected: Dict[str, List[str]] = {}
         selected_seen: Dict[str, set] = {}
         unresolved: List[Dict[str, List[str]]] = []
@@ -598,14 +617,18 @@ class PackageManager:
 
 
 class ReadMeta:
+    """Load TOML configuration files and resolve included config references."""
+
     supported_url_schemes: Tuple[str, ...] = ("http", "https", "file")
 
     @classmethod
     def is_url(cls, config_location: Union[str, Path]) -> bool:
+        """Return True if the config location is a supported URL scheme."""
         parsed = urllib.parse.urlparse(str(config_location or "").strip())
         return parsed.scheme in cls.supported_url_schemes
 
     def read_url(self, config_url: str) -> Dict[str, Any]:
+        """Load a TOML config from a remote URL and return it as a dictionary."""
         with urllib.request.urlopen(config_url) as response:
             payload = response.read().decode("utf-8")
         data = toml.loads(payload)
@@ -663,6 +686,7 @@ class ReadMeta:
 
     @classmethod
     def merge_configs(cls, base_config: Dict[str, Any], override_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge two configuration dictionaries, combining nested values and lists."""
         return cls._merge_config_values(base_config, override_config)
 
     def _normalize_location(self, config_location: Union[str, Path]) -> str:
@@ -689,6 +713,7 @@ class ReadMeta:
         config_location: Union[str, Path],
         _loading_stack: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        """Load a config from a file path or URL, resolving included configs recursively."""
         normalized_location = self._normalize_location(config_location)
         loading_stack = list(_loading_stack or [])
         if normalized_location in loading_stack:
@@ -812,32 +837,39 @@ class ManifestManager:
             return toml.load(f)
 
     def save(self, dot: str, meta: Dict[str, Any], file_pairs: List[Union[Tuple[str, str], Dict[str, Any]]]) -> None:
+        """Save a dot manifest for an installed dot to disk."""
         payload = self._serialize(meta, file_pairs)
         self._atomic_write(self._manifest_path(dot), payload)
 
     def load_desc(self, dot: str) -> Dict[str, Any]:
+        """Load metadata for an installed dot without the file entries."""
         raw = self._load_raw(dot)
         raw.pop("files", None)
         return raw
 
     def get_files(self, dot: str) -> List[str]:
+        """Return tracked installed destination file paths for a dot."""
         raw = self._load_raw(dot)
         files = raw.get("files", [])
         return [e["dst"] for e in files if e.get("installed", True)]
 
     def get_file_entries(self, dot: str) -> List[Dict[str, Any]]:
+        """Return the raw file entry definitions for a tracked dot."""
         return self._load_raw(dot).get("files", [])
 
     def remove_dot(self, dot: str) -> None:
+        """Remove the manifest for an installed dot from storage."""
         path = self._manifest_path(dot)
         if path.exists():
             path.unlink()
             LOG.debug("Removed manifest %s", path)
 
     def mark_removed(self, dot: str) -> None:
+        """Mark a dot as removed by deleting its manifest."""
         self.remove_dot(dot)
 
     def find_owner_of(self, target_path: str) -> Optional[str]:
+        """Return the dot that owns a tracked target path, if any."""
         if not self._base_dir_path().is_dir():
             return None
         for dot in self.list_dots():
@@ -846,6 +878,7 @@ class ManifestManager:
         return None
 
     def build_owner_index(self) -> Dict[str, str]:
+        """Build a reverse index mapping tracked paths to owning dot names."""
         owner_index: Dict[str, str] = {}
         for dot in self.list_dots():
             for path in self.get_files(dot):
@@ -853,6 +886,7 @@ class ManifestManager:
         return owner_index
 
     def list_dots(self) -> List[str]:
+        """List all installed dots for which manifests exist."""
         base_dir = self._base_dir_path()
         if not base_dir.is_dir():
             return []
@@ -861,6 +895,8 @@ class ManifestManager:
 
 @dataclass
 class CacheEntry:
+    """Metadata for a cached dot bundle archive."""
+
     path: Path
     name: str
     version: str
@@ -875,6 +911,8 @@ class CacheEntry:
 
 
 class CacheManager:
+    """Manage cached dot bundle archives under XDG cache storage."""
+
     def __init__(self, cache_root: Optional[Union[str, Path]] = None):
         xdg_cache = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
         self.cache_root: Path = Path(cache_root) if cache_root else xdg_cache / "deez" / "dots"
@@ -901,6 +939,7 @@ class CacheManager:
             return 0
 
     def read_bundle_metadata(self, path: Union[str, Path]) -> CacheEntry:
+        """Read metadata from a cached bundle archive without loading the full bundle."""
         p = Path(path)
         name = "?"
         version = "?"
@@ -946,11 +985,13 @@ class CacheManager:
         )
 
     def list_entries(self) -> List[CacheEntry]:
+        """List all cache bundle entries in the configured cache root."""
         entries = [self.read_bundle_metadata(p) for p in self._bundle_paths()]
         entries.sort(key=lambda e: e.mtime_ts, reverse=True)
         return entries
 
     def bundles_by_dot(self) -> Dict[str, List[CacheEntry]]:
+        """Group cached bundles by their dot name."""
         cached_by_dot: Dict[str, List[CacheEntry]] = {}
         for entry in self.list_entries():
             if not entry.name:
@@ -964,6 +1005,7 @@ class CacheManager:
         return cached_by_dot
 
     def bundle_path_for_hash(self, bundle_hash: str) -> Optional[Path]:
+        """Return the cache path for a bundle identified by its hash."""
         digest = str(bundle_hash or "").strip()
         if not digest:
             return None
@@ -971,6 +1013,7 @@ class CacheManager:
         return candidate if candidate.is_file() else None
 
     def prune_keep(self, keep_count: int = 10, dry_run: bool = False) -> int:
+        """Prune cached bundles to keep the newest `keep_count` items."""
         if keep_count is None:
             keep_count = 10
         if keep_count < 0:
@@ -1004,7 +1047,10 @@ class CacheManager:
 
 
 class WriteDots:
+    """Execute dot-related commands and backup operations during CLI workflows."""
+
     def __init__(self, runner: Callable[..., RunResult] = default_run_command):
+        """Initialize a WriteDots instance with an optional command runner."""
         self.runner = runner
 
     def execute_commands(
@@ -1013,6 +1059,7 @@ class WriteDots:
         cwd: Optional[Union[str, Path]] = None,
         soft_fail: bool = True,
     ) -> None:
+        """Execute a series of shell commands or scripts with optional failure handling."""
         for cmd in commands:
             if not cmd:
                 continue
@@ -1064,6 +1111,7 @@ class WriteDots:
         manifest_manager: Optional[ManifestManager] = None,
         desc_data: Optional[Dict[str, Any]] = None,
     ) -> str:
+        """Create a backup tarball for a dot's tracked files and return its path."""
         if desc_data is None:
             desc_data = {}
             if manifest_manager:
@@ -1544,6 +1592,7 @@ class WriteDots:
         build_command: Optional[str] = None,
         overwrite_existing: bool = False,
     ) -> str:
+        """Stage dot files and metadata into a bundle archive, returning the bundle path."""
         xdg_cache = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
         stage_dir = xdg_cache / "deez" / "stage" / dot
         shutil.rmtree(stage_dir, ignore_errors=True)
@@ -1594,6 +1643,7 @@ class WriteDots:
         out_dir: Optional[str] = None,
         overwrite_existing: bool = False,
     ) -> str:
+        """Export staged entries to a bundle with optional manifest metadata."""
         xdg_cache = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
         ts = str(int(time.time()))
         stage_dir = xdg_cache / "deez" / "stage" / f"{dot}-export-{ts}"
@@ -1631,6 +1681,7 @@ class WriteDots:
         compress: bool = True,
         overwrite_existing: bool = False,
     ) -> str:
+        """Export live files from a target root into a bundle archive."""
         xdg_cache = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
         ts = str(int(time.time()))
         stage_dir = xdg_cache / "deez" / "stage" / f"{dot}-export-{ts}"
@@ -1679,6 +1730,7 @@ class WriteDots:
             shutil.rmtree(stage_dir, ignore_errors=True)
 
     def remove(self, dot: str, manifest_manager: ManifestManager) -> None:
+        """Remove an installed dot by backing up and deleting tracked files."""
         tracked = manifest_manager.get_files(dot)
         if not tracked:
             LOG.debug("No tracked files for %s", dot)
@@ -1705,19 +1757,24 @@ class WriteDots:
 
 
 class GitHandler:
+    """Git helper used to resolve dot source paths, canonical URLs, and repo metadata."""
+
     def __init__(self, main_config: Dict[str, Any], runner: Callable[..., RunResult] = default_run_command):
+        """Initialize git source handling with config and a command runner."""
         self.main_config = main_config
         self.runner = runner
         self.source_cache_dir = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "deez" / "source"
 
     @staticmethod
     def sanitize_branch(branch: Optional[str]) -> str:
+        """Convert a git branch name into a filesystem-safe identifier."""
         if not branch:
             return "main"
         return branch.replace("/", "-").replace(" ", "-")
 
     @staticmethod
     def source_cache_path(cache_root: Union[str, Path], owner: str, name: str, branch: str) -> str:
+        """Compute a cache path for a git source based on owner/name/branch."""
         safe_branch = GitHandler.sanitize_branch(branch)
         owner_part = (owner or "unknown").lower()
         name_part = (name or "unknown").lower()
@@ -1725,6 +1782,7 @@ class GitHandler:
 
     @staticmethod
     def normalize_git_url(git_url: Optional[str]) -> str:
+        """Normalize git URLs into a consistent lower-case repository path."""
         normalized = str(git_url or "").strip()
         if not normalized:
             return ""
@@ -1741,25 +1799,30 @@ class GitHandler:
         return normalized.lower()
 
     def is_git_repo(self, repo_path: Union[str, Path]) -> bool:
+        """Return True if the given path is a git repository."""
         success, out, _ = self.runner(["git", "-C", str(repo_path), "rev-parse", "--is-inside-work-tree"])
         return success and out.strip() == "true"
 
     def get_remote_url(self, repo_path: Union[str, Path], remote: str = "origin") -> str:
+        """Return the configured remote URL for a git repository."""
         success, out, _ = self.runner(["git", "-C", str(repo_path), "config", "--get", f"remote.{remote}.url"])
         return out.strip() if success else ""
 
     @staticmethod
     def is_source_url(source: Optional[Union[str, Path]]) -> bool:
+        """Return True if the source string is a URL pointing to source content."""
         parsed = urllib.parse.urlparse(str(source or "").strip())
         return parsed.scheme in ("http", "https", "file")
 
     @staticmethod
     def is_release(url: str) -> bool:
+        """Return True if the URL points to an archive release artifact."""
         lowered = str(url or "").strip().lower()
         return lowered.endswith(".tar.gz") or lowered.endswith(".tgz") or lowered.endswith(".tar") or lowered.endswith(".zip")
 
     @staticmethod
     def file_url_to_path(url: str) -> Path:
+        """Convert a file:// URL into a local filesystem path."""
         parsed = urllib.parse.urlparse(url)
         path = urllib.request.url2pathname(parsed.path or "")
         if parsed.netloc and parsed.netloc not in ("", "localhost"):
@@ -1768,6 +1831,7 @@ class GitHandler:
 
     @staticmethod
     def archive_cache_key(source: Union[str, Path]) -> str:
+        """Compute a stable cache key for an archive source path or URL."""
         source_text = str(source).strip()
         if not source_text:
             return "source"
@@ -1817,6 +1881,7 @@ class GitHandler:
             tar.extractall(path=destination)
 
     def prepare_archive_source(self, source: Union[str, Path]) -> str:
+        """Download or copy and extract a remote/local archive source into cache."""
         source_text = str(source).strip()
         cache_key = self.archive_cache_key(source_text)
         cache_root = self.source_cache_dir / "archives" / cache_key
@@ -1849,6 +1914,7 @@ class GitHandler:
         return str(self._discover_extracted_root(extract_root))
 
     def prepare_git_source(self, git_url: str, target_branch: str) -> str:
+        """Clone or refresh a git source repository into the local cache."""
         repo_owner, repo_name = self.get_git_owner_name(git_url)
         cache_root = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
         source_root_path = Path(self.source_cache_path(cache_root, repo_owner, repo_name, target_branch))
@@ -1867,6 +1933,7 @@ class GitHandler:
         *,
         explicit_source_path: bool = False,
     ) -> str:
+        """Resolve a source path or git URL to a local source directory."""
         source_text = os.path.expandvars(os.path.expanduser(str(source_dir or "").strip()))
         if explicit_source_path and source_text:
             if self.is_source_url(source_text):
@@ -1929,6 +1996,7 @@ class GitHandler:
 
     @staticmethod
     def get_git_owner_name(git_url: str) -> Tuple[str, str]:
+        """Extract owner and repository name from a git URL."""
         parts = git_url.rstrip(".git").split("/")
         owner = parts[-2] if len(parts) > 1 else "unknown"
         name = parts[-1].replace(".git", "") if len(parts) > 0 else "unknown"
@@ -1936,6 +2004,7 @@ class GitHandler:
 
     @staticmethod
     def get_git_version(repo_path: Union[str, Path]) -> str:
+        """Return the latest git tag or commit hash for a repository."""
         try:
             res = subprocess.run(["git", "-C", str(repo_path), "describe", "--tags", "--abbrev=0"], check=True, capture_output=True, text=True)
             tag = res.stdout.strip()
@@ -1953,6 +2022,7 @@ class GitHandler:
             return "unknown"
 
     def git_clone(self, url: str, target_dir: Union[str, Path], branch: Optional[str] = None) -> None:
+        """Clone a git repository to a target directory."""
         if not url.startswith("http"):
             url = "https://" + url
         LOG.debug("[GIT] clone %s -> %s", url, target_dir)
@@ -1965,6 +2035,7 @@ class GitHandler:
             raise RuntimeError(f"git clone failed: {err or out}")
 
     def git_fetch(self, repo_path: Union[str, Path], target_branch: Optional[str] = None) -> None:
+        """Fetch updates for a local git repository."""
         LOG.debug("[GIT] fetch --all (%s)", repo_path)
         if target_branch:
             cmd = ["git", "-C", str(repo_path), "fetch", "origin", target_branch, "--depth", "1", "--progress"]
@@ -1975,6 +2046,7 @@ class GitHandler:
             raise RuntimeError(f"git fetch failed: {err or out}")
 
     def git_pull(self, repo_path: Union[str, Path], target_branch: str) -> None:
+        """Pull the latest changes for a specific branch."""
         LOG.debug("[GIT] pull origin %s (%s)", target_branch, repo_path)
         cmd = ["git", "-C", str(repo_path), "pull", "--rebase", "origin", target_branch, "--progress"]
         success, out, err = self.runner(cmd)
@@ -1982,6 +2054,7 @@ class GitHandler:
             raise RuntimeError(f"git pull failed: {err or out}")
 
     def git_checkout(self, repo_path: Union[str, Path], branch: str) -> None:
+        """Checkout or recreate a branch in a local git repository."""
         LOG.debug("[GIT] checkout %s (%s)", branch, repo_path)
         try:
             success, out, err = self.runner(["git", "-C", str(repo_path), "checkout", branch])
@@ -1993,6 +2066,7 @@ class GitHandler:
             raise
 
     def handle(self, url: str) -> None:
+        """Download and prepare a URL or git repo source based on its form."""
         if url.startswith("http"):
             url = url.split("://", 1)[1]
         if self.is_release(url):
@@ -2025,6 +2099,7 @@ class GitHandler:
             self.git_checkout(source_root_path, target_branch)
 
     def get_githash(self, repo_path: Union[str, Path]) -> str:
+        """Return the current git HEAD hash for the given repository."""
         try:
             success, out, err = self.runner(["git", "-C", str(repo_path), "rev-parse", "HEAD"])
             if success:
@@ -2036,6 +2111,8 @@ class GitHandler:
 
 
 class InteractiveMenu:
+    """Terminal prompt helpers for interactive dot selection and confirmation."""
+
     _RESET = "\033[0m"
     _BOLD = "\033[1m"
     _DIM = "\033[2m"
@@ -2052,6 +2129,7 @@ class InteractiveMenu:
 
     @classmethod
     def confirm(cls, prompt: str, default: bool = False) -> bool:
+        """Prompt the user for a yes/no confirmation."""
         hint = f"{cls._BOLD}Y{cls._RESET}/n" if default else f"y/{cls._BOLD}N{cls._RESET}"
         raw = UI.read_input(f"{prompt} [{hint}]: ").strip().lower()
         if not raw:
@@ -2060,6 +2138,7 @@ class InteractiveMenu:
 
     @classmethod
     def choose_one(cls, prompt: str, options: List[Any], labels: Optional[List[str]] = None, allow_cancel: bool = True) -> Optional[Any]:
+        """Prompt the user to choose a single option from a list."""
         if not options:
             return None
         was_paused = UI.pause_loader()
@@ -2081,6 +2160,7 @@ class InteractiveMenu:
 
     @classmethod
     def choose_many(cls, prompt: str, options: List[Any], labels: Optional[List[str]] = None, allow_all: bool = True) -> List[Any]:
+        """Prompt the user to choose multiple options or ranges from a list."""
         if not options:
             return []
         was_paused = UI.pause_loader()
@@ -2141,6 +2221,8 @@ class InteractiveMenu:
 
 
 class DeezCLI:
+    """Programmatic entrypoint exposing deez-dots query and management APIs."""
+
     def __init__(
         self,
         args: argparse.Namespace,
@@ -2151,6 +2233,8 @@ class DeezCLI:
         available_package_managers: List[str],
         distribution: str,
         package_manager_instance: Optional[PackageManager] = None,
+        manifest_manager: Optional[ManifestManager] = None,
+        cache_manager: Optional[CacheManager] = None,
     ):
         self.args = args
         self.main_config = main_config
@@ -2168,8 +2252,8 @@ class DeezCLI:
         else:
             self.dotfile_sections = [key for key, value in main_config.items() if key != "global" and isinstance(value, dict)]
         self.package_manager_instance = package_manager_instance if package_manager_instance is not None else PackageManager()
-        self.manifest_manager = ManifestManager()
-        self.cache_manager = CacheManager()
+        self.manifest_manager = manifest_manager if manifest_manager is not None else ManifestManager()
+        self.cache_manager = cache_manager if cache_manager is not None else CacheManager()
         self._manifest_dots = self.manifest_manager.list_dots()
 
     @staticmethod
@@ -2411,9 +2495,9 @@ class DeezCLI:
             return None
 
     @staticmethod
-    def _display_path_parts(path_text: str) -> List[str]:
+    def _display_path_parts(path_text: str, home: Optional[Path] = None) -> List[str]:
         path = Path(path_text).expanduser()
-        home = Path.home()
+        home = home or Path.home()
         try:
             relative = path.relative_to(home)
             return ["~", *relative.parts] or ["~"]
@@ -2502,7 +2586,7 @@ class DeezCLI:
             dst = str(entry.get("dst") or "").strip()
             if not dst:
                 continue
-            self._insert_tree_path(tree, self._display_path_parts(dst), exists=self._path_exists_or_link(Path(dst)))
+            self._insert_tree_path(tree, self._display_path_parts(dst, home=Path(self.target_root)), exists=self._path_exists_or_link(Path(dst)))
         for line in self._render_tree_lines(tree):
             UI.plain(f"  {line}")
 
@@ -2520,7 +2604,7 @@ class DeezCLI:
                     dst = str(entry.get("dst") or "").strip()
                     if not dst:
                         continue
-                    self._insert_tree_path(tree, self._display_path_parts(dst), owner=dot, exists=self._path_exists_or_link(Path(dst)))
+                    self._insert_tree_path(tree, self._display_path_parts(dst, home=Path(self.target_root)), owner=dot, exists=self._path_exists_or_link(Path(dst)))
             for line in self._render_tree_lines(tree):
                 UI.plain(line)
             return
@@ -2638,6 +2722,47 @@ class DeezCLI:
             else:
                 UI.error(f"Dot '{dot}' not found in config.")
         return [dot for dot in requested if dot in eligible]
+
+    def query_selectable_config_dots(self, action_label: str = "bundle") -> List[Dict[str, str]]:
+        """Return selectable config dot metadata for interactive selection."""
+        sections = sorted(self.dotfile_sections)
+        return [
+            {"dot": dot, "label": self._dot_selection_label(dot), "action": action_label}
+            for dot in sections
+        ]
+
+    def query_selectable_installed_dots(self) -> List[Dict[str, str]]:
+        """Return selectable installed dots for interactive restore or uninstall flows."""
+        dots = sorted(self.manifest_manager.list_dots())
+        return [
+            {"dot": dot, "label": self._installed_dot_selection_label(dot)}
+            for dot in dots
+        ]
+
+    def query_selectable_backup_dots(self) -> List[Dict[str, str]]:
+        """Return selectable backup dot options for restore workflows."""
+        dots = self._backup_dots()
+        return [
+            {"dot": dot, "label": self._restorable_dot_selection_label(dot, len(self._list_snapshots(dot)))}
+            for dot in dots
+        ]
+
+    def query_selectable_cache_dots(self) -> List[Dict[str, str]]:
+        """Return selectable cached dots and counts for downgrade or restore selection."""
+        cached_by_dot = self.cache_manager.bundles_by_dot()
+        return [
+            {"dot": dot, "label": self._cache_dot_selection_label(dot, len(entries))}
+            for dot, entries in sorted(cached_by_dot.items())
+        ]
+
+    def query_selectable_cache_versions(self, dot: str) -> List[Dict[str, str]]:
+        """Return selectable cached bundle versions for a specific dot."""
+        cached_by_dot = self.cache_manager.bundles_by_dot()
+        entries = cached_by_dot.get(dot, [])
+        return [
+            {"path": str(entry.path), "label": self._cache_version_selection_label(entry)}
+            for entry in entries
+        ]
 
     def _backup_user_base(self) -> Path:
         xdg_data = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share"))
@@ -3579,6 +3704,144 @@ class DeezCLI:
             return
         self._do_install(to_install)
 
+    def _serialize_tree_node(self, node: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "exists": bool(node.get("exists", True)),
+            "owners": sorted(node.get("owners", [])),
+            "children": {
+                name: self._serialize_tree_node(child)
+                for name, child in sorted(node.get("children", {}).items())
+            },
+        }
+
+    def _resolve_installed_dot_targets_for_query(self, requested: Optional[str]) -> List[str]:
+        dots = sorted(self.manifest_manager.list_dots())
+        if not dots:
+            return []
+        target = str(requested or "").strip()
+        if not target or target.lower() == "all":
+            return dots
+        if target not in dots:
+            return []
+        return [target]
+
+    def query_installed_dots(self) -> List[Dict[str, Any]]:
+        """Return a structured list of installed dot manifests from the local manifest store."""
+        dots = self.manifest_manager.list_dots()
+        results: List[Dict[str, Any]] = []
+        for dot in sorted(dots):
+            desc = self.manifest_manager.load_desc(dot)
+            files = list(self.manifest_manager.get_files(dot))
+            missing = [p for p in files if not Path(p).exists()]
+            results.append(
+                {
+                    "dot": dot,
+                    "owner": desc.get("owner", "?"),
+                    "version": desc.get("version"),
+                    "install_date": desc.get("installdate"),
+                    "files": files,
+                    "missing": missing,
+                    "file_count": len(files),
+                    "status": "missing" if missing else "ok",
+                }
+            )
+        return results
+
+    def query_filetree(self, target: Optional[str] = None) -> Dict[str, Any]:
+        """Return a serialized tracked file tree for installed dots."""
+        dots = self._resolve_installed_dot_targets_for_query(target)
+        tree: Dict[str, Any] = {"children": {}}
+        for dot in dots:
+            for entry in self.manifest_manager.get_file_entries(dot):
+                if not entry.get("installed", True):
+                    continue
+                dst = str(entry.get("dst") or "").strip()
+                if not dst:
+                    continue
+                self._insert_tree_path(tree, self._display_path_parts(dst, home=Path(self.target_root)), owner=dot, exists=self._path_exists_or_link(Path(dst)))
+        return {
+            "target": target or "all",
+            "dots": dots,
+            "tree": self._serialize_tree_node(tree),
+        }
+
+    def query_healthcheck(self, target: Optional[str] = None) -> Dict[str, Any]:
+        """Return a health summary for installed dots, including missing and changed files."""
+        dots = self._resolve_installed_dot_targets_for_query(target)
+        results: Dict[str, Any] = {}
+        for dot in dots:
+            results[dot] = self._healthcheck_dot(dot)
+        return {
+            "target": target or "all",
+            "dots": dots,
+            "status": results,
+        }
+
+    def query_config_sections(self) -> Dict[str, Any]:
+        """Return metadata about available configuration dot sections."""
+        return {
+            "global": dict(self.global_config),
+            "sections": sorted(self.dotfile_sections),
+            "explicit_selection": self._has_explicit_dot_selection,
+        }
+
+    @staticmethod
+    def _serialize_cache_entry(entry: CacheEntry) -> Dict[str, Any]:
+        return {
+            "path": str(entry.path),
+            "name": entry.name,
+            "version": entry.version,
+            "githash": entry.githash,
+            "builddate": entry.builddate,
+            "origin": entry.origin,
+            "size": entry.size,
+            "mtime": entry.mtime,
+            "mtime_ts": entry.mtime_ts,
+            "meta": entry.meta,
+        }
+
+    def query_cache_entries(self) -> List[Dict[str, Any]]:
+        """Return metadata for all cached bundle entries."""
+        return [self._serialize_cache_entry(entry) for entry in self.cache_manager.list_entries()]
+
+    def query_cached_bundles_by_dot(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Return cached bundle metadata grouped by dot name."""
+        return {
+            dot: [self._serialize_cache_entry(entry) for entry in entries]
+            for dot, entries in self.cache_manager.bundles_by_dot().items()
+        }
+
+    def query_available_package_managers(self) -> Dict[str, Any]:
+        """Return available package managers and their configured command templates."""
+        return {
+            "available": list(self.available_package_managers),
+            "commands": dict(self.package_manager_instance.package_manager_commands),
+        }
+
+    def query_dependency_blocks(self, sections: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Return normalized dependency blocks and merged dependencies for selected sections."""
+        selected_sections = sections if sections is not None else self.dotfile_sections
+        subset_config: Dict[str, Any] = {"global": dict(self.main_config.get("global", {}))}
+        for section in selected_sections:
+            if section in self.main_config:
+                subset_config[section] = self.main_config.get(section, {})
+        blocks = self.package_manager_instance.collect_dependency_blocks(subset_config)
+        merged = self.package_manager_instance.fetch_all_deps(subset_config)
+        return {
+            "selected_sections": selected_sections,
+            "dependency_blocks": blocks,
+            "merged_dependencies": merged,
+        }
+
+    def query_missing_dependencies(self, selected_managers: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Return missing dependencies validated against available package managers."""
+        filtered, missing = self._collect_missing_dependencies(selected_managers)
+        return {
+            "available_managers": self.available_package_managers,
+            "filtered": filtered,
+            "missing": missing,
+        }
+
     def _do_list(self) -> None:
         dots = self.manifest_manager.list_dots()
         if not dots:
@@ -3598,6 +3861,7 @@ class DeezCLI:
                     UI.plain(f"      [MISSING] {p}")
 
     def run(self) -> None:
+        """Run the CLI command flow based on parsed args and config state."""
         global_config = self.main_config.get("global", {})
         global_owner = DeezUtils.normalize_owner(global_config.get("owner", "unknown"))
         global_name = global_config.get("name", "unknown")
@@ -3741,5 +4005,388 @@ class DeezCLI:
             UI.set_loader_message("Listing installed dots...")
             self._do_list()
             return
+
+
+def create_deez_cli(
+    main_config: Dict[str, Any],
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> DeezCLI:
+    """Create a configured DeezCLI instance."""
+    args = argparse.Namespace()
+    return DeezCLI(
+        args,
+        main_config or {},
+        source_dir or "",
+        target_root or os.path.expanduser("~"),
+        version or "unknown",
+        available_package_managers if available_package_managers is not None else [],
+        distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    )
+
+
+def query_installed_dots(
+    main_config: Dict[str, Any],
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> List[Dict[str, Any]]:
+    """Return installed dot metadata."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_installed_dots()
+
+
+def query_filetree(
+    main_config: Dict[str, Any],
+    target: Optional[str] = None,
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> Dict[str, Any]:
+    """Return the installed dot file tree."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_filetree(target=target)
+
+
+def query_healthcheck(
+    main_config: Dict[str, Any],
+    target: Optional[str] = None,
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> Dict[str, Any]:
+    """Return the installed dot health summary."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_healthcheck(target=target)
+
+
+def query_config_sections(
+    main_config: Dict[str, Any],
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> Dict[str, Any]:
+    """Return dot section metadata."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_config_sections()
+
+
+def query_cache_entries(
+    main_config: Dict[str, Any],
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> List[Dict[str, Any]]:
+    """Return cached bundle metadata."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_cache_entries()
+
+
+def query_cached_bundles_by_dot(
+    main_config: Dict[str, Any],
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Return cached bundle lists by dot."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_cached_bundles_by_dot()
+
+
+def query_available_package_managers(
+    main_config: Dict[str, Any],
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> Dict[str, Any]:
+    """Return available package manager info."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_available_package_managers()
+
+
+def query_dependency_blocks(
+    main_config: Dict[str, Any],
+    sections: Optional[List[str]] = None,
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> Dict[str, Any]:
+    """Return normalized dependency blocks."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_dependency_blocks(sections=sections)
+
+
+def query_missing_dependencies(
+    main_config: Dict[str, Any],
+    selected_managers: Optional[List[str]] = None,
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> Dict[str, Any]:
+    """Return missing dependencies."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_missing_dependencies(selected_managers=selected_managers)
+
+
+def query_selectable_config_dots(
+    main_config: Dict[str, Any],
+    action_label: str = "bundle",
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> List[Dict[str, str]]:
+    """Return config dot selection labels."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_selectable_config_dots(action_label=action_label)
+
+
+def query_selectable_installed_dots(
+    main_config: Dict[str, Any],
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> List[Dict[str, str]]:
+    """Return installed dot selection labels."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_selectable_installed_dots()
+
+
+def query_selectable_backup_dots(
+    main_config: Dict[str, Any],
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> List[Dict[str, str]]:
+    """Return backup dot selection labels."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_selectable_backup_dots()
+
+
+def query_selectable_cache_dots(
+    main_config: Dict[str, Any],
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> List[Dict[str, str]]:
+    """Return cache dot selection labels."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_selectable_cache_dots()
+
+
+def query_selectable_cache_versions(
+    main_config: Dict[str, Any],
+    dot: str,
+    source_dir: Optional[str] = None,
+    target_root: Optional[str] = None,
+    version: Optional[str] = None,
+    available_package_managers: Optional[List[str]] = None,
+    distribution: str = "auto",
+    package_manager_instance: Optional[PackageManager] = None,
+    manifest_manager: Optional[ManifestManager] = None,
+    cache_manager: Optional[CacheManager] = None,
+) -> List[Dict[str, str]]:
+    """Return cached version selection labels."""
+    return create_deez_cli(
+        main_config,
+        source_dir=source_dir,
+        target_root=target_root,
+        version=version,
+        available_package_managers=available_package_managers,
+        distribution=distribution,
+        package_manager_instance=package_manager_instance,
+        manifest_manager=manifest_manager,
+        cache_manager=cache_manager,
+    ).query_selectable_cache_versions(dot)
 
 
