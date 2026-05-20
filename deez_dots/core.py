@@ -2920,20 +2920,37 @@ class DeezCLI:
             return None
         return parsed
 
+    def _check_dependency_status(self, dependency_map: Dict[str, List[str]]) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        satisfied: Dict[str, List[str]] = {}
+        missing: Dict[str, List[str]] = {}
+
+        UI.progress("Checking dependency status...")
+        for manager, packages in dependency_map.items():
+            for package in packages:
+                installed = False
+                if manager == "system":
+                    installed = bool(shutil.which(package))
+                else:
+                    installed = self.package_manager_instance.query_installed(manager, package)
+
+                if installed:
+                    satisfied.setdefault(manager, []).append(package)
+                    UI.success(f"{manager}: {package}")
+                else:
+                    missing.setdefault(manager, []).append(package)
+                    UI.warn(f"{manager}: {package} missing")
+
+        LOG.debug("Dependency status satisfied: %s", satisfied)
+        LOG.debug("Dependency status missing: %s", missing)
+        return satisfied, missing
+
     def _collect_missing_dependencies(self, selected_managers: Optional[List[str]] = None) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
         managers = selected_managers if selected_managers is not None else self.available_package_managers
         all_deps = self.package_manager_instance.fetch_all_deps(self.main_config)
         filtered = self.package_manager_instance.filter_deps(managers, all_deps)
-        missing: Dict[str, List[str]] = {}
-        for manager, packages in filtered.items():
-            if manager == "system":
-                for pkg in packages:
-                    if not shutil.which(pkg):
-                        missing.setdefault(manager, []).append(pkg)
-                continue
-            for pkg in packages:
-                if not self.package_manager_instance.query_installed(manager, pkg):
-                    missing.setdefault(manager, []).append(pkg)
+        if not filtered:
+            return filtered, {}
+        _, missing = self._check_dependency_status(filtered)
         LOG.debug("Filtered deps: %s", filtered)
         LOG.debug("Missing deps: %s", missing)
         return filtered, missing
@@ -2980,25 +2997,7 @@ class DeezCLI:
         for manager, packages in dependency_map.items():
             UI.plain(f"  {manager}: {', '.join(packages)}")
 
-        missing: Dict[str, List[str]] = {}
-        satisfied: Dict[str, List[str]] = {}
-        for manager, packages in dependency_map.items():
-            if manager == "system":
-                for package in packages:
-                    if not shutil.which(package):
-                        missing.setdefault(manager, []).append(package)
-                    else:
-                        satisfied.setdefault(manager, []).append(package)
-                continue
-            for package in packages:
-                if not self.package_manager_instance.query_installed(manager, package):
-                    missing.setdefault(manager, []).append(package)
-                else:
-                    satisfied.setdefault(manager, []).append(package)
-
-        for manager, packages in satisfied.items():
-            if packages:
-                UI.success(f"Deps already satisfied via {manager}: {', '.join(packages)}")
+        satisfied, missing = self._check_dependency_status(dependency_map)
 
         if unresolved:
             UI.error(f"Dependency managers unavailable for: {', '.join(target_dots)}")

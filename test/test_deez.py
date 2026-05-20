@@ -2794,7 +2794,8 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("Dependency plan for: kitty", text)
         self.assertIn("yay: kitty", text)
         self.assertIn("pacman: nvidia-utils", text)
-        self.assertIn("Deps already satisfied via yay: kitty", text)
+        self.assertIn("[ok] yay: kitty", text)
+        self.assertIn("[warn] pacman: nvidia-utils missing", text)
         self.assertIn("Installing via pacman: nvidia-utils", text)
 
     def test_dots_install_honors_file_level_dependency_from_bundle_manifest(self):
