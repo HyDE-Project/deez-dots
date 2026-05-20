@@ -51,7 +51,7 @@ def config_error(args: argparse.Namespace, config_file_path: str | None) -> str 
 
 def execute(cli: Any) -> None:
     """Execute the normalized `deez deps` flow using an initialized CLI instance."""
-    UI.set_loader_message("Resolving dependency managers...")
+    UI.start_loader("Resolving dependency managers...")
     selected_managers = cli._resolve_dep_managers()
     if selected_managers is None:
         os._exit(1)

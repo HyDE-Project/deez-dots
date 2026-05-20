@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import re
 import shutil
 import sys
 import threading
@@ -48,7 +49,7 @@ class UI:
         with cls._output_lock:
             if cls._loader and cls._loader.is_running():
                 cls._loader._clear_line_locked()
-            print(f"{cls._prefix(label, color)} {msg}")
+            print(f"{cls._prefix(label, color)} {msg}", flush=True)
             if cls._loader and cls._loader.is_running() and not cls._loader.is_paused():
                 cls._loader._redraw_locked()
 
@@ -58,7 +59,7 @@ class UI:
         with cls._output_lock:
             if cls._loader and cls._loader.is_running():
                 cls._loader._clear_line_locked()
-            print(msg)
+            print(msg, flush=True)
             if cls._loader and cls._loader.is_running() and not cls._loader.is_paused():
                 cls._loader._redraw_locked()
 
@@ -142,6 +143,8 @@ class UI:
 class Loader:
     """A lightweight spinner used only for interactive, non-debug sessions."""
 
+    _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
     def __init__(self, message: str = "Working..."):
         self.message = message
         self._stop_event = threading.Event()
@@ -202,20 +205,44 @@ class Loader:
     def _line_width(self) -> int:
         return max(80, shutil.get_terminal_size(fallback=(80, 20)).columns)
 
+    def _truncate_message(self, msg: str, reserved: int) -> str:
+        width = self._line_width()
+        if width <= reserved:
+            return ""
+        max_len = width - reserved
+        if len(msg) <= max_len:
+            return msg
+        return msg[: max(0, max_len - 1)] + "…"
+
+    def _visible_length(self, text: str) -> int:
+        return len(self._ANSI_ESCAPE.sub("", text))
+
+    def _line_count(self, frame: str) -> int:
+        visible = self._visible_length(frame)
+        return max(1, (visible + self._line_width() - 1) // self._line_width())
+
     def _clear_line_locked(self) -> None:
-        sys.stdout.write("\r\033[2K")
+        lines = self._line_count(self._last_frame) if self._last_frame else 1
+        for index in range(lines):
+            sys.stdout.write("\r\033[2K")
+            if index < lines - 1:
+                sys.stdout.write("\x1b[1A")
         sys.stdout.flush()
+        self._last_frame = ""
 
     def _redraw_locked(self) -> None:
-        if self._last_frame:
-            sys.stdout.write("\r" + self._last_frame)
-            sys.stdout.flush()
+        self._clear_line_locked()
+        frame = self._format_frame(next(self._spinner))
+        self._last_frame = frame
+        sys.stdout.write(frame)
+        sys.stdout.flush()
 
     def _format_frame(self, spinner: str) -> str:
+        message = self._truncate_message(self.message, len(spinner) + 1)
         if UI._colors_enabled():
             color = next(self._colors)
-            return f"{color}{spinner} {self.message}{UI._RESET}"
-        return f"{spinner} {self.message}"
+            return f"{color}{spinner}{UI._RESET} {message}"
+        return f"{spinner} {message}"
 
     def _animate(self) -> None:
         while not self._stop_event.is_set():
@@ -225,7 +252,8 @@ class Loader:
             frame = self._format_frame(next(self._spinner))
             with UI._output_lock:
                 self._last_frame = frame
-                sys.stdout.write("\r" + frame)
+                self._clear_line_locked()
+                sys.stdout.write(frame)
                 sys.stdout.flush()
             self._stop_event.wait(0.1)
 

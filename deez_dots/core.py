@@ -450,6 +450,7 @@ class PackageManager:
         if not shutil.which(manager):
             LOG.debug("Skipping install for %s: manager not present", manager)
             return False
+        UI.set_loader_message(f"Installing via {manager}: {', '.join(packages)}")
         cmd = f"{install_cmd} {' '.join(packages)}"
         success, out, err = self._run_manager_command(manager, "install", cmd)
         if not success:
@@ -466,6 +467,7 @@ class PackageManager:
         if not update_cmd:
             LOG.debug("No update command for manager=%s", manager)
             return False
+        UI.set_loader_message(f"Updating via {manager}...")
         success, out, err = self._run_manager_command(manager, "update", update_cmd)
         if not success:
             LOG.error("Update failed for %s: %s", manager, err or out)
@@ -748,6 +750,7 @@ class ReadMeta:
             raise ValueError(f"Config include cycle detected: {cycle}")
         loading_stack.append(normalized_location)
 
+        UI.set_loader_message(f"Loading config {normalized_location}...")
         if self.is_url(normalized_location):
             data = self.read_url(normalized_location)
         else:
@@ -756,6 +759,7 @@ class ReadMeta:
         merged_config: Dict[str, Any] = {}
         for include_location in self._global_include_entries(data):
             resolved_include = self._resolve_include_location(include_location, normalized_location)
+            UI.set_loader_message(f"Loading included config {resolved_include} referenced from {normalized_location}...")
             try:
                 included_config = self.read_location(resolved_include, loading_stack)
             except Exception as exc:
@@ -763,6 +767,7 @@ class ReadMeta:
                     f"Failed to load included config '{resolved_include}' referenced from '{normalized_location}': {exc}"
                 ) from exc
             merged_config = self.merge_configs(merged_config, included_config)
+            UI.success(f"Loaded included config {resolved_include}")
 
         current_config = self._strip_loader_keys(data)
         return self.merge_configs(merged_config, current_config)
@@ -2924,8 +2929,9 @@ class DeezCLI:
         satisfied: Dict[str, List[str]] = {}
         missing: Dict[str, List[str]] = {}
 
-        UI.progress("Checking dependency status...")
+        UI.set_loader_message("Checking dependency status...")
         for manager, packages in dependency_map.items():
+            UI.set_loader_message(f"Checking {manager} dependencies...")
             for package in packages:
                 installed = False
                 if manager == "system":
@@ -2946,7 +2952,9 @@ class DeezCLI:
 
     def _collect_missing_dependencies(self, selected_managers: Optional[List[str]] = None) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
         managers = selected_managers if selected_managers is not None else self.available_package_managers
+        UI.set_loader_message("Collecting dependency definitions...")
         all_deps = self.package_manager_instance.fetch_all_deps(self.main_config)
+        UI.set_loader_message("Filtering dependencies for selected package managers...")
         filtered = self.package_manager_instance.filter_deps(managers, all_deps)
         if not filtered:
             return filtered, {}

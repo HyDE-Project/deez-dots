@@ -218,46 +218,49 @@ def main() -> None:
         UI.error(config_error)
         raise SystemExit(1)
 
-    if config_file_path:
-        if auto_discovered_config:
-            UI.info(f"Using auto-discovered config from current directory: {config_file_path}")
-        try:
-            main_config = config_reader.read_location(config_file_path)
-        except Exception as exc:
-            UI.error(f"Failed to load config '{config_file_path}': {exc}")
-            raise SystemExit(1)
-    else:
-        main_config = {"global": {}}
-    main_config = _apply_global_cli_overrides(main_config, args)
-    global_config = main_config.get("global", {})
-    home = os.path.expandvars(global_config.get("home", "$HOME"))
-    distribution = global_config.get("distribution", "auto")
-    git_url = global_config.get("git")
-    owner = global_config.get("owner")
-    name = global_config.get("name")
-    target_branch = global_config.get("branch") or global_config.get("git_branch", "main")
-    source_override = getattr(args, "source", None)
-    source_dir = source_override or global_config.get("source")
-    explicit_source_path = bool(source_dir)
-    has_dot_level_source = any(isinstance(dot_data, dict) and dot_data.get("source") for name, dot_data in main_config.items() if name != "global")
-    if not source_dir:
-        xdg_cache = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
-        if not owner or not name:
-            if git_url:
-                owner, name = GitHandler.get_git_owner_name(git_url)
-            else:
-                owner, name = "unknown", "unknown"
-        source_dir = GitHandler.source_cache_path(xdg_cache, owner, name, target_branch)
-    source_dir = os.path.expandvars(os.path.expanduser(source_dir))
-    skip_global_source_prepare = bool(has_dot_level_source and not source_override and not global_config.get("source") and not git_url)
-    need_source = bool(((args.do_package or args.do_deploy) and not skip_global_source_prepare) or (args.do_install and not args.from_stage))
-
+    debug = bool(getattr(args, "debug", False))
     loader_started = False
-    if UI.can_use_loader(debug=bool(getattr(args, "debug", False))):
-        loader_started = UI.start_loader(command_module.loader_message)
+    if UI.can_use_loader(debug=debug):
+        loader_started = UI.start_loader("Loading configuration...")
 
-    target_root = home
     try:
+        if config_file_path:
+            if auto_discovered_config:
+                UI.info(f"Using auto-discovered config from current directory: {config_file_path}")
+            try:
+                main_config = config_reader.read_location(config_file_path)
+            except Exception as exc:
+                UI.error(f"Failed to load config '{config_file_path}': {exc}")
+                raise SystemExit(1)
+        else:
+            main_config = {"global": {}}
+        if loader_started:
+            UI.set_loader_message(command_module.loader_message)
+        main_config = _apply_global_cli_overrides(main_config, args)
+        global_config = main_config.get("global", {})
+        home = os.path.expandvars(global_config.get("home", "$HOME"))
+        distribution = global_config.get("distribution", "auto")
+        git_url = global_config.get("git")
+        owner = global_config.get("owner")
+        name = global_config.get("name")
+        target_branch = global_config.get("branch") or global_config.get("git_branch", "main")
+        source_override = getattr(args, "source", None)
+        source_dir = source_override or global_config.get("source")
+        explicit_source_path = bool(source_dir)
+        has_dot_level_source = any(isinstance(dot_data, dict) and dot_data.get("source") for name, dot_data in main_config.items() if name != "global")
+        if not source_dir:
+            xdg_cache = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+            if not owner or not name:
+                if git_url:
+                    owner, name = GitHandler.get_git_owner_name(git_url)
+                else:
+                    owner, name = "unknown", "unknown"
+            source_dir = GitHandler.source_cache_path(xdg_cache, owner, name, target_branch)
+        source_dir = os.path.expandvars(os.path.expanduser(source_dir))
+        skip_global_source_prepare = bool(has_dot_level_source and not source_override and not global_config.get("source") and not git_url)
+        need_source = bool(((args.do_package or args.do_deploy) and not skip_global_source_prepare) or (args.do_install and not args.from_stage))
+
+        target_root = home
         git_handler = GitHandler(global_config)
         if need_source:
             UI.set_loader_message("Preparing source directory...")

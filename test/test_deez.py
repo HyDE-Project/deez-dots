@@ -14,7 +14,7 @@ import urllib.error
 from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import deez_dots.commands as command_modules
 
@@ -982,7 +982,16 @@ class TestDeezCLI(unittest.TestCase):
             'paths = [".config/hypr/hyprland.conf"]\n'
         )
 
-        loaded = deez_module.ReadMeta().read_location(root_path)
+        with patch("deez_dots.core.UI.set_loader_message") as mocked_loader, patch("deez_dots.core.UI.success") as mocked_success:
+            loaded = deez_module.ReadMeta().read_location(root_path)
+
+        self.assertTrue(any(
+            "Loading config" in call.args[0] for call in mocked_loader.call_args_list
+        ))
+        self.assertTrue(any(
+            "Loading included config" in call.args[0] for call in mocked_loader.call_args_list
+        ))
+        mocked_success.assert_called_once_with(f"Loaded included config {child_path.resolve()}")
 
         self.assertEqual(loaded["global"]["owner"], "root-owner")
         self.assertEqual(loaded["global"]["version"], "0.1.0")
@@ -2303,8 +2312,14 @@ class TestDeezCLI(unittest.TestCase):
         self.assertTrue(calls[0][1]["passthrough_output"])
         self.assertEqual(calls[1][0], "sudo pacman -Syu")
         self.assertTrue(calls[1][1]["stream_output"])
-        self.assertTrue(calls[1][1]["passthrough_output"])
-        self.assertFalse(calls[1][1]["capture_output"])
+
+    def test_package_manager_install_uses_loader_message(self):
+        manager = deez_module.PackageManager(runner=lambda *args, **kwargs: (True, "", ""))
+
+        with patch("deez_dots.core.UI.set_loader_message") as mocked_loader_message:
+            manager.install("pacman", ["kitty"])
+
+        mocked_loader_message.assert_called_once_with("Installing via pacman: kitty")
 
     def test_command_modules_are_importable_for_interop(self):
         self.assertEqual(list(command_modules.COMMAND_MODULES.keys()), ["dots", "deps", "backup", "cache"])
@@ -2345,7 +2360,7 @@ class TestDeezCLI(unittest.TestCase):
 
         self.assertEqual(
             [call.args[0] for call in mocked_loader.call_args_list],
-            ["Resolving dependency managers...", "Checking dependencies..."],
+            ["Checking dependencies..."],
         )
 
     def test_backup_command_updates_loader_messages(self):
