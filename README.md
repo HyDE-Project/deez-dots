@@ -59,7 +59,7 @@ You can build a single-file executable using `pex`:
 
 ```bash
 python3 -m pip install pex
-python3 -m pex . -e deez:run_entrypoint -o target/deez.pex
+python3 -m pex . -e deez_dots:run_entrypoint -o target/deez.pex
 ```
 
 Run the generated release file directly:

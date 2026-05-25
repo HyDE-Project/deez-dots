@@ -21,10 +21,7 @@ Homepage = "https://github.com/HyDE-Project/deez-dots"
 Source = "https://github.com/HyDE-Project/deez-dots"
 
 [project.scripts]
-deez = "deez:run_entrypoint"
-
-[tool.setuptools]
-py-modules = ["deez"]
+deez = "deez_dots:run_entrypoint"
 
 [tool.setuptools.packages.find]
 include = ["deez_dots", "deez_dots.*"]

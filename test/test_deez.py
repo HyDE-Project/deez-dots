@@ -2541,7 +2541,7 @@ class TestDeezCLI(unittest.TestCase):
     def test_pyproject_console_entrypoint_uses_run_entrypoint(self):
         pyproject = (SCRIPT_DIR / "pyproject.toml").read_text()
 
-        self.assertIn('deez = "deez:run_entrypoint"', pyproject)
+        self.assertIn('deez = "deez_dots:run_entrypoint"', pyproject)
 
     def test_pyproject_package_discovery_includes_command_subpackages(self):
         pyproject = tomllib.loads((SCRIPT_DIR / "pyproject.toml").read_text())
