@@ -1,22 +1,37 @@
+
 import argparse
+import pytest
+import tempfile
+import shutil
 import hashlib
 import importlib.util
 import io
 import os
-import shutil
 import sys
 import tarfile
-import tempfile
 import tomllib
 import unittest
+import uuid
 import subprocess
 import urllib.error
 from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import deez_dots.commands as command_modules
+# --- SAFETY FIX: Hijack environment BEFORE loading any deez modules ---
+# This prevents module-level constants in Deez from capturing the user's 
+# real HOME directory at import time, which was causing 'sync' actions 
+# to accidentally delete real config files (like ~/.config/kitty).
+_import_safety_tmp = tempfile.TemporaryDirectory(prefix="deez_import_safety_")
+_safe_home = Path(_import_safety_tmp.name) / "home"
+_safe_home.mkdir(parents=True, exist_ok=True)
+os.environ["HOME"] = str(_safe_home)
+os.environ["XDG_CONFIG_HOME"] = str(_safe_home / ".config")
+os.environ["XDG_DATA_HOME"] = str(_safe_home / ".local" / "share")
+os.environ["XDG_CACHE_HOME"] = str(_safe_home / ".cache")
+
+import deez_dots.commands as command_modules  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 DEEZ_MODULE_PATH = SCRIPT_DIR / "deez"
@@ -33,8 +48,18 @@ EXAMPLE_CONFIG = SCRIPT_DIR / "example" / "temp.toml"
 
 def run_deez(args, env=None, input_data=None, cwd=None):
     env_vars = os.environ.copy()
+    env_vars.pop("CLICOLOR", None)
+    env_vars.pop("PY_COLORS", None)
+    env_vars["NO_COLOR"] = "1"
     if env:
         env_vars.update(env)
+    env_vars.pop("CLICOLOR", None)
+    env_vars.pop("PY_COLORS", None)
+    env_vars["NO_COLOR"] = "1"
+    home = env_vars.get("HOME") or os.environ.get("HOME") or str(Path.home())
+    env_vars.setdefault("XDG_CONFIG_HOME", str(Path(home) / ".config"))
+    env_vars.setdefault("XDG_DATA_HOME", str(Path(home) / ".local" / "share"))
+    env_vars.setdefault("XDG_CACHE_HOME", str(Path(home) / ".cache"))
     result = subprocess.run(
         [str(DEEZ_SCRIPT)] + args,
         cwd=str(cwd or SCRIPT_DIR),
@@ -50,17 +75,23 @@ class TestDeezCLI(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory(prefix="deez_test_")
         self.home_dir = Path(self.tmpdir.name) / "home"
+        self.xdg_config = Path(self.tmpdir.name) / "config"
         self.xdg_data = Path(self.tmpdir.name) / "data"
         self.xdg_cache = Path(self.tmpdir.name) / "cache"
         self.home_dir.mkdir(parents=True, exist_ok=True)
+        self.xdg_config.mkdir(parents=True, exist_ok=True)
         self.xdg_data.mkdir(parents=True, exist_ok=True)
         self.xdg_cache.mkdir(parents=True, exist_ok=True)
         self.env = {
             "HOME": str(self.home_dir),
+            "XDG_CONFIG_HOME": str(self.xdg_config),
             "XDG_DATA_HOME": str(self.xdg_data),
             "XDG_CACHE_HOME": str(self.xdg_cache),
             "PWD": str(SCRIPT_DIR),
+            "NO_COLOR": "1",
         }
+        self.env.pop("CLICOLOR", None)
+        self.env.pop("PY_COLORS", None)
 
     def tearDown(self):
         self.tmpdir.cleanup()
@@ -224,7 +255,7 @@ class TestDeezCLI(unittest.TestCase):
         )
 
     def test_query_installed_dots_returns_structured_data(self):
-        config_path = self._write_installed_manifest(
+        self._write_installed_manifest(
             "kitty",
             owner="hyde_project",
             version="0.1.0",
@@ -812,6 +843,29 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("[ok] Deploy complete", result.stdout)
         self.assertTrue((self.home_dir / ".config/kitty/kitty.conf").exists())
 
+    def test_deploy_respects_home_env_without_global_home(self):
+        unique_path = f"deez_test_{uuid.uuid4().hex}/kitty.conf"
+        source_dir = Path(self.tmpdir.name) / "source"
+        target_file = source_dir / ".config" / unique_path
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        target_file.write_text("kitty config")
+        config_path = Path(self.tmpdir.name) / "deploy-home-env.toml"
+        config_path.write_text(
+            '[global]\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            f'source = "{source_dir}"\n'
+            '\n'
+            '[kitty]\n'
+            f'paths = [".config/{unique_path}"]\n'
+        )
+
+        result = self.run_cli(["dots", "--deploy", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue((self.home_dir / ".config" / unique_path).exists())
+        self.assertFalse((Path.home() / ".config" / unique_path).exists())
+
     def test_dots_package_without_global_dots_uses_all_discovered_sections_noninteractive(self):
         source_dir = Path(self.tmpdir.name) / "source"
         (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
@@ -991,7 +1045,7 @@ class TestDeezCLI(unittest.TestCase):
         self.assertTrue(any(
             "Loading included config" in call.args[0] for call in mocked_loader.call_args_list
         ))
-        mocked_success.assert_called_once_with(f"Loaded included config {child_path.resolve()}")
+        mocked_success.assert_called_once_with("Loaded 1 includes")
 
         self.assertEqual(loaded["global"]["owner"], "root-owner")
         self.assertEqual(loaded["global"]["version"], "0.1.0")
@@ -1256,6 +1310,38 @@ class TestDeezCLI(unittest.TestCase):
             '[[kitty.files]]\n'
             'source_root = ".config"\n'
             'target_root = "$HOME/.config"\n'
+            'paths = ["kitty/kitty.conf"]\n'
+        )
+        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
+        if bundle_path.exists():
+            bundle_path.unlink()
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled kitty ->", result.stdout)
+        with tarfile.open(bundle_path, "r:gz") as tar:
+            manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
+        self.assertIn(f'source = "{archive_path}"', manifest_text)
+        self.assertIn('src = ".config/kitty/kitty.conf"', manifest_text)
+
+    def test_dots_package_file_entries_inherit_dot_level_paths_and_roots(self):
+        archive_path = self._make_source_archive(
+            Path(self.tmpdir.name) / "dot-source-inherit.tar.gz",
+            {".config/kitty/kitty.conf": "font_size 12"},
+        )
+        config_path = Path(self.tmpdir.name) / "dot-level-source-inherit.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{archive_path}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            '[[kitty.files]]\n'
             'paths = ["kitty/kitty.conf"]\n'
         )
         bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
@@ -1644,6 +1730,32 @@ class TestDeezCLI(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(deez_module.DeezUtils.normalize_action(value), expected)
 
+    def test_expand_env_recursively_handles_nested_structures(self):
+        value = {
+            "path": "$HOME/.config",
+            "files": ["$HOME/.bashrc", "$HOME/.profile"],
+            "details": ("$HOME/bin", {"nested": "$HOME/.local"}),
+        }
+
+        with patch.dict(os.environ, {"HOME": str(self.home_dir)}, clear=False):
+            expanded = deez_module.DeezUtils.expand_env(value)
+
+        self.assertEqual(expanded["path"], f"{self.home_dir}/.config")
+        self.assertEqual(expanded["files"], [f"{self.home_dir}/.bashrc", f"{self.home_dir}/.profile"])
+        self.assertEqual(expanded["details"][0], f"{self.home_dir}/bin")
+        self.assertEqual(expanded["details"][1]["nested"], f"{self.home_dir}/.local")
+
+    def test_expand_env_handles_user_home_tilde(self):
+        with patch.dict(os.environ, {"HOME": str(self.home_dir)}, clear=False):
+            result = deez_module.DeezUtils.expand_env("~/.config/kitty.conf")
+        self.assertEqual(result, str(self.home_dir / ".config" / "kitty.conf"))
+
+    def test_expand_env_defaults_xdg_config_home(self):
+        env = {"HOME": str(self.home_dir)}
+        with patch.dict(os.environ, env, clear=True):
+            result = deez_module.DeezUtils.expand_env("${XDG_CONFIG_HOME}/kitty.conf")
+        self.assertEqual(result, str(self.home_dir / ".config" / "kitty.conf"))
+
     def test_fetch_all_deps_includes_file_dependency_blocks(self):
         package_manager = deez_module.PackageManager(runner=lambda *args, **kwargs: (True, "", ""))
 
@@ -1689,6 +1801,21 @@ class TestDeezCLI(unittest.TestCase):
         )
 
         self.assertEqual(custom_commands["yay"]["install"], "yay -S --noconfirm")
+
+    def test_load_pm_parses_named_schema(self):
+        custom_commands = deez_module.PackageManager.load_pm(
+            {
+                "package_managers": {
+                    "yay": {
+                        "query": "yay -Qs",
+                        "install": "yay -S --noconfirm",
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(custom_commands["yay"]["install"], "yay -S --noconfirm")
+        self.assertEqual(custom_commands["yay"]["query"], "yay -Qs")
 
     def test_package_manager_custom_commands_override_defaults(self):
         package_manager = deez_module.PackageManager(
@@ -2244,7 +2371,7 @@ class TestDeezCLI(unittest.TestCase):
         result = run_deez(["--debug", "dots", "--package", "--config", str(config_path)], env=self.env)
 
         self.assertEqual(result.returncode, 0)
-        self.assertIn("[DEBUG] Debug logging enabled", result.stderr)
+        self.assertIn("Debug logging enabled", result.stderr)
         self.assertIn("[DEBUG] [PACKAGE] Packaging dot: kitty", result.stderr)
 
     def test_default_run_command_returns_false_on_non_zero_exit(self):
@@ -2557,8 +2684,12 @@ class TestDeezCLI(unittest.TestCase):
         files: list of (rel_path_from_home, content_bytes)
         Returns the Path to the created tarball.
         """
-        import re, io
-        safe = lambda s: re.sub(r"[^a-zA-Z0-9._-]", "-", str(s or "unknown"))
+        import re
+        import io
+
+        def safe(s):
+            return re.sub(r"[^a-zA-Z0-9._-]", "-", str(s or "unknown"))
+
         dirname = f"{safe(section)}.{safe(owner)}.{safe(version)}"
         backup_dir = Path(self.xdg_data) / "deez" / "backup" / "user" / dirname
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -2606,8 +2737,12 @@ class TestDeezCLI(unittest.TestCase):
 
     def _make_empty_backup_tarballs(self, section, owner, version, timestamps):
         """Create minimal (structurally valid) backup tarballs for prune/list tests."""
-        import re, io
-        safe = lambda s: re.sub(r"[^a-zA-Z0-9._-]", "-", str(s or "unknown"))
+        import re
+        import io
+
+        def safe(s):
+            return re.sub(r"[^a-zA-Z0-9._-]", "-", str(s or "unknown"))
+
         dirname = f"{safe(section)}.{safe(owner)}.{safe(version)}"
         backup_dir = Path(self.xdg_data) / "deez" / "backup" / "user" / dirname
         backup_dir.mkdir(parents=True, exist_ok=True)

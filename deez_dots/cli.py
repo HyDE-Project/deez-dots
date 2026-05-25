@@ -12,6 +12,7 @@ from .commands.base import normalize_requested_sections
 
 from .core import (
     CLI_VERSION,
+    DeezUtils,
     GitHandler,
     LOG,
     PackageManager,
@@ -31,18 +32,11 @@ def _resolve_deez_cli_class():
 
 def _setup_logging(debug: bool = False) -> None:
     """Configure CLI logging mode."""
-    root = logging.getLogger()
-    root.handlers.clear()
-    handler = logging.StreamHandler()
-    if debug:
-        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        handler.setFormatter(formatter)
-        root.setLevel(logging.DEBUG)
-    else:
-        formatter = logging.Formatter("%(levelname)s: %(message)s")
-        handler.setFormatter(formatter)
-        root.setLevel(logging.WARNING)
-    root.addHandler(handler)
+    level = logging.DEBUG if debug else logging.WARNING
+    fmt = "%(asctime)s [%(levelname)s] %(message)s" if debug else "%(levelname)s: %(message)s"
+    logging.basicConfig(stream=sys.stderr, level=level, format=fmt, force=True)
+    LOG.propagate = True
+    LOG.setLevel(level)
     LOG.debug("Debug logging enabled")
 
 
@@ -172,14 +166,37 @@ def _initialize_command_state(args: argparse.Namespace) -> None:
 
 def main() -> None:
     """Parse CLI arguments and execute deez-dots commands."""
-    global_override_parser = argparse.ArgumentParser(add_help=False)
-    _add_global_override_arguments(global_override_parser)
 
-    parser = argparse.ArgumentParser(prog="deez", description="Deez dots manager (deez-dots)", parents=[global_override_parser])
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging for troubleshooting (default: off)")
-    parser.add_argument("--version", action="version", version=f"deez {CLI_VERSION}")
-    subparsers = parser.add_subparsers(dest="command")
-    command_parsers = register_subcommands(subparsers, parents=[global_override_parser])
+    # Main parser with custom formatter
+    parser = argparse.ArgumentParser(
+        prog="deez",
+        description="Deez dots manager (deez-dots)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # Global options group
+    global_group = parser.add_argument_group("Global options")
+    _add_global_override_arguments(global_group)
+    global_group.add_argument("--debug", action="store_true", help="Enable debug logging for troubleshooting (default: off)")
+    global_group.add_argument("--version", action="version", version=f"deez {CLI_VERSION}")
+
+    # Subcommands
+    subparsers = parser.add_subparsers(dest="command", title="Commands", metavar="{dots,deps,backup,cache}")
+    command_parsers = {}
+    for cmd_name, command_module in COMMAND_MODULES.items():
+        cmd_parser = subparsers.add_parser(
+            cmd_name,
+            help=command_module.description,
+            description=command_module.description,
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        )
+        # Command options group
+        cmd_group = cmd_parser.add_argument_group("Command options")
+        command_module.add_arguments(cmd_group)
+        # Also add global options to each subcommand for visibility
+        _add_global_override_arguments(cmd_parser)
+        cmd_parser.add_argument("--version", action="version", version=f"deez {CLI_VERSION}")
+        command_parsers[cmd_name] = cmd_parser
 
     argv = sys.argv[1:]
     if argv and argv[-1] == "--":
@@ -238,7 +255,12 @@ def main() -> None:
             UI.set_loader_message(command_module.loader_message)
         main_config = _apply_global_cli_overrides(main_config, args)
         global_config = main_config.get("global", {})
-        home = os.path.expandvars(global_config.get("home", "$HOME"))
+        home = DeezUtils.expand(global_config.get("home", "$HOME"))
+        home = os.path.expanduser(home)
+        os.environ["HOME"] = str(home)
+        os.environ.setdefault("XDG_CONFIG_HOME", str(Path(home) / ".config"))
+        os.environ.setdefault("XDG_DATA_HOME", str(Path(home) / ".local" / "share"))
+        os.environ.setdefault("XDG_CACHE_HOME", str(Path(home) / ".cache"))
         distribution = global_config.get("distribution", "auto")
         git_url = global_config.get("git")
         owner = global_config.get("owner")
@@ -249,14 +271,14 @@ def main() -> None:
         explicit_source_path = bool(source_dir)
         has_dot_level_source = any(isinstance(dot_data, dict) and dot_data.get("source") for name, dot_data in main_config.items() if name != "global")
         if not source_dir:
-            xdg_cache = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+            xdg_cache = os.getenv("XDG_CACHE_HOME", DeezUtils.xdg_cache_home())
             if not owner or not name:
                 if git_url:
                     owner, name = GitHandler.get_git_owner_name(git_url)
                 else:
                     owner, name = "unknown", "unknown"
             source_dir = GitHandler.source_cache_path(xdg_cache, owner, name, target_branch)
-        source_dir = os.path.expandvars(os.path.expanduser(source_dir))
+        source_dir = DeezUtils.expand(source_dir)
         skip_global_source_prepare = bool(has_dot_level_source and not source_override and not global_config.get("source") and not git_url)
         need_source = bool(((args.do_package or args.do_deploy) and not skip_global_source_prepare) or (args.do_install and not args.from_stage))
 

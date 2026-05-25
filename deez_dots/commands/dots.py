@@ -7,7 +7,6 @@ namespace normalization in other integrations.
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -134,7 +133,7 @@ def build_runtime_context(cli: Any) -> DotsRuntimeContext:
         global_owner=global_owner,
         global_name=global_name,
         global_version=global_config.get("version"),
-        global_home=global_config.get("home", os.path.expandvars("$HOME")),
+        global_home=DeezUtils.expand(global_config.get("home", "$HOME")),
         git_url=git_url,
         target_branch=global_config.get("branch") or global_config.get("git_branch", "main"),
         global_pre_command=global_config.get("pre_command"),
@@ -153,68 +152,167 @@ def _prepare_global_pre_command(cli: Any, context: DotsRuntimeContext) -> None:
     cli._require_pre_command(context.global_pre_command, scope_label="global", cwd=context.hook_cwd)
 
 
+def _with_loader(message: str, action, *args, **kwargs):
+    UI.set_loader_message(message)
+    return action(*args, **kwargs)
+
+
+def _debug_source(context: DotsRuntimeContext) -> None:
+    if context.git_url:
+        LOG.debug("Source: %s/%s branch=%s", context.global_owner, context.global_name, context.target_branch)
+
+
+def _run_global_action(cli: Any, context: DotsRuntimeContext, message: str, handler, *args, require_pre_command: bool = False, **kwargs):
+    if require_pre_command:
+        _prepare_global_pre_command(cli, context)
+    return _with_loader(message, handler, *args, **kwargs)
+
+
+def _resolve_selected_sections(cli: Any, requested: object, action_label: str) -> list[str]:
+    return cli._resolve_requested_config_dot_targets(requested, action_label)
+
+
+def _find_pkg_for_dots(pkg_paths: list[str], sections: list[str]) -> dict[str, str]:
+    dot_to_pkg: dict[str, str] = {}
+    for pkg_path in pkg_paths:
+        basename = Path(pkg_path).name
+        for dot in sections:
+            if dot in basename:
+                dot_to_pkg[dot] = pkg_path
+    return dot_to_pkg
+
+
+def _should_overwrite_installed_dot(cli: Any, dot: str, new_owner: str | None, new_version: str | None) -> bool:
+    existing_desc = cli.manifest_manager.load_desc(dot)
+    if not existing_desc:
+        return True
+    old_owner = existing_desc.get("owner")
+    old_version = existing_desc.get("version")
+    conflict = bool(
+        (old_owner and new_owner and old_owner != new_owner)
+        or (old_version and new_version and old_version != new_version)
+    )
+    if not conflict:
+        return True
+    if getattr(cli.args, "force", False):
+        UI.info(f"Overwriting installed dot '{dot}' owned by {old_owner} with version {new_version} owned by {new_owner}.")
+        return True
+    prompt = (
+        f"Dot '{dot}' version {old_version} owned by {old_owner} is installed. "
+        f"Overwrite with version {new_version} owned by {new_owner}? [y/N]: "
+    )
+    answer = UI.read_input(prompt).strip().lower()
+    if answer in ("y", "yes"):
+        return True
+    UI.info("Cancelled.")
+    return False
+
+
+def _deploy_dot(cli: Any, context: DotsRuntimeContext, dot: str, pkg_path: str) -> None:
+    if not _should_overwrite_installed_dot(cli, dot, *(_read_dot_manifest(cli, pkg_path) or (None, None))):
+        return
+    _run_global_action(
+        cli,
+        context,
+        f"Uninstalling previous '{dot}' (if installed)...",
+        cli._do_uninstall,
+        [dot],
+        context.dry_run,
+        confirm=False,
+        remove_manifest=True,
+    )
+    _run_global_action(
+        cli,
+        context,
+        f"Installing new '{dot}'...",
+        cli._do_install,
+        [pkg_path],
+        context.dry_run,
+        prechecked_dependencies=True,
+    )
+
+
+def _read_dot_manifest(cli: Any, pkg_path: str) -> tuple[str | None, str | None] | None:
+    bundle_manifest = cli._read_bundle_manifest(Path(pkg_path))
+    if not bundle_manifest:
+        return None
+    return bundle_manifest.get("owner"), bundle_manifest.get("version")
+
+
 def execute(cli: Any) -> None:
     """Execute the normalized `deez dots` flow using an initialized CLI instance."""
     context = build_runtime_context(cli)
-    hook_runner = WriteDots()
-    if getattr(cli.args, "do_package", False):
-        if context.git_url:
-            LOG.debug("Source: %s/%s branch=%s", context.global_owner, context.global_name, context.target_branch)
-        compress = not getattr(cli.args, "no_compress", False)
-        selected_sections = cli._resolve_requested_config_dot_targets(getattr(cli.args, "package_sections", None), "bundle")
+    args = cli.args
+    force = getattr(args, "force", False)
+    dry_run = bool(getattr(args, "dry_run", False))
+    compress = not getattr(args, "no_compress", False)
+    install_tarballs = getattr(args, "install_tarballs", []) or []
+
+    if args.do_package:
+        _debug_source(context)
+        selected_sections = _resolve_selected_sections(cli, getattr(args, "package_sections", None), "bundle")
         if not selected_sections:
             return
-        _prepare_global_pre_command(cli, context)
-        UI.set_loader_message("Bundling selected dots...")
         if context.global_build_command:
-            hook_runner.execute_commands([context.global_build_command], cwd=cli.source_dir)
-        cli._do_package(
+            WriteDots().execute_commands([context.global_build_command], cwd=cli.source_dir)
+        _run_global_action(
+            cli,
+            context,
+            "Bundling selected dots...",
+            cli._do_package,
             context.global_owner,
             context.global_home,
             context.global_version,
             git_url=context.git_url,
             target_branch=context.target_branch,
             compress=compress,
-            overwrite_existing=getattr(cli.args, "force", False),
+            overwrite_existing=force,
             sections=selected_sections,
-            dry_run=context.dry_run,
+            dry_run=dry_run,
+            require_pre_command=True,
         )
         return
-    if getattr(cli.args, "do_export", False):
-        compress = not getattr(cli.args, "no_compress", False)
-        selected_sections = cli._resolve_requested_config_dot_targets(getattr(cli.args, "export_sections", None), "export")
+    if args.do_export:
+        selected_sections = _resolve_selected_sections(cli, getattr(args, "export_sections", None), "export")
         if not selected_sections:
             return
-        _prepare_global_pre_command(cli, context)
-        UI.set_loader_message("Exporting dots...")
-        cli._do_export(
+        _run_global_action(
+            cli,
+            context,
+            "Exporting dots...",
+            cli._do_export,
             context.global_owner,
             context.global_home,
             context.global_version,
             selected_sections,
             compress=compress,
-            overwrite_existing=getattr(cli.args, "force", False),
-            dry_run=context.dry_run,
+            overwrite_existing=force,
+            dry_run=dry_run,
+            require_pre_command=True,
         )
         return
-    if getattr(cli.args, "do_install", False):
-        _prepare_global_pre_command(cli, context)
-        UI.set_loader_message("Installing bundles...")
-        cli._do_install(cli.args.install_tarballs, context.dry_run)
+    if args.do_install:
+        _run_global_action(
+            cli,
+            context,
+            "Installing bundles...",
+            cli._do_install,
+            install_tarballs,
+            dry_run,
+            require_pre_command=True,
+        )
         return
-    if getattr(cli.args, "do_deploy", False):
-        if context.git_url:
-            LOG.debug("Source: %s/%s branch=%s", context.global_owner, context.global_name, context.target_branch)
-        selected_sections = cli._resolve_requested_config_dot_targets(getattr(cli.args, "deploy_sections", None), "deploy")
+    if args.do_deploy:
+        _debug_source(context)
+        selected_sections = _resolve_selected_sections(cli, getattr(args, "deploy_sections", None), "deploy")
         if not selected_sections:
             return
         UI.set_loader_message("Resolving dependencies...")
         cli._resolve_config_dependencies(selected_sections)
         tmp_dir = tempfile.mkdtemp(prefix="deez-deploy-")
+        hook_runner = WriteDots() if context.global_post_command else None
         try:
-            _prepare_global_pre_command(cli, context)
-            UI.set_loader_message("Bundling selected dots...")
-            pkg_paths = cli._do_package(
+            pkg_paths = _run_global_action(cli, context, "Bundling selected dots...", cli._do_package,
                 context.global_owner,
                 context.global_home,
                 context.global_version,
@@ -222,42 +320,76 @@ def execute(cli: Any) -> None:
                 target_branch=context.target_branch,
                 out_dir=tmp_dir,
                 sections=selected_sections,
-                dry_run=context.dry_run,
+                compress=compress,
+                dry_run=dry_run,
+                require_pre_command=True,
             )
             if not pkg_paths:
                 UI.error("Deploy failed: bundling produced no bundles.")
                 raise SystemExit(1)
-            UI.set_loader_message("Installing bundled dots...")
-            cli._do_install(pkg_paths, context.dry_run, prechecked_dependencies=True)
-            if context.global_post_command:
+            dot_to_pkg = _find_pkg_for_dots(pkg_paths, selected_sections)
+            for dot in selected_sections:
+                pkg_path = dot_to_pkg.get(dot)
+                if not pkg_path:
+                    UI.error(f"No package found for dot '{dot}' after bundling.")
+                    continue
+                _deploy_dot(cli, context, dot, pkg_path)
+            if hook_runner is not None:
                 hook_runner.execute_commands([context.global_post_command], cwd=cli.source_dir)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         UI.success("Deploy complete")
         return
-    if getattr(cli.args, "do_uninstall", False):
-        UI.set_loader_message("Uninstalling dots...")
-        cli._do_uninstall(getattr(cli.args, "uninstall_dots", []) or None, context.dry_run)
+    if args.do_uninstall:
+        _run_global_action(
+            cli,
+            context,
+            "Uninstalling dots...",
+            cli._do_uninstall,
+            getattr(args, "uninstall_dots", []) or None,
+            dry_run,
+        )
         return
-    if getattr(cli.args, "do_filetree", False):
-        UI.set_loader_message("Rendering tracked file tree...")
-        cli._do_filetree(getattr(cli.args, "filetree_target", "all"))
+    if args.do_filetree:
+        _run_global_action(
+            cli,
+            context,
+            "Rendering tracked file tree...",
+            cli._do_filetree,
+            getattr(args, "filetree_target", "all"),
+        )
         return
-    if getattr(cli.args, "do_healthcheck", False):
-        UI.set_loader_message("Checking tracked dot health...")
-        cli._do_healthcheck(getattr(cli.args, "healthcheck_target", "all"))
+    if args.do_healthcheck:
+        _run_global_action(
+            cli,
+            context,
+            "Checking tracked dot health...",
+            cli._do_healthcheck,
+            getattr(args, "healthcheck_target", "all"),
+        )
         return
-    if getattr(cli.args, "do_restore", False):
-        UI.set_loader_message("Restoring dots...")
-        cli._do_restore(getattr(cli.args, "restore_dots", []) or None, context.dry_run)
+    if args.do_restore:
+        _run_global_action(
+            cli,
+            context,
+            "Restoring dots...",
+            cli._do_restore,
+            getattr(args, "restore_dots", []) or None,
+            dry_run,
+        )
         return
-    if getattr(cli.args, "do_downgrade", False):
-        UI.set_loader_message("Downgrading dots...")
-        cli._do_downgrade(getattr(cli.args, "downgrade_dots", []) or None, context.dry_run)
+    if args.do_downgrade:
+        _run_global_action(
+            cli,
+            context,
+            "Downgrading dots...",
+            cli._do_downgrade,
+            getattr(args, "downgrade_dots", []) or None,
+            dry_run,
+        )
         return
-    if getattr(cli.args, "list", False):
-        UI.set_loader_message("Listing installed dots...")
-        cli._do_list()
+    if args.list:
+        _run_global_action(cli, context, "Listing installed dots...", cli._do_list)
 
 
 DOTS_COMMAND = CommandModule(

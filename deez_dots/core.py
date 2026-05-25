@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import itertools
 import logging
 import os
 import shutil
@@ -10,7 +9,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import threading
 import time
 import urllib.parse
 import urllib.request
@@ -39,6 +37,14 @@ RequestedSections = Optional[Union[List[str], _AllSectionsRequested]]
 RunResult = Tuple[bool, str, str]
 
 
+def _normalize_command(cmd: Union[str, List[str], Tuple[str, ...]], shell: bool = False) -> Union[str, List[str]]:
+    if isinstance(cmd, (list, tuple)):
+        return list(cmd)
+    if isinstance(cmd, str):
+        return cmd if shell else cmd.split()
+    return cmd
+
+
 def _normalize_description(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -61,10 +67,11 @@ def default_run_command(
     cwd_path = str(cwd) if cwd is not None else None
     for attempt in range(1, retries + 1):
         try:
+            normalized_cmd = _normalize_command(cmd, shell=shell)
             if stream_output and passthrough_output:
-                if shell and isinstance(cmd, str):
+                if shell and isinstance(normalized_cmd, str):
                     proc = subprocess.run(
-                        cmd,
+                        normalized_cmd,
                         shell=True,
                         cwd=cwd_path,
                         capture_output=False,
@@ -72,9 +79,8 @@ def default_run_command(
                         check=False,
                     )
                 else:
-                    args = cmd if isinstance(cmd, list) else (cmd.split() if isinstance(cmd, str) else cmd)
                     proc = subprocess.run(
-                        args,
+                        normalized_cmd,
                         shell=False,
                         cwd=cwd_path,
                         capture_output=False,
@@ -85,9 +91,9 @@ def default_run_command(
                 stdout = ""
                 stderr = ""
             elif stream_output:
-                if shell and isinstance(cmd, str):
+                if shell and isinstance(normalized_cmd, str):
                     proc = subprocess.Popen(
-                        cmd,
+                        normalized_cmd,
                         shell=True,
                         cwd=cwd_path,
                         stdout=subprocess.PIPE,
@@ -96,9 +102,8 @@ def default_run_command(
                         bufsize=1,
                     )
                 else:
-                    args = cmd if isinstance(cmd, list) else (cmd.split() if isinstance(cmd, str) else cmd)
                     proc = subprocess.Popen(
-                        args,
+                        normalized_cmd,
                         shell=False,
                         cwd=cwd_path,
                         stdout=subprocess.PIPE,
@@ -124,9 +129,9 @@ def default_run_command(
                 return_code = proc.wait()
                 stdout = "".join(combined_chunks) if text else b"".join(combined_chunks)
                 stderr = ""
-            elif shell and isinstance(cmd, str):
+            elif shell and isinstance(normalized_cmd, str):
                 proc = subprocess.run(
-                    cmd,
+                    normalized_cmd,
                     shell=True,
                     cwd=cwd_path,
                     capture_output=capture_output,
@@ -137,9 +142,8 @@ def default_run_command(
                 stdout = proc.stdout or ""
                 stderr = proc.stderr or ""
             else:
-                args = cmd if isinstance(cmd, list) else (cmd.split() if isinstance(cmd, str) else cmd)
                 proc = subprocess.run(
-                    args,
+                    normalized_cmd,
                     shell=False,
                     cwd=cwd_path,
                     capture_output=capture_output,
@@ -194,22 +198,62 @@ class DeezUtils:
         return normalized
 
     @staticmethod
+    def home_dir() -> str:
+        """Return the effective home directory, preferring $HOME when set."""
+        return os.environ.get("HOME") or str(Path.home())
+
+    @staticmethod
+    def xdg_config_home() -> str:
+        """Return the effective XDG config home, preferring $XDG_CONFIG_HOME when set."""
+        return os.environ.get("XDG_CONFIG_HOME") or str(Path(DeezUtils.home_dir()) / ".config")
+
+    @staticmethod
+    def xdg_data_home() -> str:
+        """Return the effective XDG data home, preferring $XDG_DATA_HOME when set."""
+        return os.environ.get("XDG_DATA_HOME") or str(Path(DeezUtils.home_dir()) / ".local" / "share")
+
+    @staticmethod
+    def xdg_cache_home() -> str:
+        """Return the effective XDG cache home, preferring $XDG_CACHE_HOME when set."""
+        return os.environ.get("XDG_CACHE_HOME") or str(Path(DeezUtils.home_dir()) / ".cache")
+
+    @staticmethod
     def get_timestamp() -> str:
         """Return the current timestamp formatted for backup and package metadata."""
         return datetime.now().strftime("%Y-%m-%dT%H:%M:%S%z")
 
     @staticmethod
     def expand_env(val: Any) -> Any:
-        """Expand environment variables for a string or recursively for lists."""
+        """Expand environment variables and home-path shortcuts for strings, recursively handling lists, tuples, and dicts."""
         if isinstance(val, str):
-            return os.path.expandvars(val)
+            original_env = {k: os.environ.get(k) for k in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME")}
+            default_home = original_env["HOME"] or str(Path.home())
+            defaults = {
+                "HOME": default_home,
+                "XDG_CONFIG_HOME": original_env["XDG_CONFIG_HOME"] or str(Path(default_home) / ".config"),
+                "XDG_DATA_HOME": original_env["XDG_DATA_HOME"] or str(Path(default_home) / ".local" / "share"),
+                "XDG_CACHE_HOME": original_env["XDG_CACHE_HOME"] or str(Path(default_home) / ".cache"),
+            }
+            os.environ.update(defaults)
+            try:
+                return os.path.expanduser(os.path.expandvars(val))
+            finally:
+                for key, original_value in original_env.items():
+                    if original_value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = original_value
         if isinstance(val, list):
-            return [os.path.expandvars(v) for v in val]
+            return [DeezUtils.expand_env(v) for v in val]
+        if isinstance(val, tuple):
+            return tuple(DeezUtils.expand_env(v) for v in val)
+        if isinstance(val, dict):
+            return {k: DeezUtils.expand_env(v) for k, v in val.items()}
         return val
 
     @staticmethod
     def expand(val: Any) -> Any:
-        """Expand environment variables in strings and lists for config values."""
+        """Expand environment variables in strings and supported nested values."""
         return DeezUtils.expand_env(val)
 
     @staticmethod
@@ -337,7 +381,10 @@ class PackageManager:
         for key in cls.config_keys:
             entries = global_config.get(key)
             if isinstance(entries, dict):
-                entries = [entries]
+                if any(isinstance(v, dict) for v in entries.values()):
+                    entries = [{"name": name, **value} if isinstance(value, dict) else {"name": name} for name, value in entries.items()]
+                else:
+                    entries = [entries]
             if not isinstance(entries, list):
                 continue
             for entry in entries:
@@ -346,7 +393,12 @@ class PackageManager:
                 name = str(entry.get("name", "")).strip()
                 if not name:
                     continue
-                commands = {cmd_key: str(value).strip() for cmd_key in cls.command_keys for value in [entry.get(cmd_key)] if value is not None and str(value).strip()}
+                commands = {
+                    cmd_key: str(value).strip()
+                    for cmd_key in cls.command_keys
+                    for value in [entry.get(cmd_key)]
+                    if value is not None and str(value).strip()
+                }
                 if commands:
                     parsed.setdefault(name, {}).update(commands)
         return parsed
@@ -722,10 +774,10 @@ class ReadMeta:
         location_text = str(config_location).strip()
         if self.is_url(location_text):
             return location_text
-        return str(Path(os.path.expandvars(os.path.expanduser(location_text))).resolve())
+        return str(Path(DeezUtils.expand(location_text)).resolve())
 
     def _resolve_include_location(self, include_location: str, base_location: str) -> Union[str, Path]:
-        include_text = os.path.expandvars(os.path.expanduser(str(include_location).strip()))
+        include_text = DeezUtils.expand(str(include_location).strip())
         if not include_text:
             raise ValueError("Config include path cannot be empty.")
         if self.is_url(include_text):
@@ -757,6 +809,7 @@ class ReadMeta:
             data = self.read_file(normalized_location)
 
         merged_config: Dict[str, Any] = {}
+        include_count = 0
         for include_location in self._global_include_entries(data):
             resolved_include = self._resolve_include_location(include_location, normalized_location)
             UI.set_loader_message(f"Loading included config {resolved_include} referenced from {normalized_location}...")
@@ -767,8 +820,10 @@ class ReadMeta:
                     f"Failed to load included config '{resolved_include}' referenced from '{normalized_location}': {exc}"
                 ) from exc
             merged_config = self.merge_configs(merged_config, included_config)
-            UI.success(f"Loaded included config {resolved_include}")
-
+            include_count += 1
+        if include_count:
+            UI.set_loader_message(f"Loaded {include_count} includes")
+            UI.success(f"Loaded {include_count} includes")
         current_config = self._strip_loader_keys(data)
         return self.merge_configs(merged_config, current_config)
 
@@ -781,7 +836,7 @@ class ManifestManager:
     """
 
     def __init__(self, base_dir: Optional[Union[str, Path]] = None):
-        data_home = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+        data_home = Path(DeezUtils.xdg_data_home())
         self.base_dir: Path = Path(base_dir) if base_dir else data_home / "deez" / "dots"
 
     def _base_dir_path(self) -> Path:
@@ -951,7 +1006,7 @@ class CacheManager:
     """Manage cached dot bundle archives under XDG cache storage."""
 
     def __init__(self, cache_root: Optional[Union[str, Path]] = None):
-        xdg_cache = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
+        xdg_cache = Path(DeezUtils.xdg_cache_home())
         self.cache_root: Path = Path(cache_root) if cache_root else xdg_cache / "deez" / "dots"
 
     def _bundle_paths(self) -> List[Path]:
@@ -1156,7 +1211,7 @@ class WriteDots:
         owner = desc_data.get("owner", "unknown")
         version = desc_data.get("version", "unknown")
         dirname = self._backup_dot_dirname(dot, owner, version)
-        xdg_data = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+        xdg_data = Path(DeezUtils.xdg_data_home())
         backup_dir = xdg_data / "deez" / "backup" / "user" / dirname
         backup_dir.mkdir(parents=True, exist_ok=True)
         ts = DeezUtils.get_timestamp().replace(":", "-")
@@ -1630,7 +1685,7 @@ class WriteDots:
         overwrite_existing: bool = False,
     ) -> str:
         """Stage dot files and metadata into a bundle archive, returning the bundle path."""
-        xdg_cache = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
+        xdg_cache = Path(DeezUtils.xdg_cache_home())
         stage_dir = xdg_cache / "deez" / "stage" / dot
         shutil.rmtree(stage_dir, ignore_errors=True)
         try:
@@ -1681,7 +1736,7 @@ class WriteDots:
         overwrite_existing: bool = False,
     ) -> str:
         """Export staged entries to a bundle with optional manifest metadata."""
-        xdg_cache = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
+        xdg_cache = Path(DeezUtils.xdg_cache_home())
         ts = str(int(time.time()))
         stage_dir = xdg_cache / "deez" / "stage" / f"{dot}-export-{ts}"
         shutil.rmtree(stage_dir, ignore_errors=True)
@@ -1719,7 +1774,7 @@ class WriteDots:
         overwrite_existing: bool = False,
     ) -> str:
         """Export live files from a target root into a bundle archive."""
-        xdg_cache = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
+        xdg_cache = Path(DeezUtils.xdg_cache_home())
         ts = str(int(time.time()))
         stage_dir = xdg_cache / "deez" / "stage" / f"{dot}-export-{ts}"
         try:
@@ -1800,7 +1855,7 @@ class GitHandler:
         """Initialize git source handling with config and a command runner."""
         self.main_config = main_config
         self.runner = runner
-        self.source_cache_dir = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache")) / "deez" / "source"
+        self.source_cache_dir = Path(DeezUtils.xdg_cache_home()) / "deez" / "source"
 
     @staticmethod
     def sanitize_branch(branch: Optional[str]) -> str:
@@ -1879,7 +1934,7 @@ class GitHandler:
                 stat = local_path.stat()
                 source_text = f"file:{local_path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
         else:
-            candidate = Path(os.path.expandvars(os.path.expanduser(source_text)))
+            candidate = Path(DeezUtils.expand(source_text))
             if candidate.exists() and candidate.is_file():
                 stat = candidate.stat()
                 source_text = f"file:{candidate.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
@@ -1942,7 +1997,7 @@ class GitHandler:
             else:
                 urllib.request.urlretrieve(source_text, str(archive_path))
         else:
-            local_archive = Path(os.path.expandvars(os.path.expanduser(source_text)))
+            local_archive = Path(DeezUtils.expand(source_text))
             if not local_archive.is_file():
                 raise RuntimeError(f"Source archive '{local_archive}' does not exist.")
             shutil.copy2(local_archive, archive_path)
@@ -1953,7 +2008,7 @@ class GitHandler:
     def prepare_git_source(self, git_url: str, target_branch: str) -> str:
         """Clone or refresh a git source repository into the local cache."""
         repo_owner, repo_name = self.get_git_owner_name(git_url)
-        cache_root = os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+        cache_root = os.getenv("XDG_CACHE_HOME", DeezUtils.xdg_cache_home())
         source_root_path = Path(self.source_cache_path(cache_root, repo_owner, repo_name, target_branch))
         if not source_root_path.exists():
             self.git_clone(git_url, source_root_path, target_branch)
@@ -1971,7 +2026,7 @@ class GitHandler:
         explicit_source_path: bool = False,
     ) -> str:
         """Resolve a source path or git URL to a local source directory."""
-        source_text = os.path.expandvars(os.path.expanduser(str(source_dir or "").strip()))
+        source_text = DeezUtils.expand(str(source_dir or "").strip())
         if explicit_source_path and source_text:
             if self.is_source_url(source_text):
                 if self.is_release(source_text):
@@ -1986,13 +2041,13 @@ class GitHandler:
                         raise RuntimeError(f"Source path '{local_path}' is not a directory or supported archive.")
                 else:
                     return self.prepare_git_source(source_text, target_branch)
-            source_path = Path(source_text).expanduser()
+            source_path = Path(source_text)
             if source_path.exists() and source_path.is_file():
                 if self.is_release(str(source_path)):
                     return self.prepare_archive_source(source_path)
                 raise RuntimeError(f"Source path '{source_path}' is not a directory or supported archive.")
         else:
-            source_path = Path(source_text).expanduser()
+            source_path = Path(source_text)
         if source_path.exists():
             if not source_path.is_dir():
                 raise RuntimeError(f"Source path '{source_path}' is not a directory.")
@@ -2128,7 +2183,7 @@ class GitHandler:
             LOG.debug("Repository Owner: %s", repo_owner)
             LOG.debug("Repository Name: %s", repo_name)
             LOG.debug("Branch: %s", target_branch)
-            source_root_path = Path(self.source_cache_path(os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache")), repo_owner, repo_name, safe_branch))
+            source_root_path = Path(self.source_cache_path(os.getenv("XDG_CACHE_HOME", DeezUtils.xdg_cache_home()), repo_owner, repo_name, safe_branch))
             if not source_root_path.exists():
                 self.git_clone(url, source_root_path, target_branch)
             self.git_fetch(source_root_path, target_branch)
@@ -2534,7 +2589,7 @@ class DeezCLI:
     @staticmethod
     def _display_path_parts(path_text: str, home: Optional[Path] = None) -> List[str]:
         path = Path(path_text).expanduser()
-        home = home or Path.home()
+        home = home or Path(DeezUtils.home_dir())
         try:
             relative = path.relative_to(home)
             return ["~", *relative.parts] or ["~"]
@@ -2802,7 +2857,7 @@ class DeezCLI:
         ]
 
     def _backup_user_base(self) -> Path:
-        xdg_data = Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+        xdg_data = Path(DeezUtils.xdg_data_home())
         return xdg_data / "deez" / "backup" / "user"
 
     def _list_snapshots(self, dot: str) -> List[str]:
@@ -2931,7 +2986,6 @@ class DeezCLI:
 
         UI.set_loader_message("Checking dependency status...")
         for manager, packages in dependency_map.items():
-            UI.set_loader_message(f"Checking {manager} dependencies...")
             for package in packages:
                 installed = False
                 if manager == "system":
@@ -2941,7 +2995,8 @@ class DeezCLI:
 
                 if installed:
                     satisfied.setdefault(manager, []).append(package)
-                    UI.success(f"{manager}: {package}")
+                    # Show installed feedback in loader, not as a separate line
+                    UI.set_loader_message(f"[ok] {manager}: {package}")
                 else:
                     missing.setdefault(manager, []).append(package)
                     UI.warn(f"{manager}: {package} missing")
@@ -3002,8 +3057,34 @@ class DeezCLI:
             UI.warn("No supported package managers detected.")
 
         UI.progress(f"Dependency plan for: {', '.join(target_dots)}")
+        debug = getattr(self.args, "debug", False)
         for manager, packages in dependency_map.items():
-            UI.plain(f"  {manager}: {', '.join(packages)}")
+            if debug:
+                UI.plain(f"  {manager}: {', '.join(packages)}")
+            else:
+                UI.success(f"{manager}: {len(packages)} packages")
+                if packages:
+                    # Alternate colors for each package
+                    color_cycle = [UI._GREEN, UI._CYAN, UI._YELLOW, UI._MAGENTA, UI._BLUE]
+                    colored_pkgs = []
+                    for i, pkg in enumerate(packages):
+                        color = color_cycle[i % len(color_cycle)]
+                        colored_pkgs.append(f"{color}{pkg}{UI._RESET}")
+                    # Pretty print, 6 per line, indented
+                    indent = '      '
+                    line = indent
+                    count = 0
+                    for i, pkg in enumerate(colored_pkgs):
+                        if count > 0:
+                            line += ', '
+                        line += pkg
+                        count += 1
+                        if count == 6:
+                            UI.plain(line)
+                            line = indent
+                            count = 0
+                    if count > 0:
+                        UI.plain(line)
 
         satisfied, missing = self._check_dependency_status(dependency_map)
 
@@ -3132,24 +3213,24 @@ class DeezCLI:
         source_dir: Optional[str] = None,
     ) -> Tuple[str, str, List[str], List[str], str, bool, List[str]]:
         resolved_source_dir = source_dir or self.source_dir
-        source_root_value = file_entry.get("source_root")
+        source_root_value = file_entry.get("source_root") if file_entry.get("source_root") is not None else dot_data.get("source_root")
         if source_root_value:
             expanded_source_root = DeezUtils.expand(source_root_value)
             source_root = expanded_source_root if os.path.isabs(expanded_source_root) else os.path.join(resolved_source_dir, expanded_source_root)
         else:
             source_root = resolved_source_dir
-        target_root = DeezUtils.expand(file_entry.get("target_root") or default_target_root)
-        relative_paths = file_entry.get("paths")
+        target_root = DeezUtils.expand(file_entry.get("target_root") or dot_data.get("target_root") or default_target_root)
+        relative_paths = file_entry.get("paths") if file_entry.get("paths") is not None else dot_data.get("paths")
         relative_paths = DeezUtils.expand(relative_paths) if relative_paths else []
         if isinstance(relative_paths, str):
             relative_paths = [relative_paths]
-        ignored_paths = file_entry.get("ignored_paths")
+        ignored_paths = file_entry.get("ignored_paths") if file_entry.get("ignored_paths") is not None else dot_data.get("ignored_paths")
         ignored_paths = DeezUtils.expand(ignored_paths) if ignored_paths else []
         if isinstance(ignored_paths, str):
             ignored_paths = [ignored_paths]
         action = DeezUtils.normalize_action(file_entry.get("action") or dot_data.get("action") or self.main_config.get("global", {}).get("action"))
         clean_target = bool(file_entry.get("clean_target", dot_data.get("clean_target", False)))
-        conflicted_paths = self._normalize_conflicted_paths(file_entry.get("conflicted_paths"))
+        conflicted_paths = self._normalize_conflicted_paths(file_entry.get("conflicted_paths") if file_entry.get("conflicted_paths") is not None else dot_data.get("conflicted_paths"))
         return source_root, target_root, relative_paths, ignored_paths, action, clean_target, conflicted_paths
 
     def _iter_file_entries(self, dot_section: str, global_owner: str, global_home: str, global_version: str, source_dir: Optional[str] = None):
@@ -3173,15 +3254,83 @@ class DeezCLI:
         for file_entry in self._iter_raw_file_entries(dot_data):
             yield self._resolve_file_entry(dot_data, file_entry, section_home, source_dir) + (section_owner, section_version)
 
+    def _normalize_raw_file_entries(self, dot_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        dot_files = dot_data.get("files", [])
+        if not dot_files and dot_data.get("paths"):
+            return [
+                {
+                    "source_root": dot_data.get("source_root"),
+                    "target_root": dot_data.get("target_root"),
+                    "paths": dot_data.get("paths"),
+                    "ignored_paths": dot_data.get("ignored_paths"),
+                    "action": dot_data.get("action"),
+                    "clean_target": dot_data.get("clean_target", False),
+                    "pre_command": dot_data.get("pre_command"),
+                    "build_command": dot_data.get("build_command"),
+                    "dependency": dot_data.get("dependency") or dot_data.get("depends"),
+                    "conflicted_paths": dot_data.get("conflicted_paths"),
+                }
+            ]
+        return [file_entry for file_entry in self._iter_raw_file_entries(dot_data)]
+
+    def _normalize_file_entry_record(
+        self,
+        dot_data: Dict[str, Any],
+        file_entry: Dict[str, Any],
+        default_target_root: str,
+        source_dir: Optional[str],
+        for_export: bool = False,
+    ) -> Dict[str, Any]:
+        source_root, target_root, relative_paths, ignored_paths, action, clean_target, conflicted_paths = self._resolve_file_entry(
+            dot_data,
+            file_entry,
+            default_target_root,
+            source_dir,
+        )
+        archive_root = file_entry.get("source_root") if file_entry.get("source_root") is not None else dot_data.get("source_root") or ""
+        resolved_src_root = target_root if for_export else source_root
+        return {
+            "src_root": resolved_src_root,
+            "tgt_root": target_root,
+            "paths": relative_paths,
+            "rel_paths": relative_paths,
+            "ignored_paths": ignored_paths,
+            "archive_root": archive_root,
+            "entry_metadata": {
+                "source_root": archive_root,
+                "dependency": DeezUtils.normalize_dependency_blocks(file_entry.get("dependency") or file_entry.get("depends")) or None,
+                "conflicted_paths": [str(Path(target_root) / path) for path in conflicted_paths] or None,
+                "pre_command": file_entry.get("pre_command"),
+            },
+            "action": action,
+            "clean_target": clean_target,
+            "pre_command": file_entry.get("pre_command"),
+            "build_command": file_entry.get("build_command"),
+        }
+
+    def _build_file_entry_records(
+        self,
+        dot_data: Dict[str, Any],
+        default_target_root: str,
+        source_dir: Optional[str] = None,
+        for_export: bool = False,
+    ) -> List[Dict[str, Any]]:
+        raw_file_entries = self._normalize_raw_file_entries(dot_data)
+        return [
+            self._normalize_file_entry_record(dot_data, file_entry, default_target_root, source_dir, for_export=for_export)
+            for file_entry in raw_file_entries
+        ]
+
     def _check_conflicts_from_bundle(
         self,
         dot: str,
         new_owner: str,
         bundle_entries: List[Dict[str, Any]],
         bundle_conflicts: Optional[List[str]] = None,
+        ignore_installed_dot: bool = False,
     ) -> Tuple[bool, List[Tuple[str, str]]]:
         existing_desc = self.manifest_manager.load_desc(dot)
-        if existing_desc:
+        if existing_desc and not ignore_installed_dot:
             existing_owner = existing_desc.get("owner", "unknown")
             if existing_owner != new_owner:
                 UI.error(f"Conflict: dot '{dot}' is already installed by '{existing_owner}'.")
@@ -3244,32 +3393,56 @@ class DeezCLI:
         self,
         bundle_path: Path,
         bundle: Dict[str, Any],
+        dry_run: bool = False,
     ) -> Optional[Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], List[Tuple[str, str]]]]:
         dot = bundle.get("name")
         if not dot:
             UI.error(f"{bundle_path}: manifest.toml has no 'name' field")
             return None
         bundle_entries = bundle.get("files", [])
-        file_pairs = [(entry["src"], entry["dst"]) for entry in bundle_entries]
-        if not file_pairs:
+        if not bundle_entries:
             UI.error(f"{bundle_path}: manifest.toml has no [[files]]")
             return None
+
+        bundle_owner = bundle.get("owner", "")
+        bundle_version = bundle.get("version", "unknown")
+        existing_desc = self.manifest_manager.load_desc(dot)
+        ignore_existing_dot_conflict = False
+        if existing_desc:
+            existing_owner = existing_desc.get("owner", "unknown")
+            existing_version = existing_desc.get("version", "unknown")
+            if existing_owner != bundle_owner:
+                prompt = (
+                    f"Dot '{dot}' version {existing_version} owned by {existing_owner} is installed. "
+                    f"Overwrite with version {bundle_version} owned by {bundle_owner}?"
+                )
+                if not InteractiveMenu.confirm(prompt, default=False):
+                    UI.info("Skipped existing dot due to conflict.")
+                    return None
+                if dry_run:
+                    UI.plain(f"[DRY RUN] Would uninstall installed dot '{dot}' owned by {existing_owner}.")
+                    ignore_existing_dot_conflict = True
+                else:
+                    UI.set_loader_message(f"Uninstalling previous '{dot}' (if installed)...")
+                    self._do_uninstall([dot], dry_run=False, confirm=False, remove_manifest=True)
+                    ignore_existing_dot_conflict = True
+
         ok, kept_pairs = self._check_conflicts_from_bundle(
             dot,
-            bundle.get("owner", ""),
+            bundle_owner,
             bundle_entries,
             bundle.get("conflicts"),
+            ignore_installed_dot=ignore_existing_dot_conflict,
         )
         if not ok or not kept_pairs:
             UI.info(f"'{dot}' skipped due to conflict.")
             return None
-        remaining_pairs = list(kept_pairs)
-        filtered_entries: List[Dict[str, Any]] = []
-        for bundle_entry in bundle_entries:
-            entry_key = (bundle_entry.get("src"), bundle_entry.get("dst"))
-            if entry_key in remaining_pairs:
-                filtered_entries.append(bundle_entry)
-                remaining_pairs.remove(entry_key)
+        kept_pair_set = set(kept_pairs)
+        filtered_entries = [
+            bundle_entry
+            for bundle_entry in bundle_entries
+            if (bundle_entry.get("src"), bundle_entry.get("dst")) in kept_pair_set
+        ]
         return dot, bundle_entries, filtered_entries, kept_pairs
 
     def _do_package(self, global_owner: str, global_home: str, global_version: str, git_url: str = "", target_branch: str = "", compress: bool = True, out_dir: Optional[str] = None, overwrite_existing: bool = False, sections: Optional[List[str]] = None, dry_run: bool = False) -> List[str]:
@@ -3300,21 +3473,10 @@ class DeezCLI:
                 writer.execute_commands([build_command], cwd=dot_source_dir)
             section_home = os.path.expandvars(dot_data.get("home", global_home))
 
+            raw_file_entries = self._build_file_entry_records(dot_data, section_home, dot_source_dir)
             file_entries: List[Dict[str, Any]] = []
-            raw_file_entries = list(self._iter_raw_file_entries(dot_data))
-            if not raw_file_entries and dot_data.get("paths"):
-                raw_file_entries = [
-                    {
-                        "source_root": dot_data.get("source_root"),
-                        "target_root": dot_data.get("target_root"),
-                        "paths": dot_data.get("paths"),
-                        "ignored_paths": dot_data.get("ignored_paths"),
-                        "action": dot_data.get("action"),
-                        "clean_target": dot_data.get("clean_target", False),
-                    }
-                ]
             for file_entry in raw_file_entries:
-                entry_pre_command = file_entry.get("pre_command")
+                entry_pre_command = file_entry["pre_command"]
                 if dry_run:
                     self._announce_dry_run_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, file_entry))
                 elif self._skip_on_failed_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, file_entry), cwd=hook_cwd):
@@ -3322,27 +3484,16 @@ class DeezCLI:
                 entry_build_command = file_entry.get("build_command")
                 if entry_build_command:
                     writer.execute_commands([entry_build_command], cwd=dot_source_dir)
-                source_root, target_root, relative_paths, ignored_paths, action, clean_target, conflicted_paths = self._resolve_file_entry(
-                    dot_data,
-                    file_entry,
-                    section_home,
-                    dot_source_dir,
-                )
                 file_entries.append(
                     {
-                        "src_root": source_root,
-                        "tgt_root": target_root,
-                        "rel_paths": relative_paths,
-                        "ignored_paths": ignored_paths,
-                        "archive_root": file_entry.get("source_root") or "",
-                        "entry_metadata": {
-                            "source_root": file_entry.get("source_root") or "",
-                            "dependency": DeezUtils.normalize_dependency_blocks(file_entry.get("dependency") or file_entry.get("depends")) or None,
-                            "conflicted_paths": [str(Path(target_root) / path) for path in conflicted_paths] or None,
-                            "pre_command": entry_pre_command,
-                        },
-                        "action": action,
-                        "clean_target": clean_target,
+                        "src_root": file_entry["src_root"],
+                        "tgt_root": file_entry["tgt_root"],
+                        "rel_paths": file_entry["rel_paths"],
+                        "ignored_paths": file_entry["ignored_paths"],
+                        "archive_root": file_entry["archive_root"],
+                        "entry_metadata": file_entry["entry_metadata"],
+                        "action": file_entry["action"],
+                        "clean_target": file_entry["clean_target"],
                     }
                 )
             pkg_path = writer.stage(
@@ -3401,65 +3552,24 @@ class DeezCLI:
                 }
                 UI.plain(f"[EXPORT] Capturing dot: {dot_section}")
                 file_entries: List[Dict[str, Any]] = []
-                dot_files = dot_data.get("files", [])
-                if not dot_files and dot_data.get("paths"):
-                    legacy_entry = {
-                        "source_root": dot_data.get("source_root"),
-                        "target_root": dot_data.get("target_root"),
-                        "paths": dot_data.get("paths"),
-                        "action": dot_data.get("action"),
-                        "clean_target": dot_data.get("clean_target", False),
-                    }
-                    _source_root, tgt_root, rel_paths, ignored_paths, action, clean_target, conflicted_paths = self._resolve_file_entry(
-                        dot_data,
-                        legacy_entry,
-                        section_home,
-                    )
+                for file_entry in self._build_file_entry_records(dot_data, section_home, self.source_dir, for_export=True):
+                    entry_pre_command = file_entry["pre_command"]
+                    if dry_run:
+                        self._announce_dry_run_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, file_entry))
+                    elif self._skip_on_failed_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, file_entry), cwd=hook_cwd):
+                        continue
                     file_entries.append(
                         {
-                            "src_root": tgt_root,
-                            "tgt_root": tgt_root,
-                            "rel_paths": rel_paths,
-                            "ignored_paths": ignored_paths,
-                            "archive_root": legacy_entry.get("source_root") or "",
-                            "entry_metadata": {
-                                "source_root": legacy_entry.get("source_root") or "",
-                                "dependency": DeezUtils.normalize_dependency_blocks(legacy_entry.get("dependency") or legacy_entry.get("depends")) or None,
-                                "conflicted_paths": [str(Path(tgt_root) / path) for path in conflicted_paths] or None,
-                            },
-                            "action": action,
-                            "clean_target": clean_target,
+                            "src_root": file_entry["src_root"],
+                            "tgt_root": file_entry["tgt_root"],
+                            "rel_paths": file_entry["rel_paths"],
+                            "ignored_paths": file_entry["ignored_paths"],
+                            "archive_root": file_entry["archive_root"],
+                            "entry_metadata": file_entry["entry_metadata"],
+                            "action": file_entry["action"],
+                            "clean_target": file_entry["clean_target"],
                         }
                     )
-                else:
-                    for raw_file_entry in self._iter_raw_file_entries(dot_data):
-                        entry_pre_command = raw_file_entry.get("pre_command")
-                        if dry_run:
-                            self._announce_dry_run_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, raw_file_entry))
-                        elif self._skip_on_failed_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, raw_file_entry), cwd=hook_cwd):
-                            continue
-                        _source_root, tgt_root, rel_paths, ignored_paths, action, clean_target, conflicted_paths = self._resolve_file_entry(
-                            dot_data,
-                            raw_file_entry,
-                            section_home,
-                        )
-                        file_entries.append(
-                            {
-                                "src_root": tgt_root,
-                                "tgt_root": tgt_root,
-                                "rel_paths": rel_paths,
-                                "ignored_paths": ignored_paths,
-                                "archive_root": raw_file_entry.get("source_root") or "",
-                                "entry_metadata": {
-                                    "source_root": raw_file_entry.get("source_root") or "",
-                                    "dependency": DeezUtils.normalize_dependency_blocks(raw_file_entry.get("dependency") or raw_file_entry.get("depends")) or None,
-                                    "conflicted_paths": [str(Path(tgt_root) / path) for path in conflicted_paths] or None,
-                                    "pre_command": entry_pre_command,
-                                },
-                                "action": action,
-                                "clean_target": clean_target,
-                            }
-                        )
                 writer.export_entries(
                     file_entries=file_entries,
                     dot=dot_section,
@@ -3478,7 +3588,7 @@ class DeezCLI:
                 desc_data = self.manifest_manager.load_desc(dot_section)
                 section_owner = desc_data.get("owner", global_owner)
                 section_version = desc_data.get("version", global_version)
-                home_dir = os.path.expanduser("~")
+                home_dir = DeezUtils.home_dir()
                 relative_paths, action_by_path = self._collect_installed_export_paths(dot_section, home_dir)
                 if not relative_paths:
                     UI.info(f"No home-relative files found for '{dot_section}'.")
@@ -3510,7 +3620,7 @@ class DeezCLI:
                 bundle = self._read_bundle_manifest(bundle_path)
                 if bundle is None:
                     continue
-                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle)
+                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle, dry_run=dry_run)
                 if prepared_bundle is None:
                     continue
                 planned_installs.append((bundle_path, bundle, prepared_bundle))
@@ -3526,7 +3636,7 @@ class DeezCLI:
                 bundle = self._read_bundle_manifest(bundle_path)
                 if bundle is None:
                     continue
-                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle)
+                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle, dry_run=dry_run)
                 if prepared_bundle is None:
                     continue
                 dot, _bundle_entries, filtered_entries, kept_pairs = prepared_bundle
@@ -3545,7 +3655,7 @@ class DeezCLI:
                     continue
                 with manifest_path.open("rb") as f:
                     bundle = toml.load(f)
-                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle)
+                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle, dry_run=dry_run)
                 if prepared_bundle is None:
                     continue
                 dot, bundle_entries, filtered_entries, _kept_pairs = prepared_bundle
@@ -3589,7 +3699,7 @@ class DeezCLI:
                 adopted_count = len(adopted_pairs)
                 deployed_pairs.extend(adopted_pairs)
                 digest = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
-                xdg_cache = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
+                xdg_cache = Path(DeezUtils.xdg_cache_home())
                 cache_dir = xdg_cache / "deez" / "dots"
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 cached_pkg = cache_dir / f"{digest}.tar.gz"
@@ -3661,7 +3771,7 @@ class DeezCLI:
         finally:
             self.args.no_backup = original_no_backup
 
-    def _do_uninstall(self, dots: Optional[List[str]] = None, dry_run: bool = False) -> None:
+    def _do_uninstall(self, dots: Optional[List[str]] = None, dry_run: bool = False, confirm: bool = True, remove_manifest: bool = False) -> None:
         installed = self.manifest_manager.list_dots()
         if dots:
             selected_dots = self._resolve_uninstall_targets(dots, installed)
@@ -3675,15 +3785,28 @@ class DeezCLI:
             if not selected_dots:
                 UI.info("Cancelled.")
                 return
-        if not dry_run and not InteractiveMenu.confirm("Confirm uninstall?", default=False):
-            UI.info("Cancelled.")
-            return
+        if confirm and not dry_run:
+            if not InteractiveMenu.confirm("Confirm uninstall?", default=False):
+                UI.info("Cancelled.")
+                return
         writer = WriteDots()
         for dot in selected_dots:
+            # Only remove files with action 'sync', leave 'preserve' files untouched
+            manifest_entries = self.manifest_manager.get_file_entries(dot)
+            sync_files = [entry["dst"] for entry in manifest_entries if DeezUtils.normalize_action(entry.get("action")) == "sync"]
             if dry_run:
-                self._print_uninstall_dry_run(dot)
+                UI.plain(f"[DRY RUN] [UNINSTALL] Would remove dot '{dot}' with {len(sync_files)} sync-tracked files.")
+                for target_path in sync_files:
+                    UI.plain(f"  would remove: {target_path}")
                 continue
-            writer.remove(dot, self.manifest_manager)
+            for target_path in sync_files:
+                try:
+                    writer._remove_existing_path(target_path)
+                    LOG.debug(f"Removed sync file: {target_path}")
+                except Exception as e:
+                    LOG.warning(f"Failed to remove {target_path}: {e}")
+            if remove_manifest and not dry_run:
+                self.manifest_manager.remove_dot(dot)
 
     def _do_restore(self, dots: Optional[List[str]] = None, dry_run: bool = False) -> None:
         all_backup_dots = self._backup_dots()
@@ -3923,7 +4046,7 @@ def create_deez_cli(
         args,
         main_config or {},
         source_dir or "",
-        target_root or os.path.expanduser("~"),
+        target_root or DeezUtils.home_dir(),
         version or "unknown",
         available_package_managers if available_package_managers is not None else [],
         distribution,
