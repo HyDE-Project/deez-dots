@@ -3321,6 +3321,83 @@ class TestDeezCLI(unittest.TestCase):
         self.assertFalse(tracked_file.exists(), "Uninstall should remove tracked files with templated manifest paths")
         self.assertFalse((Path(self.xdg_data) / "deez" / "dots" / "kitty.toml").exists())
 
+    def test_dots_uninstall_backups_current_dot_state(self):
+        dot = "kitty"
+        sync_target = self.home_dir / ".config/kitty/kitty.conf"
+        preserve_target = self.home_dir / ".config/kitty/theme.conf"
+        self._write_installed_manifest(
+            dot,
+            files=[
+                {"src": ".config/kitty/kitty.conf", "dst": str(sync_target), "action": "sync"},
+                {"src": ".config/kitty/theme.conf", "dst": str(preserve_target), "action": "preserve"},
+            ],
+        )
+        sync_target.parent.mkdir(parents=True, exist_ok=True)
+        sync_target.write_text("sync content")
+        preserve_target.write_text("preserve content")
+
+        result = self.run_cli(["dots", "--uninstall", dot], input_data="y\n")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Backup saved:", result.stdout)
+        backup_base = Path(self.xdg_data) / "deez" / "backup" / "user"
+        backups = [p for p in backup_base.rglob("*.tar.gz") if any(part.startswith(f"{dot}.") for part in p.parts)]
+        self.assertTrue(backups, "Expected uninstall to create backup snapshot")
+
+        with tarfile.open(backups[0], "r:gz") as tar:
+            members = tar.getnames()
+
+        expected_sync = f"data/{sync_target.relative_to(Path('/')).as_posix()}"
+        expected_preserve = f"data/{preserve_target.relative_to(Path('/')).as_posix()}"
+        self.assertIn(expected_sync, members)
+        self.assertIn(expected_preserve, members)
+        self.assertFalse(sync_target.exists())
+        self.assertTrue(preserve_target.exists(), "Preserved files should remain after uninstall")
+
+    def test_dots_install_backups_existing_installed_dot(self):
+        dot = "kitty"
+        sync_target = self.home_dir / ".config/kitty/kitty.conf"
+        preserve_target = self.home_dir / ".config/kitty/theme.conf"
+        self._write_installed_manifest(
+            dot,
+            owner="hyde_project",
+            version="1.0",
+            files=[
+                {"src": ".config/kitty/kitty.conf", "dst": str(sync_target), "action": "sync"},
+                {"src": ".config/kitty/theme.conf", "dst": str(preserve_target), "action": "preserve"},
+            ],
+        )
+        sync_target.parent.mkdir(parents=True, exist_ok=True)
+        sync_target.write_text("sync content")
+        preserve_target.write_text("preserve content")
+
+        bundle_path = self._make_bundle_tarball(
+            Path(self.tmpdir.name) / "kitty-v2.tar.gz",
+            name=dot,
+            owner="hyde_project",
+            version="2.0",
+            files=[
+                {"src": "kitty.conf", "dst": str(sync_target)},
+            ],
+        )
+
+        with patch.dict(os.environ, self.env, clear=False):
+            cli = self._make_cli({"global": {}}, source_dir=self.home_dir)
+            cli.args = argparse.Namespace(no_backup=False, no_deps_checks=True, no_deps_install=True)
+            cli._do_install([str(bundle_path)], prechecked_dependencies=True)
+
+        backup_base = Path(self.xdg_data) / "deez" / "backup" / "user"
+        backups = [p for p in backup_base.rglob("*.tar.gz") if any(part.startswith(f"{dot}.") for part in p.parts)]
+        self.assertTrue(backups, "Expected install to create a backup snapshot")
+
+        with tarfile.open(backups[0], "r:gz") as tar:
+            members = tar.getnames()
+
+        expected_sync = f"data/{sync_target.relative_to(Path('/')).as_posix()}"
+        expected_preserve = f"data/{preserve_target.relative_to(Path('/')).as_posix()}"
+        self.assertIn(expected_sync, members)
+        self.assertIn(expected_preserve, members)
+
     def test_dots_install_records_bundle_hash_for_healthcheck(self):
         bundle_path = self._make_bundle_tarball(
             Path(self.tmpdir.name) / "kitty-health.tar.gz",

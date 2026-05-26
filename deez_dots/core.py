@@ -2431,6 +2431,7 @@ class DeezCLI:
         self.manifest_manager = manifest_manager if manifest_manager is not None else ManifestManager()
         self.cache_manager = cache_manager if cache_manager is not None else CacheManager()
         self._manifest_dots = self.manifest_manager.list_dots()
+        self._backed_up_dots: set[str] = set()
 
     @staticmethod
     def _can_prompt_for_selection() -> bool:
@@ -3776,9 +3777,16 @@ class DeezCLI:
                 if not filtered_entries:
                     UI.info(f"'{dot}' skipped — all file entries failed pre_command.")
                     continue
-                if not no_backup:
-                    backup_desc = self.manifest_manager.load_desc(dot) or {k: v for k, v in bundle.items() if k != "files"}
-                    writer.backup_to_tarball(dot, filtered_entries, desc_data=backup_desc)
+                if not no_backup and dot not in self._backed_up_dots:
+                    installed_entries = self.manifest_manager.get_file_entries(dot)
+                    if installed_entries:
+                        backup_desc = self.manifest_manager.load_desc(dot) or {k: v for k, v in bundle.items() if k != "files"}
+                        backup_path = writer.backup_to_tarball(dot, installed_entries, desc_data=backup_desc)
+                    else:
+                        backup_desc = {k: v for k, v in bundle.items() if k != "files"}
+                        backup_path = writer.backup_to_tarball(dot, filtered_entries, desc_data=backup_desc)
+                    if backup_path:
+                        self._backed_up_dots.add(dot)
                 deployed_pairs: List[Dict[str, Any]] = []
                 adopted_pairs: List[Dict[str, Any]] = []
                 bundle_data_dir = temp_install_dir / "data"
@@ -3922,9 +3930,15 @@ class DeezCLI:
                 UI.info("Cancelled.")
                 return
         writer = WriteDots()
+        no_backup = getattr(self.args, "no_backup", False)
         for dot in selected_dots:
-            # Only remove files with action 'sync', leave 'preserve' files untouched
             manifest_entries = self.manifest_manager.get_file_entries(dot)
+            if not dry_run and not no_backup and dot not in self._backed_up_dots:
+                backup_desc = self.manifest_manager.load_desc(dot) or {}
+                backup_path = writer.backup_to_tarball(dot, manifest_entries, desc_data=backup_desc)
+                if backup_path:
+                    self._backed_up_dots.add(dot)
+            # Only remove files with action 'sync', leave 'preserve' files untouched
             sync_files = [DeezUtils.expand(entry["dst"]) for entry in manifest_entries if entry.get("dst") and DeezUtils.normalize_action(entry.get("action")) == "sync"]
             if dry_run:
                 UI.plain(f"[DRY RUN] [UNINSTALL] Would remove dot '{dot}' with {len(sync_files)} sync-tracked files.")
