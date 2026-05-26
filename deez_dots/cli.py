@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
 import os
 import sys
@@ -158,6 +159,7 @@ def _initialize_command_state(args: argparse.Namespace) -> None:
     args.sections = None
     args.no_backup = getattr(args, "no_backup", False)
     args.no_deps_checks = getattr(args, "no_deps_checks", False)
+    args.skip_git = getattr(args, "skip_git", False)
     args.no_deps_install = getattr(args, "no_deps_install", False)
     args.no_compress = getattr(args, "no_compress", False)
     args.force = getattr(args, "force", False)
@@ -283,16 +285,30 @@ def main() -> None:
         need_source = bool(((args.do_package or args.do_deploy) and not skip_global_source_prepare) or (args.do_install and not args.from_stage))
 
         target_root = home
-        git_handler = GitHandler(global_config)
+        try:
+            git_handler = GitHandler(global_config, skip_git=args.skip_git)
+        except TypeError:
+            git_handler = GitHandler(global_config)
+            setattr(git_handler, "skip_git", args.skip_git)
         if need_source:
             UI.set_loader_message("Preparing source directory...")
             try:
-                source_dir = git_handler.prepare_source(
-                    source_dir,
-                    git_url,
-                    target_branch,
-                    explicit_source_path=explicit_source_path,
-                )
+                prepare_source = git_handler.prepare_source
+                if "skip_git" in inspect.signature(prepare_source).parameters:
+                    source_dir = prepare_source(
+                        source_dir,
+                        git_url,
+                        target_branch,
+                        explicit_source_path=explicit_source_path,
+                        skip_git=args.skip_git,
+                    )
+                else:
+                    source_dir = prepare_source(
+                        source_dir,
+                        git_url,
+                        target_branch,
+                        explicit_source_path=explicit_source_path,
+                    )
             except RuntimeError as exc:
                 UI.error(str(exc))
                 raise SystemExit(1)

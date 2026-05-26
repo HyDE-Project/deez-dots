@@ -1,6 +1,5 @@
 
 import argparse
-import pytest
 import tempfile
 import shutil
 import hashlib
@@ -384,6 +383,55 @@ class TestDeezCLI(unittest.TestCase):
         status = result["status"]["kitty"]
         self.assertEqual(status["missing"], [str(file_path)])
         self.assertEqual(status["ok"], [])
+
+    def test_query_filetree_expands_templated_dst_entries(self):
+        file_path = self.home_dir / ".config/kitty/kitty.conf"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("content")
+        self._write_installed_manifest(
+            "kitty",
+            owner="hyde_project",
+            version="0.1.0",
+            files=[{"src": "payload/.config/kitty/kitty.conf", "dst": "${HOME}/.config/kitty/kitty.conf"}],
+        )
+
+        with patch.dict(os.environ, {"HOME": str(self.home_dir)}, clear=False):
+            result = deez_module.query_filetree(
+                {},
+                target="kitty",
+                target_root=str(self.home_dir),
+                manifest_manager=deez_module.ManifestManager(base_dir=self.xdg_data / "deez" / "dots"),
+            )
+        self.assertEqual(result["target"], "kitty")
+        self.assertEqual(result["dots"], ["kitty"])
+        self.assertIn("children", result["tree"])
+        self.assertIn("~", result["tree"]["children"])
+        home_node = result["tree"]["children"]["~"]
+        self.assertIn("children", home_node)
+        self.assertIn(".config", home_node["children"])
+
+    def test_query_healthcheck_expands_templated_dst_entries(self):
+        file_path = self.home_dir / ".config/kitty/kitty.conf"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("content")
+        self._write_installed_manifest(
+            "kitty",
+            owner="hyde_project",
+            version="0.1.0",
+            files=[{"src": "payload/.config/kitty/kitty.conf", "dst": "${HOME}/.config/kitty/kitty.conf"}],
+        )
+
+        with patch.dict(os.environ, {"HOME": str(self.home_dir)}, clear=False):
+            result = deez_module.query_healthcheck(
+                {},
+                target="kitty",
+                manifest_manager=deez_module.ManifestManager(base_dir=self.xdg_data / "deez" / "dots"),
+            )
+        self.assertEqual(result["target"], "kitty")
+        self.assertEqual(result["dots"], ["kitty"])
+        status = result["status"]["kitty"]
+        self.assertEqual(status["missing"], [])
+        self.assertEqual(status["ok"], [str(file_path)])
 
     def _make_dot_args(self, **overrides):
         values = {
@@ -1180,6 +1228,27 @@ class TestDeezCLI(unittest.TestCase):
         git_pull.assert_called_once_with(source_override, "dev")
         git_checkout.assert_called_once_with(source_override, "dev")
 
+    def test_dots_source_override_skips_git_refresh_when_requested(self):
+        config_path = self._write_git_config()
+        source_override = Path(self.tmpdir.name) / "override-repo"
+        source_override.mkdir(parents=True, exist_ok=True)
+        captured = {}
+
+        class FakeCLI:
+            def __init__(self, _args, _main_config, source_dir, *_rest, **_kwargs):
+                captured["source_dir"] = source_dir
+
+            def run(self):
+                return None
+
+        with patch.object(deez_module, "DeezCLI", FakeCLI), patch.object(deez_module.GitHandler, "is_git_repo", return_value=True), patch.object(deez_module.GitHandler, "get_remote_url", return_value="git@github.com:HyDE-Project/HyDE.git"), patch.object(deez_module.GitHandler, "git_fetch") as git_fetch, patch.object(deez_module.GitHandler, "git_pull") as git_pull, patch.object(deez_module.GitHandler, "git_checkout") as git_checkout:
+            self.run_main(["deez", "dots", "--package", "--config", str(config_path), "--source", str(source_override), "--skip-git"])
+
+        self.assertEqual(captured["source_dir"], str(source_override))
+        git_fetch.assert_not_called()
+        git_pull.assert_not_called()
+        git_checkout.assert_not_called()
+
     def test_dots_source_override_skips_mismatched_git_repo(self):
         config_path = self._write_git_config()
         source_override = Path(self.tmpdir.name) / "override-other-repo"
@@ -1701,7 +1770,7 @@ class TestDeezCLI(unittest.TestCase):
         self.assertTrue(bundle_path.exists())
         with tarfile.open(bundle_path, "r:gz") as tar:
             manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
-        self.assertIn(f'dst = "{self.home_dir}/.config/kitty/kitty.conf"', manifest_text)
+        self.assertIn('dst = "${HOME}/.config/kitty/kitty.conf"', manifest_text)
         self.assertNotIn('dst = "/etc/kitty/kitty.conf"', manifest_text)
 
     def test_manifest_serializes_file_action(self):
@@ -1712,12 +1781,70 @@ class TestDeezCLI(unittest.TestCase):
         loaded = manager.get_file_entries("kitty")
         self.assertEqual(loaded[0].get("action"), "preserve")
 
+    def test_manifest_templates_home_paths_for_source(self):
+        manager = deez_module.ManifestManager()
+        manager.base_dir = str(Path(self.tmpdir.name) / "manifest")
+        home_path = str(Path.home())
+        source_path = f"{home_path}/The HyDE Project/HyDE"
+        manager.save(
+            "kitty",
+            {"name": "kitty", "state": "installed", "source": source_path},
+            [
+                {
+                    "src": "Configs/.config/kitty/kitty.conf",
+                    "dst": f"{home_path}/.config/kitty/kitty.conf",
+                    "source_root": "Configs/.config/",
+                }
+            ],
+        )
+        manifest_path = Path(manager.base_dir) / "kitty.toml"
+        manifest_text = manifest_path.read_text()
+        self.assertIn('source = "${HOME}/The HyDE Project/HyDE"', manifest_text)
+        self.assertIn('dst = "${XDG_CONFIG_HOME}/kitty/kitty.conf"', manifest_text)
+        self.assertIn('source_root = "Configs/.config/"', manifest_text)
+        self.assertNotIn(f'dst = "{home_path}/.config/kitty/kitty.conf"', manifest_text)
+
     def test_manifest_serializes_clean_target_bool(self):
         manager = deez_module.ManifestManager()
         manager.base_dir = str(Path(self.tmpdir.name) / "manifest")
         manager.save("kitty", {"name": "kitty", "state": "installed", "clean_target": True}, [])
         loaded = manager.load_desc("kitty")
         self.assertTrue(loaded.get("clean_target"))
+
+    def test_manifest_serializes_directories(self):
+        manager = deez_module.ManifestManager()
+        manager.base_dir = str(Path(self.tmpdir.name) / "manifest")
+        directory = "${HOME}/.config/kitty"
+        manager.save(
+            "kitty",
+            {"name": "kitty", "directories": [directory]},
+            [{"src": "kitty.conf", "dst": "${HOME}/.config/kitty/kitty.conf", "action": "sync"}],
+        )
+        manifest_path = Path(manager.base_dir) / "kitty.toml"
+        manifest_text = manifest_path.read_text()
+        self.assertIn('directories = ["${HOME}/.config/kitty"]', manifest_text)
+        loaded_dirs = manager.get_directory_entries("kitty")
+        self.assertEqual(loaded_dirs[0].get("dst"), directory)
+
+    def test_writer_remove_prunes_empty_directories(self):
+        manager = deez_module.ManifestManager()
+        manager.base_dir = str(Path(self.tmpdir.name) / "manifest")
+        dot = "kitty"
+        target_file = self.home_dir / ".config" / "kitty" / "kitty.conf"
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        target_file.write_text("dummy")
+        manager.save(
+            dot,
+            {"name": dot, "directories": [{"dst": str(target_file.parent)}]},
+            [{"src": "kitty.conf", "dst": str(target_file), "action": "sync"}],
+        )
+
+        writer = deez_module.WriteDots()
+        writer.remove(dot, manager)
+
+        self.assertFalse(target_file.exists())
+        self.assertFalse(target_file.parent.exists())
+        self.assertFalse((Path(manager.base_dir) / f"{dot}.toml").exists())
 
     def test_normalize_action_cases(self):
         cases = [
@@ -2175,8 +2302,8 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn('src = "Configs/.local/state/hypr/theme.lua"', manifest_text)
         self.assertIn('source_root = "Configs/.config/hypr"', manifest_text)
         self.assertIn('source_root = "Configs/.local/state/hypr"', manifest_text)
-        self.assertIn(f'dst = "{self.home_dir}/.config/hypr/hyprland.conf"', manifest_text)
-        self.assertIn(f'dst = "{self.home_dir}/.local/state/hypr/theme.lua"', manifest_text)
+        self.assertIn('dst = "${HOME}/.config/hypr/hyprland.conf"', manifest_text)
+        self.assertIn('dst = "${HOME}/.local/state/hypr/theme.lua"', manifest_text)
 
     def test_dots_deploy_with_config_installs_built_bundle(self):
         source_dir = Path(self.tmpdir.name) / "source"
@@ -3176,6 +3303,23 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("[DRY RUN] [UNINSTALL] Would remove dot 'kitty'", result.stdout)
         self.assertTrue(tracked_file.exists(), "Dry-run uninstall should not remove tracked files")
+
+    def test_dots_uninstall_expands_templated_paths(self):
+        manifest_manager = deez_module.ManifestManager(base_dir=Path(self.xdg_data) / "deez" / "dots")
+        manifest_manager.save(
+            "kitty",
+            {"owner": "hyde_project", "name": "kitty", "version": "1.0"},
+            [{"src": ".config/kitty/kitty.conf", "dst": str(self.home_dir / ".config/kitty/kitty.conf"), "action": "sync"}],
+        )
+        tracked_file = self.home_dir / ".config/kitty/kitty.conf"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text("dummy")
+
+        result = self.run_cli(["dots", "--uninstall", "kitty"], input_data="y\n")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Uninstalled kitty", result.stdout)
+        self.assertFalse(tracked_file.exists(), "Uninstall should remove tracked files with templated manifest paths")
+        self.assertFalse((Path(self.xdg_data) / "deez" / "dots" / "kitty.toml").exists())
 
     def test_dots_install_records_bundle_hash_for_healthcheck(self):
         bundle_path = self._make_bundle_tarball(

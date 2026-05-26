@@ -32,6 +32,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--list", action="store_true", help="List all tracked dots and their state")
     parser.add_argument("--no-backup", action="store_true", dest="no_backup", help="Skip backup when deploying or uninstalling")
     parser.add_argument("--no-deps-checks", action="store_true", dest="no_deps_checks", help="Skip dependency checks before install or deploy")
+    parser.add_argument("--skip-git", action="store_true", dest="skip_git", help="Skip git refresh operations when preparing source")
     parser.add_argument("--no-deps-install", action="store_true", dest="no_deps_install", help="Check dependencies but do not auto-install missing ones before install or deploy")
     parser.add_argument("--no-compress", action="store_true", dest="no_compress", help="Skip tar.gz packing; leave output as a plain directory (for inspection)")
     parser.add_argument("--force", action="store_true", dest="force", help="Remove an existing extracted build directory beside the output tarball before writing")

@@ -179,6 +179,27 @@ class DeezUtils:
     """
 
     @staticmethod
+    def template_path(path: str) -> str:
+        """Convert absolute XDG/home paths to ${VAR} for manifest portability."""
+        subs = [
+            (DeezUtils.xdg_config_home(), "${XDG_CONFIG_HOME}"),
+            (DeezUtils.xdg_data_home(), "${XDG_DATA_HOME}"),
+            (DeezUtils.xdg_cache_home(), "${XDG_CACHE_HOME}"),
+            (DeezUtils.home_dir(), "${HOME}"),
+        ]
+        norm = os.path.normpath(str(path))
+        for real, var in subs:
+            real_norm = os.path.normpath(str(real))
+            if norm == real_norm:
+                return var
+            if norm.startswith(real_norm + os.sep):
+                return var + norm[len(real_norm):]
+        home = os.path.expanduser("~")
+        if norm.startswith(home + os.sep):
+            return "${HOME}" + norm[len(home):]
+        return path
+
+    @staticmethod
     def normalize_owner(owner: Optional[str]) -> str:
         """Normalize a dot owner string into a canonical lowercase identifier."""
         if not owner:
@@ -847,16 +868,19 @@ class ManifestManager:
 
     @staticmethod
     def _serialize(meta: Dict[str, Any], file_pairs: List[Union[Tuple[str, str], Dict[str, Any]]]) -> bytes:
-        def normalize_value(value: Any) -> Any:
+        def normalize_value(value: Any, key: str = "") -> Any:
+            # Template all paths for portability
             if isinstance(value, Path):
-                return str(value)
+                value = str(value)
+            if key in {"src", "dst", "source", "source_root"} and isinstance(value, str):
+                return DeezUtils.template_path(value)
             return value
 
         def is_table_array(value: Any) -> bool:
             return isinstance(value, list) and all(isinstance(item, dict) for item in value)
 
-        def format_scalar(value: Any) -> str:
-            value = normalize_value(value)
+        def format_scalar(value: Any, key: str = "") -> str:
+            value = normalize_value(value, key)
             if isinstance(value, bool):
                 return "true" if value else "false"
             if isinstance(value, int):
@@ -867,12 +891,12 @@ class ManifestManager:
         def append_key_value(lines: List[str], key: str, value: Any) -> None:
             if value is None:
                 return
-            value = normalize_value(value)
+            value = normalize_value(value, key)
             if isinstance(value, list) and not is_table_array(value):
-                items = ", ".join(format_scalar(item) for item in value)
+                items = ", ".join(format_scalar(item, key) for item in value)
                 lines.append(f"{key} = [{items}]")
                 return
-            lines.append(f"{key} = {format_scalar(value)}")
+            lines.append(f"{key} = {format_scalar(value, key)}")
 
         def append_table_array(lines: List[str], table_name: str, blocks: List[Dict[str, Any]]) -> None:
             for block in blocks:
@@ -904,10 +928,10 @@ class ManifestManager:
         serialized_files: List[Dict[str, Any]] = []
         for file_pair in file_pairs:
             if isinstance(file_pair, dict):
-                serialized_files.append({k: normalize_value(v) for k, v in file_pair.items() if v is not None})
+                serialized_files.append({k: normalize_value(v, k) for k, v in file_pair.items() if v is not None})
             else:
                 src, dst = file_pair
-                serialized_files.append({"src": normalize_value(src), "dst": normalize_value(dst)})
+                serialized_files.append({"src": normalize_value(src, "src"), "dst": normalize_value(dst, "dst")})
         append_table_array(lines, "files", serialized_files)
         return "\n".join(lines).encode("utf-8")
 
@@ -943,11 +967,39 @@ class ManifestManager:
         """Return tracked installed destination file paths for a dot."""
         raw = self._load_raw(dot)
         files = raw.get("files", [])
-        return [e["dst"] for e in files if e.get("installed", True)]
+        return [DeezUtils.expand(e["dst"]) for e in files if e.get("installed", True) and e.get("dst")]
 
     def get_file_entries(self, dot: str) -> List[Dict[str, Any]]:
         """Return the raw file entry definitions for a tracked dot."""
         return self._load_raw(dot).get("files", [])
+
+    def get_directory_entries(self, dot: str) -> List[Dict[str, Any]]:
+        """Return the raw directory entry definitions for a tracked dot."""
+        raw_directories = self._load_raw(dot).get("directories", [])
+        if isinstance(raw_directories, dict):
+            dst_values = raw_directories.get("dst")
+            if isinstance(dst_values, list):
+                return [{"dst": dst} for dst in dst_values if dst]
+            return [raw_directories]
+        if isinstance(raw_directories, list):
+            if raw_directories and all(isinstance(item, str) for item in raw_directories):
+                return [{"dst": dst} for dst in raw_directories if dst]
+            return [entry for entry in raw_directories if isinstance(entry, dict)]
+        return []
+
+    def get_directories(self, dot: str) -> List[str]:
+        """Return tracked installed destination directories for a dot."""
+        raw = self._load_raw(dot).get("directories", [])
+        if isinstance(raw, dict):
+            dst_values = raw.get("dst")
+            if isinstance(dst_values, list):
+                return [dst for dst in dst_values if isinstance(dst, str)]
+            return []
+        if isinstance(raw, list):
+            if raw and all(isinstance(item, str) for item in raw):
+                return [dst for dst in raw if dst]
+            return [entry["dst"] for entry in raw if isinstance(entry, dict) and entry.get("dst")]
+        return []
 
     def remove_dot(self, dot: str) -> None:
         """Remove the manifest for an installed dot from storage."""
@@ -1222,10 +1274,10 @@ class WriteDots:
             backed_pairs: List[Dict[str, Any]] = []
             for entry in file_entries:
                 if isinstance(entry, dict):
-                    dst_abs = entry.get("dst")
+                    dst_abs = DeezUtils.expand(entry.get("dst"))
                     action = entry.get("action", "sync")
                 else:
-                    dst_abs = entry
+                    dst_abs = DeezUtils.expand(entry)
                     action = "sync"
                 if not dst_abs:
                     continue
@@ -1300,6 +1352,28 @@ class WriteDots:
             return
         if candidate.exists():
             shutil.rmtree(candidate)
+
+    @staticmethod
+    def _remove_empty_directories(directory_paths: Iterable[Union[str, Path]]) -> None:
+        paths = sorted(
+            {str(Path(path)) for path in directory_paths if path is not None},
+            key=lambda p: len(Path(p).parts),
+            reverse=True,
+        )
+        for raw_path in paths:
+            candidate = Path(raw_path)
+            if not candidate.is_dir():
+                continue
+            try:
+                next(candidate.iterdir())
+                continue
+            except StopIteration:
+                try:
+                    candidate.rmdir()
+                    LOG.debug("Removed empty directory %s", candidate)
+                except Exception as e:
+                    LOG.warning("Failed to remove empty directory %s: %s", candidate, e)
+                    UI.error(f"Failed to remove empty directory {candidate}: {e}")
 
     @staticmethod
     def _copy_symlink(source_path: Union[str, Path], staged_path: Union[str, Path]) -> None:
@@ -1844,6 +1918,13 @@ class WriteDots:
             except Exception as e:
                 LOG.warning("Failed to remove %s: %s", tgt_path, e)
                 UI.error(f"Failed to remove {tgt_path}: {e}")
+
+        directories = [entry.get("dst") for entry in manifest_manager.get_directory_entries(dot) if entry.get("dst")]
+        if not directories:
+            directories = [str(Path(p).parent) for p in tracked if p]
+        writer = WriteDots()
+        writer._remove_empty_directories(directories)
+
         manifest_manager.mark_removed(dot)
         UI.success(f"Uninstalled {dot}")
 
@@ -2005,16 +2086,17 @@ class GitHandler:
         self._extract_archive(archive_path, extract_root)
         return str(self._discover_extracted_root(extract_root))
 
-    def prepare_git_source(self, git_url: str, target_branch: str) -> str:
+    def prepare_git_source(self, git_url: str, target_branch: str, skip_git: bool = False) -> str:
         """Clone or refresh a git source repository into the local cache."""
         repo_owner, repo_name = self.get_git_owner_name(git_url)
         cache_root = os.getenv("XDG_CACHE_HOME", DeezUtils.xdg_cache_home())
         source_root_path = Path(self.source_cache_path(cache_root, repo_owner, repo_name, target_branch))
         if not source_root_path.exists():
             self.git_clone(git_url, source_root_path, target_branch)
-        self.git_fetch(source_root_path, target_branch)
-        self.git_pull(source_root_path, target_branch)
-        self.git_checkout(source_root_path, target_branch)
+        if not skip_git:
+            self.git_fetch(source_root_path, target_branch)
+            self.git_pull(source_root_path, target_branch)
+            self.git_checkout(source_root_path, target_branch)
         return str(source_root_path)
 
     def prepare_source(
@@ -2024,6 +2106,7 @@ class GitHandler:
         target_branch: str,
         *,
         explicit_source_path: bool = False,
+        skip_git: bool = False,
     ) -> str:
         """Resolve a source path or git URL to a local source directory."""
         source_text = DeezUtils.expand(str(source_dir or "").strip())
@@ -2073,9 +2156,10 @@ class GitHandler:
                     configured_remote or "(missing)",
                 )
                 return str(source_path)
-            self.git_fetch(source_path, target_branch)
-            self.git_pull(source_path, target_branch)
-            self.git_checkout(source_path, target_branch)
+            if not skip_git:
+                self.git_fetch(source_path, target_branch)
+                self.git_pull(source_path, target_branch)
+                self.git_checkout(source_path, target_branch)
             return str(source_path)
         if not git_url:
             raise RuntimeError(f"Source directory '{source_path}' does not exist and no git URL provided.")
@@ -2331,7 +2415,7 @@ class DeezCLI:
         self.args = args
         self.main_config = main_config
         self.source_dir = source_dir
-        self.target_root = target_root
+        self.target_root = str(DeezUtils.expand(target_root or DeezUtils.home_dir()))
         self.version = version
         self.available_package_managers = available_package_managers
         self.distribution = distribution
@@ -2589,9 +2673,9 @@ class DeezCLI:
     @staticmethod
     def _display_path_parts(path_text: str, home: Optional[Path] = None) -> List[str]:
         path = Path(path_text).expanduser()
-        home = home or Path(DeezUtils.home_dir())
+        home_path = Path(home or Path(DeezUtils.home_dir())).expanduser()
         try:
-            relative = path.relative_to(home)
+            relative = path.relative_to(home_path)
             return ["~", *relative.parts] or ["~"]
         except ValueError:
             parts = list(path.parts)
@@ -2665,7 +2749,16 @@ class DeezCLI:
         return [target]
 
     def _render_filetree_for_dot(self, dot: str) -> None:
-        entries = [entry for entry in self.manifest_manager.get_file_entries(dot) if entry.get("installed", True) and entry.get("dst")]
+        raw_entries = self.manifest_manager.get_file_entries(dot)
+        entries = []
+        for entry in raw_entries:
+            raw_dst = str(DeezUtils.expand(entry.get("dst") or "")).strip()
+            if not raw_dst:
+                continue
+            dst = os.path.normpath(raw_dst)
+            if not entry.get("installed", True) and not self._path_exists_or_link(Path(dst)):
+                continue
+            entries.append(entry)
         desc = self.manifest_manager.load_desc(dot)
         owner = self._selection_color(str(desc.get("owner", "?")), InteractiveMenu._YELLOW)
         colored_dot = self._selection_color(dot, InteractiveMenu._CYAN, bold=True)
@@ -2675,9 +2768,10 @@ class DeezCLI:
             return
         tree: Dict[str, Any] = {"children": {}}
         for entry in entries:
-            dst = str(entry.get("dst") or "").strip()
-            if not dst:
+            dst_raw = str(DeezUtils.expand(entry.get("dst") or "")).strip()
+            if not dst_raw:
                 continue
+            dst = os.path.normpath(dst_raw)
             self._insert_tree_path(tree, self._display_path_parts(dst, home=Path(self.target_root)), exists=self._path_exists_or_link(Path(dst)))
         for line in self._render_tree_lines(tree):
             UI.plain(f"  {line}")
@@ -2693,9 +2787,10 @@ class DeezCLI:
                 for entry in self.manifest_manager.get_file_entries(dot):
                     if not entry.get("installed", True):
                         continue
-                    dst = str(entry.get("dst") or "").strip()
-                    if not dst:
+                    raw_dst = str(DeezUtils.expand(entry.get("dst") or "")).strip()
+                    if not raw_dst:
                         continue
+                    dst = os.path.normpath(raw_dst)
                     self._insert_tree_path(tree, self._display_path_parts(dst, home=Path(self.target_root)), owner=dot, exists=self._path_exists_or_link(Path(dst)))
             for line in self._render_tree_lines(tree):
                 UI.plain(line)
@@ -2704,7 +2799,15 @@ class DeezCLI:
 
     def _healthcheck_dot(self, dot: str) -> Dict[str, Any]:
         desc = self.manifest_manager.load_desc(dot)
-        tracked_entries = [entry for entry in self.manifest_manager.get_file_entries(dot) if entry.get("installed", True) and entry.get("dst")]
+        tracked_entries = []
+        for entry in self.manifest_manager.get_file_entries(dot):
+            raw_dst = str(DeezUtils.expand(entry.get("dst") or "")).strip()
+            if not raw_dst:
+                continue
+            dst = os.path.normpath(raw_dst)
+            if not entry.get("installed", True) and not self._path_exists_or_link(Path(dst)):
+                continue
+            tracked_entries.append(entry)
         expected_bundle_hash = str(desc.get("hash") or "").strip()
         bundle_path = self.cache_manager.bundle_path_for_hash(expected_bundle_hash)
         bundle_available = False
@@ -2722,7 +2825,7 @@ class DeezCLI:
             "bundle_available": bundle_available,
         }
         for entry in tracked_entries:
-            dst = str(entry.get("dst") or "").strip()
+            dst = os.path.normpath(str(DeezUtils.expand(entry.get("dst") or "")).strip())
             if not dst:
                 continue
             path = Path(dst)
@@ -3345,8 +3448,9 @@ class DeezCLI:
         kept_pairs: List[Tuple[str, str]] = []
         for bundle_entry in bundle_entries:
             src_rel = bundle_entry.get("src")
-            dst_abs = bundle_entry.get("dst")
-            if not src_rel or not dst_abs:
+            dst_raw = bundle_entry.get("dst")
+            dst_abs = os.path.normpath(str(DeezUtils.expand(dst_raw))) if dst_raw else ""
+            if not src_rel or not dst_raw or not dst_abs:
                 continue
             owner_dot = owner_index.get(dst_abs)
             if owner_dot and owner_dot != dot:
@@ -3354,20 +3458,22 @@ class DeezCLI:
                 continue
             conflict_hit = False
             for conflict_path in self._normalize_conflicted_paths(bundle_entry.get("conflicted_paths")):
+                conflict_path = os.path.normpath(str(DeezUtils.expand(conflict_path))) if conflict_path else ""
                 owner_dot = owner_index.get(conflict_path)
                 if owner_dot and owner_dot != dot:
                     UI.error(f"File conflict: {conflict_path} (owned by {owner_dot})")
                     conflict_hit = True
             if conflict_hit:
                 continue
-            kept_pairs.append((src_rel, dst_abs))
+            kept_pairs.append((src_rel, dst_raw))
         return True, kept_pairs
 
     def _collect_installed_export_paths(self, dot: str, home_dir: str) -> Tuple[List[str], Dict[str, str]]:
         relative_paths: List[str] = []
         action_by_path: Dict[str, str] = {}
         for file_entry in self.manifest_manager.get_file_entries(dot):
-            destination_path = os.path.abspath(file_entry.get("dst", ""))
+            raw_dst = DeezUtils.expand(file_entry.get("dst", "") or "")
+            destination_path = os.path.abspath(os.path.normpath(str(raw_dst))) if raw_dst else ""
             if destination_path.startswith(home_dir + os.sep) or destination_path == home_dir:
                 relative_path = os.path.relpath(destination_path, home_dir)
                 relative_paths.append(relative_path)
@@ -3679,7 +3785,8 @@ class DeezCLI:
                 clean_target = bundle.get("clean_target", False)
                 for file_entry in filtered_entries:
                     source_rel_path = file_entry.get("src")
-                    destination_path = file_entry.get("dst")
+                    destination_path = DeezUtils.expand(file_entry.get("dst"))
+                    destination_path = os.path.normpath(str(destination_path)) if destination_path else ""
                     entry_action = DeezUtils.normalize_action(file_entry.get("action"))
                     source_path = bundle_data_dir / source_rel_path
                     if not writer._path_exists_or_link(source_path):
@@ -3705,17 +3812,42 @@ class DeezCLI:
                 cached_pkg = cache_dir / f"{digest}.tar.gz"
                 if not cached_pkg.exists():
                     shutil.copy2(bundle_path, cached_pkg)
-                deployed_keys = {(e["src"], e["dst"]) for e in deployed_pairs}
+                deployed_keys = {
+                    (
+                        str(e.get("src") or ""),
+                        os.path.normpath(str(e.get("dst") or "")),
+                    )
+                    for e in deployed_pairs
+                }
                 all_entries: List[Dict[str, Any]] = []
                 for file_entry in bundle_entries:
-                    entry_key = (file_entry.get("src"), file_entry.get("dst"))
+                    entry_key = (
+                        str(file_entry.get("src") or ""),
+                        os.path.normpath(str(DeezUtils.expand(file_entry.get("dst")) or "")),
+                    )
                     manifest_entry = {k: v for k, v in file_entry.items() if k != "installed"}
                     manifest_entry["src"] = file_entry.get("src")
                     manifest_entry["dst"] = file_entry.get("dst")
                     manifest_entry["action"] = DeezUtils.normalize_action(file_entry.get("action"))
                     manifest_entry["installed"] = entry_key in deployed_keys
                     all_entries.append(manifest_entry)
+                directories: List[str] = []
+                seen_dirs = set()
+                for file_entry in bundle_entries:
+                    dst = file_entry.get("dst")
+                    if not dst:
+                        continue
+                    parent_dir = Path(dst).parent
+                    if parent_dir == Path(dst):
+                        continue
+                    dst_dir = str(parent_dir)
+                    if dst_dir not in seen_dirs:
+                        seen_dirs.add(dst_dir)
+                        directories.append(dst_dir)
+
                 meta = {k: v for k, v in bundle.items() if k != "files"}
+                if directories:
+                    meta["directories"] = directories
                 meta["hash"] = digest
                 meta["installdate"] = str(int(time.time()))
                 meta.pop("removeddate", None)
@@ -3793,7 +3925,7 @@ class DeezCLI:
         for dot in selected_dots:
             # Only remove files with action 'sync', leave 'preserve' files untouched
             manifest_entries = self.manifest_manager.get_file_entries(dot)
-            sync_files = [entry["dst"] for entry in manifest_entries if DeezUtils.normalize_action(entry.get("action")) == "sync"]
+            sync_files = [DeezUtils.expand(entry["dst"]) for entry in manifest_entries if entry.get("dst") and DeezUtils.normalize_action(entry.get("action")) == "sync"]
             if dry_run:
                 UI.plain(f"[DRY RUN] [UNINSTALL] Would remove dot '{dot}' with {len(sync_files)} sync-tracked files.")
                 for target_path in sync_files:
@@ -3805,8 +3937,9 @@ class DeezCLI:
                     LOG.debug(f"Removed sync file: {target_path}")
                 except Exception as e:
                     LOG.warning(f"Failed to remove {target_path}: {e}")
-            if remove_manifest and not dry_run:
+            if not dry_run:
                 self.manifest_manager.remove_dot(dot)
+                UI.success(f"Uninstalled {dot}")
 
     def _do_restore(self, dots: Optional[List[str]] = None, dry_run: bool = False) -> None:
         all_backup_dots = self._backup_dots()
@@ -3915,10 +4048,11 @@ class DeezCLI:
         tree: Dict[str, Any] = {"children": {}}
         for dot in dots:
             for entry in self.manifest_manager.get_file_entries(dot):
-                if not entry.get("installed", True):
+                raw_dst = str(DeezUtils.expand(entry.get("dst") or "")).strip()
+                if not raw_dst:
                     continue
-                dst = str(entry.get("dst") or "").strip()
-                if not dst:
+                dst = os.path.normpath(raw_dst)
+                if not entry.get("installed", True) and not self._path_exists_or_link(Path(dst)):
                     continue
                 self._insert_tree_path(tree, self._display_path_parts(dst, home=Path(self.target_root)), owner=dot, exists=self._path_exists_or_link(Path(dst)))
         return {
@@ -4046,7 +4180,7 @@ def create_deez_cli(
         args,
         main_config or {},
         source_dir or "",
-        target_root or DeezUtils.home_dir(),
+        str(DeezUtils.expand(target_root)) if target_root else str(DeezUtils.expand(DeezUtils.home_dir())),
         version or "unknown",
         available_package_managers if available_package_managers is not None else [],
         distribution,
