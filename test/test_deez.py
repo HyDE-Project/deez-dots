@@ -162,7 +162,14 @@ class TestDeezCLI(unittest.TestCase):
             file_path = stage_dir / rel_path
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content)
-        with tarfile.open(archive_path, "w:gz") as tar:
+        archive_name = archive_path.name.lower()
+        if archive_name.endswith(".tar.xz") or archive_name.endswith(".txz"):
+            tar_mode = "w:xz"
+        elif archive_name.endswith(".tar.gz") or archive_name.endswith(".tgz"):
+            tar_mode = "w:gz"
+        else:
+            tar_mode = "w:gz"
+        with tarfile.open(archive_path, tar_mode) as tar:
             tar.add(stage_dir, arcname="payload")
         return archive_path
 
@@ -1311,6 +1318,28 @@ class TestDeezCLI(unittest.TestCase):
             {".config/kitty/kitty.conf": "font_size 12"},
         )
         config_path = Path(self.tmpdir.name) / "tarball-source.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{archive_path}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled kitty ->", result.stdout)
+
+    def test_dots_package_supports_local_tarball_xz_source(self):
+        archive_path = self._make_source_archive(
+            Path(self.tmpdir.name) / "assets.tar.xz",
+            {".config/kitty/kitty.conf": "font_size 12"},
+        )
+        config_path = Path(self.tmpdir.name) / "tarball-source-xz.toml"
         config_path.write_text(
             '[global]\n'
             f'home = "{self.home_dir}"\n'

@@ -1991,7 +1991,14 @@ class GitHandler:
     def is_release(url: str) -> bool:
         """Return True if the URL points to an archive release artifact."""
         lowered = str(url or "").strip().lower()
-        return lowered.endswith(".tar.gz") or lowered.endswith(".tgz") or lowered.endswith(".tar") or lowered.endswith(".zip")
+        return (
+            lowered.endswith(".tar.gz")
+            or lowered.endswith(".tgz")
+            or lowered.endswith(".tar.xz")
+            or lowered.endswith(".txz")
+            or lowered.endswith(".tar")
+            or lowered.endswith(".zip")
+        )
 
     @staticmethod
     def file_url_to_path(url: str) -> Path:
