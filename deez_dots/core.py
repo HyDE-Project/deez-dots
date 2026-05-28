@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import re
 import tarfile
 import tempfile
 import time
@@ -16,6 +17,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from fnmatch import fnmatchcase
+from itertools import zip_longest
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -49,6 +51,78 @@ def _normalize_description(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return " ".join(value.split())
+
+
+def _tokenize_version_segment(segment: str) -> list[tuple[int, str | int]]:
+    tokens: list[tuple[int, str | int]] = []
+    if not isinstance(segment, str):
+        return tokens
+    for chunk in re.split(r"[._]", segment):
+        if not chunk:
+            continue
+        pos = 0
+        while pos < len(chunk):
+            if chunk[pos].isdigit():
+                match = re.match(r"\d+", chunk[pos:])
+                assert match
+                tokens.append((1, int(match.group(0))))
+                pos += len(match.group(0))
+            else:
+                match = re.match(r"[A-Za-z]+", chunk[pos:])
+                if match:
+                    tokens.append((0, match.group(0).lower()))
+                    pos += len(match.group(0))
+                else:
+                    tokens.append((0, chunk[pos:].lower()))
+                    break
+    return tokens
+
+
+def _parse_version(version: Any) -> tuple[int, list[tuple[int, str | int]], list[tuple[int, str | int]]]:
+    if version is None:
+        return 0, [], []
+    version_text = str(version).strip()
+    epoch = 0
+    if ":" in version_text:
+        maybe_epoch, remainder = version_text.split(":", 1)
+        if maybe_epoch.isdigit():
+            epoch = int(maybe_epoch)
+            version_text = remainder
+    if "-" in version_text:
+        base_text, release_text = version_text.rsplit("-", 1)
+    else:
+        base_text, release_text = version_text, ""
+    return epoch, _tokenize_version_segment(base_text), _tokenize_version_segment(release_text)
+
+
+def _compare_version_token_lists(
+    left: list[tuple[int, str | int]],
+    right: list[tuple[int, str | int]],
+) -> int:
+    for left_token, right_token in zip_longest(left, right):
+        if left_token is None and right_token is None:
+            return 0
+        if left_token is None:
+            return 1 if right_token[0] == 0 else -1
+        if right_token is None:
+            return -1 if left_token[0] == 0 else 1
+        if left_token == right_token:
+            continue
+        if left_token[0] != right_token[0]:
+            return -1 if left_token[0] < right_token[0] else 1
+        return -1 if left_token[1] < right_token[1] else 1
+    return 0
+
+
+def compare_versions(old: Any, new: Any) -> int:
+    old_epoch, old_base, old_revision = _parse_version(old)
+    new_epoch, new_base, new_revision = _parse_version(new)
+    if old_epoch != new_epoch:
+        return -1 if old_epoch < new_epoch else 1
+    base_cmp = _compare_version_token_lists(old_base, new_base)
+    if base_cmp != 0:
+        return base_cmp
+    return _compare_version_token_lists(old_revision, new_revision)
 
 
 def default_run_command(
@@ -2001,6 +2075,66 @@ class GitHandler:
         )
 
     @staticmethod
+    def is_file_source_url(source: Optional[Union[str, Path]]) -> bool:
+        """Return True if the URL points to a single file source."""
+        parsed = urllib.parse.urlparse(str(source or "").strip())
+        if parsed.scheme not in ("http", "https", "file"):
+            return False
+        if GitHandler.is_release(str(source)):
+            return False
+        path = parsed.path.rstrip("/")
+        suffix = Path(path).suffix
+        if suffix == ".git":
+            return False
+        return bool(suffix)
+
+    @staticmethod
+    def normalize_file_source_url(source: str) -> str:
+        """Rewrite known file source URLs into direct download URLs."""
+        source_text = str(source or "").strip()
+        parsed = urllib.parse.urlparse(source_text)
+        if parsed.scheme in ("http", "https") and parsed.netloc == "github.com":
+            parts = parsed.path.split("/")
+            if len(parts) >= 6 and parts[3] == "blob":
+                user, repo, branch = parts[1], parts[2], parts[4]
+                raw_path = "/".join(parts[5:])
+                return f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{raw_path}"
+        return source_text
+
+    def prepare_file_source(self, source: Union[str, Path]) -> str:
+        """Download or copy a single file source into cache and return its content directory."""
+        source_text = str(source).strip()
+        if self.is_source_url(source_text):
+            source_text = self.normalize_file_source_url(source_text)
+        cache_key = self.archive_cache_key(source_text)
+        cache_root = self.source_cache_dir / "files" / cache_key
+        content_root = cache_root / "content"
+        if content_root.exists() and any(content_root.iterdir()):
+            return str(content_root)
+
+        shutil.rmtree(cache_root, ignore_errors=True)
+        content_root.mkdir(parents=True, exist_ok=True)
+        file_name = Path(urllib.parse.urlparse(source_text).path).name or "source"
+        cached_file = content_root / file_name
+
+        if self.is_source_url(source_text):
+            parsed = urllib.parse.urlparse(source_text)
+            if parsed.scheme == "file":
+                local_file = self.file_url_to_path(source_text)
+                if not local_file.is_file():
+                    raise RuntimeError(f"Source file '{local_file}' does not exist.")
+                shutil.copy2(local_file, cached_file)
+            else:
+                urllib.request.urlretrieve(source_text, str(cached_file))
+        else:
+            local_file = Path(DeezUtils.expand(source_text))
+            if not local_file.is_file():
+                raise RuntimeError(f"Source file '{local_file}' does not exist.")
+            shutil.copy2(local_file, cached_file)
+
+        return str(content_root)
+
+    @staticmethod
     def file_url_to_path(url: str) -> Path:
         """Convert a file:// URL into a local filesystem path."""
         parsed = urllib.parse.urlparse(url)
@@ -2121,21 +2255,23 @@ class GitHandler:
             if self.is_source_url(source_text):
                 if self.is_release(source_text):
                     return self.prepare_archive_source(source_text)
-                if urllib.parse.urlparse(source_text).scheme == "file":
+                parsed = urllib.parse.urlparse(source_text)
+                if parsed.scheme == "file":
                     local_path = self.file_url_to_path(source_text)
                     if local_path.is_dir():
                         source_text = str(local_path)
-                    elif local_path.is_file() and self.is_release(str(local_path)):
-                        return self.prepare_archive_source(local_path)
+                    elif local_path.is_file():
+                        return self.prepare_file_source(local_path)
                     else:
                         raise RuntimeError(f"Source path '{local_path}' is not a directory or supported archive.")
-                else:
-                    return self.prepare_git_source(source_text, target_branch)
+                if self.is_file_source_url(source_text):
+                    return self.prepare_file_source(source_text)
+                return self.prepare_git_source(source_text, target_branch)
             source_path = Path(source_text)
             if source_path.exists() and source_path.is_file():
                 if self.is_release(str(source_path)):
                     return self.prepare_archive_source(source_path)
-                raise RuntimeError(f"Source path '{source_path}' is not a directory or supported archive.")
+                return self.prepare_file_source(source_path)
         else:
             source_path = Path(source_text)
         if source_path.exists():
@@ -2291,6 +2427,10 @@ class GitHandler:
         except Exception as e:
             LOG.warning("Could not get git hash for %s: %s", repo_path, e)
         return ""
+
+
+class BundleFileConflictError(Exception):
+    """Raised when a bundle install contains a non-recoverable file conflict."""
 
 
 class InteractiveMenu:
@@ -3454,6 +3594,7 @@ class DeezCLI:
                 return False, []
         owner_index = self.manifest_manager.build_owner_index()
         kept_pairs: List[Tuple[str, str]] = []
+        conflict_found = False
         for bundle_entry in bundle_entries:
             src_rel = bundle_entry.get("src")
             dst_raw = bundle_entry.get("dst")
@@ -3463,6 +3604,7 @@ class DeezCLI:
             owner_dot = owner_index.get(dst_abs)
             if owner_dot and owner_dot != dot:
                 UI.error(f"File conflict: {dst_abs} (owned by {owner_dot})")
+                conflict_found = True
                 continue
             conflict_hit = False
             for conflict_path in self._normalize_conflicted_paths(bundle_entry.get("conflicted_paths")):
@@ -3472,8 +3614,11 @@ class DeezCLI:
                     UI.error(f"File conflict: {conflict_path} (owned by {owner_dot})")
                     conflict_hit = True
             if conflict_hit:
+                conflict_found = True
                 continue
             kept_pairs.append((src_rel, dst_raw))
+        if conflict_found:
+            raise BundleFileConflictError(f"File conflicts detected while preparing bundle '{dot}'")
         return True, kept_pairs
 
     def _collect_installed_export_paths(self, dot: str, home_dir: str) -> Tuple[List[str], Dict[str, str]]:
@@ -3508,6 +3653,7 @@ class DeezCLI:
         bundle_path: Path,
         bundle: Dict[str, Any],
         dry_run: bool = False,
+        uninstall_existing: bool = False,
     ) -> Optional[Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], List[Tuple[str, str]]]]:
         dot = bundle.get("name")
         if not dot:
@@ -3525,7 +3671,11 @@ class DeezCLI:
         if existing_desc:
             existing_owner = existing_desc.get("owner", "unknown")
             existing_version = existing_desc.get("version", "unknown")
-            if existing_owner != bundle_owner:
+            if uninstall_existing:
+                ignore_existing_dot_conflict = True
+                if dry_run:
+                    UI.plain(f"[DRY RUN] Would uninstall installed dot '{dot}' owned by {existing_owner}.")
+            elif existing_owner != bundle_owner:
                 prompt = (
                     f"Dot '{dot}' version {existing_version} owned by {existing_owner} is installed. "
                     f"Overwrite with version {bundle_version} owned by {bundle_owner}?"
@@ -3533,24 +3683,38 @@ class DeezCLI:
                 if not InteractiveMenu.confirm(prompt, default=False):
                     UI.info("Skipped existing dot due to conflict.")
                     return None
+                ignore_existing_dot_conflict = True
                 if dry_run:
                     UI.plain(f"[DRY RUN] Would uninstall installed dot '{dot}' owned by {existing_owner}.")
-                    ignore_existing_dot_conflict = True
-                else:
-                    UI.set_loader_message(f"Uninstalling previous '{dot}' (if installed)...")
-                    self._do_uninstall([dot], dry_run=False, confirm=False, remove_manifest=True)
-                    ignore_existing_dot_conflict = True
+            elif existing_version and bundle_version and compare_versions(existing_version, bundle_version) > 0:
+                prompt = (
+                    f"Dot '{dot}' version {existing_version} owned by {existing_owner} is installed. "
+                    f"Overwrite with version {bundle_version} owned by {bundle_owner}?"
+                )
+                if not InteractiveMenu.confirm(prompt, default=False):
+                    UI.info("Skipped existing dot due to conflict.")
+                    return None
+                ignore_existing_dot_conflict = True
+                if dry_run:
+                    UI.plain(f"[DRY RUN] Would uninstall installed dot '{dot}' owned by {existing_owner}.")
 
-        ok, kept_pairs = self._check_conflicts_from_bundle(
-            dot,
-            bundle_owner,
-            bundle_entries,
-            bundle.get("conflicts"),
-            ignore_installed_dot=ignore_existing_dot_conflict,
-        )
+        try:
+            ok, kept_pairs = self._check_conflicts_from_bundle(
+                dot,
+                bundle_owner,
+                bundle_entries,
+                bundle.get("conflicts"),
+                ignore_installed_dot=ignore_existing_dot_conflict,
+            )
+        except BundleFileConflictError:
+            if dry_run:
+                UI.info(f"'{dot}' skipped due to conflict.")
+                return None
+            raise SystemExit(1)
         if not ok or not kept_pairs:
             UI.info(f"'{dot}' skipped due to conflict.")
             return None
+
         kept_pair_set = set(kept_pairs)
         filtered_entries = [
             bundle_entry
@@ -3721,7 +3885,7 @@ class DeezCLI:
                 )
         UI.info("Export complete")
 
-    def _do_install(self, tarballs: List[str], dry_run: bool = False, prechecked_dependencies: bool = False) -> None:
+    def _do_install(self, tarballs: List[str], dry_run: bool = False, prechecked_dependencies: bool = False, uninstall_existing: bool = False) -> None:
         writer = WriteDots()
         no_backup = getattr(self.args, "no_backup", False)
         planned_installs: List[Tuple[Path, Dict[str, Any], Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], List[Tuple[str, str]]]]] = []
@@ -3734,7 +3898,7 @@ class DeezCLI:
                 bundle = self._read_bundle_manifest(bundle_path)
                 if bundle is None:
                     continue
-                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle, dry_run=dry_run)
+                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle, dry_run=dry_run, uninstall_existing=uninstall_existing)
                 if prepared_bundle is None:
                     continue
                 planned_installs.append((bundle_path, bundle, prepared_bundle))
@@ -3750,7 +3914,7 @@ class DeezCLI:
                 bundle = self._read_bundle_manifest(bundle_path)
                 if bundle is None:
                     continue
-                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle, dry_run=dry_run)
+                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle, dry_run=dry_run, uninstall_existing=uninstall_existing)
                 if prepared_bundle is None:
                     continue
                 dot, _bundle_entries, filtered_entries, kept_pairs = prepared_bundle
@@ -3769,7 +3933,7 @@ class DeezCLI:
                     continue
                 with manifest_path.open("rb") as f:
                     bundle = toml.load(f)
-                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle, dry_run=dry_run)
+                prepared_bundle = self._prepare_bundle_install(bundle_path, bundle, dry_run=dry_run, uninstall_existing=uninstall_existing)
                 if prepared_bundle is None:
                     continue
                 dot, bundle_entries, filtered_entries, _kept_pairs = prepared_bundle
@@ -3794,6 +3958,8 @@ class DeezCLI:
                         backup_path = writer.backup_to_tarball(dot, filtered_entries, desc_data=backup_desc)
                     if backup_path:
                         self._backed_up_dots.add(dot)
+                if uninstall_existing and not dry_run:
+                    self._do_uninstall([dot], dry_run=False, confirm=False, remove_manifest=True)
                 deployed_pairs: List[Dict[str, Any]] = []
                 adopted_pairs: List[Dict[str, Any]] = []
                 bundle_data_dir = temp_install_dir / "data"

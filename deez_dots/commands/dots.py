@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import CommandModule, normalize_requested_sections
-from ..core import DeezUtils, GitHandler, LOG, WriteDots
+from ..core import DeezUtils, GitHandler, LOG, WriteDots, compare_versions
 from ..ui import UI
 
 
@@ -189,9 +189,14 @@ def _should_overwrite_installed_dot(cli: Any, dot: str, new_owner: str | None, n
         return True
     old_owner = existing_desc.get("owner")
     old_version = existing_desc.get("version")
+    same_owner = bool(old_owner and new_owner and old_owner == new_owner)
+    if same_owner and old_version and new_version:
+        version_cmp = compare_versions(old_version, new_version)
+        if version_cmp <= 0:
+            return True
     conflict = bool(
         (old_owner and new_owner and old_owner != new_owner)
-        or (old_version and new_version and old_version != new_version)
+        or (old_version and new_version and compare_versions(old_version, new_version) != 0)
     )
     if not conflict:
         return True
@@ -215,21 +220,12 @@ def _deploy_dot(cli: Any, context: DotsRuntimeContext, dot: str, pkg_path: str) 
     _run_global_action(
         cli,
         context,
-        f"Uninstalling previous '{dot}' (if installed)...",
-        cli._do_uninstall,
-        [dot],
-        context.dry_run,
-        confirm=False,
-        remove_manifest=True,
-    )
-    _run_global_action(
-        cli,
-        context,
         f"Installing new '{dot}'...",
         cli._do_install,
         [pkg_path],
         context.dry_run,
         prechecked_dependencies=True,
+        uninstall_existing=True,
     )
 
 
@@ -329,11 +325,12 @@ def execute(cli: Any) -> None:
                 UI.error("Deploy failed: bundling produced no bundles.")
                 raise SystemExit(1)
             dot_to_pkg = _find_pkg_for_dots(pkg_paths, selected_sections)
+            missing_dots = [dot for dot in selected_sections if dot not in dot_to_pkg]
+            if missing_dots:
+                UI.error(f"Deploy failed: bundling failed for selected dots: {', '.join(missing_dots)}.")
+                raise SystemExit(1)
             for dot in selected_sections:
                 pkg_path = dot_to_pkg.get(dot)
-                if not pkg_path:
-                    UI.error(f"No package found for dot '{dot}' after bundling.")
-                    continue
                 _deploy_dot(cli, context, dot, pkg_path)
             if hook_runner is not None:
                 hook_runner.execute_commands([context.global_post_command], cwd=cli.source_dir)

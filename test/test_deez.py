@@ -17,6 +17,8 @@ from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
+from deez_dots.commands.dots import _should_overwrite_installed_dot
+from deez_dots.core import compare_versions
 
 # --- SAFETY FIX: Hijack environment BEFORE loading any deez modules ---
 # This prevents module-level constants in Deez from capturing the user's 
@@ -302,6 +304,38 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual({item["dot"] for item in result}, {"kitty", "icons"})
         self.assertTrue(all("label" in item for item in result))
         self.assertTrue(all(item["action"] == "deploy" for item in result))
+
+    def test_compare_versions_understands_dash_revisions(self):
+        self.assertLess(compare_versions("1.2.3", "1.2.3-1"), 0)
+        self.assertGreater(compare_versions("1.2.3-1", "1.2.3"), 0)
+        self.assertLess(compare_versions("1.2.3alpha", "1.2.3"), 0)
+        self.assertLess(compare_versions("1.2.3", "1.2.4"), 0)
+        self.assertEqual(compare_versions("1.2.3", "1.2.3"), 0)
+        self.assertLess(compare_versions("1.0.0-1", "1.0.0-2"), 0)
+        self.assertGreater(compare_versions("1.0.0-2", "1.0.0-1"), 0)
+        self.assertGreater(compare_versions("1.0.0-1", "1.0.0-1alpha"), 0)
+        self.assertLess(compare_versions("1.0.0-1alpha", "1.0.0-1"), 0)
+        self.assertGreater(compare_versions("1:0.9rc4-1", "0.9rc4-2"), 0)
+        self.assertLess(compare_versions("0.11.0.r10.gab2b0af-1.1", "0.11.0.r10.gab2b0af-1.2"), 0)
+        self.assertLess(compare_versions("12-1", "12-2"), 0)
+        self.assertLess(compare_versions("7.0.10.zen1-1", "7.0.10.zen1-2"), 0)
+        self.assertLess(compare_versions("2025.10.12-1", "2025.10.12-2"), 0)
+        self.assertLess(compare_versions("4.0.13-251226", "4.0.13-251227"), 0)
+
+    def test_should_overwrite_installed_dot_when_newer_same_owner(self):
+        cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
+        cli.args = argparse.Namespace(force=False)
+        cli.manifest_manager.load_desc = lambda dot: {"owner": "hyde_project", "version": "1.2.3"}
+
+        self.assertTrue(_should_overwrite_installed_dot(cli, "kitty", "hyde_project", "1.2.4"))
+
+    def test_should_prompt_when_new_bundle_is_older_same_owner(self):
+        cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
+        cli.args = argparse.Namespace(force=False)
+        cli.manifest_manager.load_desc = lambda dot: {"owner": "hyde_project", "version": "1.2.3"}
+
+        with patch.object(deez_module.UI, "read_input", return_value="n"):
+            self.assertFalse(_should_overwrite_installed_dot(cli, "kitty", "hyde_project", "1.2.2"))
 
     def test_query_selectable_installed_and_cache_options(self):
         file_path = self.home_dir / ".config/kitty/kitty.conf"
@@ -597,7 +631,10 @@ class TestDeezCLI(unittest.TestCase):
 
         def fake_do_package(*_args, **kwargs):
             captured["sections"] = kwargs["sections"]
-            return [str(Path(self.tmpdir.name) / "kitty.tar.gz")]
+            return [
+                str(Path(self.tmpdir.name) / "kitty.tar.gz"),
+                str(Path(self.tmpdir.name) / "hyprland.tar.gz"),
+            ]
 
         with patch.object(deez_module.DeezCLI, "_can_prompt_for_selection", return_value=True), patch("builtins.input", side_effect=AssertionError("interactive prompt should not be used")), patch.object(cli, "_resolve_config_dependencies", return_value=None), patch.object(cli, "_do_package", side_effect=fake_do_package), patch.object(cli, "_do_install", return_value=None):
             cli.run()
@@ -1356,6 +1393,27 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
 
+    def test_dots_package_supports_local_file_source(self):
+        source_file = Path(self.tmpdir.name) / "NotoSansCJK-Regular.ttc"
+        source_file.write_bytes(b"dummy font data")
+        config_path = Path(self.tmpdir.name) / "file-source.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_file}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[fonts]\n'
+            'paths = ["NotoSansCJK-Regular.ttc"]\n'
+            'target_root = "$HOME/.local/share/fonts"\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled fonts ->", result.stdout)
+
     def test_dots_package_supports_dot_level_tarball_source_legacy_entry(self):
         archive_path = self._make_source_archive(
             Path(self.tmpdir.name) / "cursor-theme.tar.gz",
@@ -1500,6 +1558,18 @@ class TestDeezCLI(unittest.TestCase):
 
         prepare_git_source.assert_called_once_with("https://github.com/HyDE-Project/HyDE.git", "main")
         self.assertEqual(captured["source_dir"], "/tmp/deez-git-source")
+
+    def test_is_file_source_url_accepts_github_blob_file_with_trailing_slash(self):
+        url = "https://github.com/notofonts/noto-cjk/blob/main/Sans/OTC/NotoSansCJK-Regular.ttc/"
+        self.assertTrue(deez_module.GitHandler.is_file_source_url(url))
+
+    def test_prepare_source_uses_file_source_for_blob_file_url(self):
+        handler = deez_module.GitHandler({})
+        url = "https://github.com/notofonts/noto-cjk/blob/main/Sans/OTC/NotoSansCJK-Regular.ttc/"
+        with patch.object(deez_module.GitHandler, "prepare_file_source", return_value="/tmp/file-source") as prepare_file_source:
+            result = handler.prepare_source(url, None, "main", explicit_source_path=True)
+        prepare_file_source.assert_called_once_with(url)
+        self.assertEqual(result, "/tmp/file-source")
 
     def test_root_global_overrides_before_subcommand_override_config(self):
         config_path = self._write_git_config(git_url="https://github.com/example/original.git", git_branch="main")
@@ -2363,6 +2433,117 @@ class TestDeezCLI(unittest.TestCase):
         self.assertTrue((self.home_dir / ".config/kitty/kitty.conf").exists())
         self.assertTrue((Path(self.xdg_data) / "deez" / "dots" / "kitty.toml").exists())
 
+    def test_dots_deploy_uninstalls_existing_dot_before_install_after_conflict_check(self):
+        source_dir = Path(self.tmpdir.name) / "source-deploy-overwrite"
+        config_file = source_dir / "Configs/.config/kitty/kitty.conf"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text("font_size 12")
+        old_file = self.home_dir / ".config/kitty/old.conf"
+        old_file.parent.mkdir(parents=True, exist_ok=True)
+        old_file.write_text("old")
+        self._write_installed_manifest(
+            "kitty",
+            owner="hyde_project",
+            version="1.0.0",
+            files=[
+                {
+                    "src": ".config/kitty/kitty.conf",
+                    "dst": str(self.home_dir / ".config/kitty/kitty.conf"),
+                    "action": "sync",
+                },
+                {
+                    "src": ".config/kitty/old.conf",
+                    "dst": str(old_file),
+                    "action": "sync",
+                },
+            ],
+        )
+        config_path = Path(self.tmpdir.name) / "deploy-overwrite.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "2.0.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'source_root = "Configs/.config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty/kitty.conf"]\n'
+        )
+
+        result = run_deez([
+            "dots",
+            "--deploy",
+            "kitty",
+            "--config",
+            str(config_path),
+            "--no-deps-checks",
+        ], env=self.env, input_data="y\n")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Uninstalled kitty", result.stdout)
+        self.assertIn("Installed 'kitty'", result.stdout)
+        self.assertFalse(old_file.exists())
+        self.assertTrue((self.home_dir / ".config/kitty/kitty.conf").exists())
+
+    def test_dots_deploy_preserves_preserve_action_files_on_uninstall(self):
+        source_dir = Path(self.tmpdir.name) / "source-deploy-preserve"
+        config_file = source_dir / "Configs/.config/kitty/kitty.conf"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text("font_size 12")
+        preserved_file = self.home_dir / ".config/kitty/keep.conf"
+        preserved_file.parent.mkdir(parents=True, exist_ok=True)
+        preserved_file.write_text("keep this")
+        self._write_installed_manifest(
+            "kitty",
+            owner="hyde_project",
+            version="1.0.0",
+            files=[
+                {
+                    "src": ".config/kitty/kitty.conf",
+                    "dst": str(self.home_dir / ".config/kitty/kitty.conf"),
+                    "action": "sync",
+                },
+                {
+                    "src": ".config/kitty/keep.conf",
+                    "dst": str(preserved_file),
+                    "action": "preserve",
+                },
+            ],
+        )
+        config_path = Path(self.tmpdir.name) / "deploy-preserve.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "2.0.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'source_root = "Configs/.config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty/kitty.conf"]\n'
+        )
+
+        result = run_deez([
+            "dots",
+            "--deploy",
+            "kitty",
+            "--config",
+            str(config_path),
+            "--no-deps-checks",
+        ], env=self.env, input_data="y\n")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Uninstalled kitty", result.stdout)
+        self.assertIn("Installed 'kitty'", result.stdout)
+        self.assertTrue(preserved_file.exists())
+        self.assertEqual(preserved_file.read_text(), "keep this")
+        self.assertTrue((self.home_dir / ".config/kitty/kitty.conf").exists())
+
     def test_dots_deploy_checks_config_dependencies_before_packaging(self):
         main_config = {
             "global": {
@@ -2786,6 +2967,31 @@ class TestDeezCLI(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn("Deploy failed: bundling produced no bundles.", output)
+
+    def test_dots_deploy_fails_when_package_produces_incomplete_bundles(self):
+        source_dir = Path(self.tmpdir.name) / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        config_path = Path(self.tmpdir.name) / "deploy-incomplete.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+            '\n'
+            '[alacritty]\n'
+            'paths = [".config/alacritty/alacritty.yml"]\n'
+        )
+
+        with patch.object(deez_module.DeezCLI, "_do_package", return_value=[str(Path(self.tmpdir.name) / "kitty.tar.gz")]):
+            exit_code, output = self.run_entrypoint(["deez", "dots", "--deploy", "--config", str(config_path)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("Deploy failed: bundling failed for selected dots: alacritty.", output)
+        self.assertNotIn("Installed", output)
 
     def test_run_entrypoint_handles_cancelled_actions(self):
         config_path = self._write_package_config()
@@ -3317,6 +3523,42 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn(conflict_path, result.stdout)
         self.assertIn("owned by hyprland", result.stdout)
         self.assertIn("'kitty' skipped due to conflict.", result.stdout)
+
+    def test_dots_install_does_not_uninstall_existing_dot_when_file_conflict_occurs(self):
+        existing_path = f"{self.home_dir}/.config/kitty/kitty.conf"
+        self._write_installed_manifest(
+            "kitty",
+            owner="old-owner",
+            version="1.0",
+            files=[{"src": ".config/kitty/kitty.conf", "dst": existing_path}],
+        )
+        self._write_installed_manifest(
+            "other-dot",
+            files=[{"src": ".config/other/other.conf", "dst": f"{self.home_dir}/.config/other/other.conf"}],
+        )
+        bundle_path = self._make_bundle_tarball(
+            Path(self.tmpdir.name) / "kitty-conflict-after-prompt.tar.gz",
+            name="kitty",
+            owner="new-owner",
+            version="2.0",
+            files=[
+                {
+                    "src": "kitty.conf",
+                    "dst": existing_path,
+                },
+                {
+                    "src": "conflict.conf",
+                    "dst": f"{self.home_dir}/.config/other/other.conf",
+                },
+            ],
+        )
+
+        result = self.run_cli(["dots", "--install", str(bundle_path)], input_data="y\n")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("File conflict:", result.stdout)
+        self.assertIn("owned by other-dot", result.stdout)
+        self.assertTrue((Path(self.xdg_data) / "deez" / "dots" / "kitty.toml").exists())
 
     def test_dots_uninstall_dry_run(self):
         section = "kitty"
