@@ -755,6 +755,19 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("No dots found in the manifest.", result.stdout)
 
+    def test_dots_list_normalizes_installed_owner(self):
+        self._write_installed_manifest(
+            "hyde",
+            owner="The HyDE Project",
+            files=[{"src": ".config/hypr/hyprland.conf", "dst": f"{self.home_dir}/.config/hypr/hyprland.conf"}],
+        )
+
+        result = self.run_cli(["dots", "--list"])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("the_hyde_project", result.stdout)
+        self.assertNotIn("The HyDE Project", result.stdout)
+
     def test_dots_filetree_defaults_to_all_installed_dots(self):
         self._write_installed_manifest(
             "kitty",

@@ -1837,6 +1837,7 @@ class WriteDots:
         stage_dir = xdg_cache / "deez" / "stage" / dot
         shutil.rmtree(stage_dir, ignore_errors=True)
         try:
+            owner = DeezUtils.normalize_owner(owner)
             all_file_pairs, any_staged = self._stage_file_entries(file_entries, stage_dir, warn_on_missing=True)
             if not any_staged:
                 LOG.debug("Nothing staged for %s", dot)
@@ -1889,6 +1890,7 @@ class WriteDots:
         stage_dir = xdg_cache / "deez" / "stage" / f"{dot}-export-{ts}"
         shutil.rmtree(stage_dir, ignore_errors=True)
         try:
+            owner = DeezUtils.normalize_owner(owner)
             file_pairs, any_staged = self._stage_file_entries(file_entries, stage_dir)
             if not any_staged:
                 LOG.debug("No files exported for %s", dot)
@@ -1955,6 +1957,7 @@ class WriteDots:
             if not captured_rel_paths:
                 LOG.debug("No files exported for %s", dot)
                 return ""
+            owner = DeezUtils.normalize_owner(owner)
             pkg_path = self._pkg_path(dot, version)
             desc_data = self._filter_manifest_meta(manifest_meta, origin="export", builddate=ts)
             desc_data.setdefault("name", dot)
@@ -2694,7 +2697,8 @@ class DeezCLI:
         dot_data = self.main_config.get(dot, {})
         if not isinstance(dot_data, dict):
             dot_data = {}
-        return str(dot_data.get("owner") or self.global_config.get("owner") or "?")
+        owner = dot_data.get("owner") or self.global_config.get("owner")
+        return DeezUtils.normalize_owner(owner) if owner else "?"
 
     def _dot_selection_header(self, action_label: str) -> str:
         global_description = _normalize_description(self.global_config.get("description"))
@@ -3582,7 +3586,8 @@ class DeezCLI:
     ) -> Tuple[bool, List[Tuple[str, str]]]:
         existing_desc = self.manifest_manager.load_desc(dot)
         if existing_desc and not ignore_installed_dot:
-            existing_owner = existing_desc.get("owner", "unknown")
+            existing_owner = DeezUtils.normalize_owner(existing_desc.get("owner", "unknown"))
+            new_owner = DeezUtils.normalize_owner(new_owner)
             if existing_owner != new_owner:
                 UI.error(f"Conflict: dot '{dot}' is already installed by '{existing_owner}'.")
                 UI.info("Uninstall the dot first, then re-run install.")
@@ -3664,12 +3669,12 @@ class DeezCLI:
             UI.error(f"{bundle_path}: manifest.toml has no [[files]]")
             return None
 
-        bundle_owner = bundle.get("owner", "")
+        bundle_owner = DeezUtils.normalize_owner(bundle.get("owner", ""))
         bundle_version = bundle.get("version", "unknown")
         existing_desc = self.manifest_manager.load_desc(dot)
         ignore_existing_dot_conflict = False
         if existing_desc:
-            existing_owner = existing_desc.get("owner", "unknown")
+            existing_owner = DeezUtils.normalize_owner(existing_desc.get("owner", "unknown"))
             existing_version = existing_desc.get("version", "unknown")
             if uninstall_existing:
                 ignore_existing_dot_conflict = True
@@ -3735,7 +3740,7 @@ class DeezCLI:
             dot_source_dir, dot_source_url, dot_target_branch = self._resolve_dot_source(dot_data, git_handler, default_source_url, target_branch)
             githash = git_handler.get_githash(dot_source_dir)
             hook_cwd = self._hook_cwd(dot_source_dir)
-            section_owner = dot_data.get("owner", global_owner)
+            section_owner = DeezUtils.normalize_owner(dot_data.get("owner") or global_owner)
             section_version = dot_data.get("version", global_version)
             dependency = DeezUtils.normalize_dependency_blocks(dot_data.get("dependency") or dot_data.get("depends"))
             conflicts = self._normalize_conflict_names(dot_data.get("conflicts"))
@@ -3809,7 +3814,7 @@ class DeezCLI:
             UI.set_loader_message(f"Exporting {dot_section}...")
             if dot_section in self.main_config:
                 dot_data = self.main_config.get(dot_section, {})
-                section_owner = dot_data.get("owner", global_owner)
+                section_owner = DeezUtils.normalize_owner(dot_data.get("owner") or global_owner)
                 section_version = dot_data.get("version", global_version)
                 section_home = os.path.expandvars(dot_data.get("home", global_home))
                 if dry_run:
@@ -3864,7 +3869,7 @@ class DeezCLI:
                     continue
                 UI.plain(f"[EXPORT] Capturing installed dot: {dot_section}")
                 desc_data = self.manifest_manager.load_desc(dot_section)
-                section_owner = desc_data.get("owner", global_owner)
+                section_owner = DeezUtils.normalize_owner(desc_data.get("owner") or global_owner)
                 section_version = desc_data.get("version", global_version)
                 home_dir = DeezUtils.home_dir()
                 relative_paths, action_by_path = self._collect_installed_export_paths(dot_section, home_dir)
@@ -4335,7 +4340,7 @@ class DeezCLI:
         for dot in sorted(dots):
             desc = self.manifest_manager.load_desc(dot)
             files = self.manifest_manager.get_files(dot)
-            owner = desc.get("owner", "?")
+            owner = DeezUtils.normalize_owner(desc.get("owner")) if desc.get("owner") else "?"
             install_ts = desc.get("installdate", "?")
             missing = [p for p in files if not Path(p).exists()]
             UI.plain(f"  {dot:<18} {owner:<30} {len(files):<6} {install_ts}")
