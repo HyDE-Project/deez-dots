@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import logging
 import os
@@ -288,7 +289,7 @@ class DeezUtils:
         normalized = str(action).strip().lower()
         if normalized == "overwrite":
             return "sync"
-        if normalized not in ("preserve", "sync"):
+        if normalized not in ("preserve", "sync", "tarball"):
             return "preserve"
         return normalized
 
@@ -1313,6 +1314,51 @@ class WriteDots:
                     UI.error(f"Command failed: {cmd}: {e}")
                     raise
 
+    def _run_sudo_command(self, command: List[str], description: str) -> bool:
+        """Run a privileged command via sudo, showing prompts and output."""
+        if not shutil.which("sudo"):
+            LOG.debug("sudo not available to perform privileged action: %s", description)
+            return False
+        UI.info(f"Privileged operation required: {description}")
+        UI.info(f"Running elevated command: sudo {' '.join(str(part) for part in command)}")
+        was_paused = UI.pause_loader()
+        try:
+            success, out, err = self.runner(
+                ["sudo", "-p", "[sudo] password for %u: "] + command,
+                shell=False,
+                capture_output=False,
+                stream_output=True,
+                passthrough_output=True,
+                retries=1,
+            )
+        finally:
+            UI.resume_loader(was_paused)
+        if not success:
+            LOG.warning("Privileged command failed: sudo %s", " ".join(str(part) for part in command))
+            UI.error(f"Privileged operation failed: {description}")
+        return success
+
+    def _is_writable_path(self, candidate_path: Union[str, Path]) -> bool:
+        path = Path(candidate_path)
+        if path.exists():
+            return os.access(path, os.W_OK)
+        current = path
+        while not current.exists():
+            parent = current.parent
+            if parent == current:
+                return False
+            current = parent
+        return os.access(current, os.W_OK)
+
+    def _remove_path_sudo(self, candidate_path: Union[str, Path]) -> None:
+        try:
+            WriteDots._remove_existing_path(candidate_path)
+        except (PermissionError, OSError) as exc:
+            if getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM} and shutil.which("sudo"):
+                if self._run_sudo_command(["rm", "-rf", str(candidate_path)], "remove path %s" % candidate_path):
+                    return
+            raise
+
     @staticmethod
     def _backup_dot_dirname(dot: str, owner: str, version: str) -> str:
         import re
@@ -1469,10 +1515,28 @@ class WriteDots:
             return True
         staged.parent.mkdir(parents=True, exist_ok=True)
         if source.is_dir():
+            staged.parent.mkdir(parents=True, exist_ok=True)
             if staged.exists() or staged.is_symlink():
+                if staged.is_dir():
+                    for item in sorted(source.iterdir()):
+                        target_item = staged / item.name
+                        if item.is_dir():
+                            WriteDots._copy_path_to_stage(item, target_item)
+                        elif item.is_symlink():
+                            if target_item.exists() or target_item.is_symlink():
+                                WriteDots._remove_existing_path(target_item)
+                            target_item.parent.mkdir(parents=True, exist_ok=True)
+                            os.symlink(os.readlink(item), target_item)
+                        else:
+                            if target_item.exists() or target_item.is_symlink():
+                                WriteDots._remove_existing_path(target_item)
+                            target_item.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(item, target_item)
+                    return True
                 WriteDots._remove_existing_path(staged)
             shutil.copytree(source, staged, symlinks=True)
         else:
+            staged.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, staged)
         return True
 
@@ -1541,6 +1605,57 @@ class WriteDots:
             file_pairs.append(manifest_entry)
             appended_count += 1
         return appended_count
+
+    def _create_tarball_payload(
+        self,
+        src_path: Union[str, Path],
+        stage_root: Union[str, Path],
+        rel_path: str,
+        ignored_paths: List[str],
+    ) -> Optional[Path]:
+        source = Path(src_path)
+        stage_root_path = Path(stage_root)
+        stage_root_path.mkdir(parents=True, exist_ok=True)
+
+        archive_name = Path(str(rel_path or "")).name if rel_path not in (".", "./") else source.name
+        archive_name = archive_name.replace("/", "_").strip("_") or "archive"
+        tarball_path = stage_root_path / f"{archive_name}.tar.gz"
+        if tarball_path.exists():
+            tarball_path.unlink()
+
+        entries_added = 0
+        with tarfile.open(tarball_path, "w:gz") as tar:
+            if source.is_dir():
+                for root, dirs, files in os.walk(source, topdown=True, followlinks=False):
+                    rel_root = Path(root).relative_to(source).as_posix()
+                    if rel_root == ".":
+                        rel_root = ""
+                    if rel_root and self._matches_ignored_path(rel_root, ignored_paths):
+                        dirs[:] = []
+                        continue
+                    if rel_root:
+                        tar.add(root, arcname=rel_root, recursive=False)
+                        entries_added += 1
+                    dirs[:] = [d for d in dirs if not self._matches_ignored_path(Path(rel_root, d).as_posix(), ignored_paths)]
+                    for file_name in sorted(files):
+                        candidate = Path(root) / file_name
+                        rel_file = Path(rel_root) / file_name if rel_root else Path(file_name)
+                        rel_file_text = rel_file.as_posix()
+                        if self._matches_ignored_path(rel_file_text, ignored_paths):
+                            continue
+                        tar.add(candidate, arcname=rel_file_text, recursive=False)
+                        entries_added += 1
+            else:
+                arcname = source.name
+                if self._matches_ignored_path(arcname, ignored_paths):
+                    return None
+                tar.add(source, arcname=arcname, recursive=False)
+                entries_added += 1
+
+        if entries_added == 0:
+            tarball_path.unlink(missing_ok=True)
+            return None
+        return tarball_path
 
     @staticmethod
     def _filter_manifest_meta(meta: Optional[Dict[str, Any]], *, origin: str, builddate: str) -> Dict[str, Any]:
@@ -1706,6 +1821,44 @@ class WriteDots:
         shutil.copy2(src, tgt)
         return True
 
+    def _extract_tarball_payload(self, archive_path: Union[str, Path], destination: Union[str, Path], clean_target: bool = False) -> bool:
+        archive = Path(archive_path)
+        destination_path = Path(destination)
+        if clean_target and destination_path.exists():
+            if destination_path.is_dir() and not destination_path.is_symlink():
+                backup_parent = destination_path.parent
+                backup_name = destination_path.name + ".old"
+                backup_path = backup_parent / backup_name
+                counter = 1
+                while backup_path.exists():
+                    backup_path = backup_parent / f"{backup_name}.{counter}"
+                    counter += 1
+                try:
+                    shutil.move(str(destination_path), str(backup_path))
+                    LOG.debug("Clean build: moved existing %s -> %s", destination_path, backup_path)
+                except (PermissionError, OSError) as exc:
+                    if getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM} and shutil.which("sudo"):
+                        if self._run_sudo_command(["rm", "-rf", str(destination_path)], "remove existing destination for tarball clean build"):
+                            LOG.debug("Privileged clean build removed existing destination %s", destination_path)
+                        else:
+                            raise
+                    else:
+                        raise
+            else:
+                self._remove_path_sudo(destination_path)
+
+        if not self._is_writable_path(destination_path):
+            if not self._run_sudo_command(["mkdir", "-p", str(destination_path)], "create tarball destination directory"):
+                raise PermissionError(f"Unable to prepare destination path: {destination_path}")
+            if not self._run_sudo_command(["tar", "-xf", str(archive), "-C", str(destination_path)], "extract tarball payload"):
+                raise RuntimeError(f"Failed to extract tarball payload into {destination_path}")
+            return True
+
+        destination_path.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, "r:*") as tar:
+            tar.extractall(path=destination_path)
+        return True
+
     def _write_bundle(
         self,
         stage_dir: Union[str, Path],
@@ -1739,8 +1892,11 @@ class WriteDots:
                 UI.warn(f"Existing extracted build directory may be stale: {extracted_dir}. Use --force to remove it.")
         Path(pkg_path).parent.mkdir(parents=True, exist_ok=True)
         with tarfile.open(pkg_path, "w:gz") as tar:
-            tar.add(stage / "manifest.toml", arcname="manifest.toml")
-            tar.add(stage / "data", arcname="data")
+            for child in sorted(stage.iterdir()):
+                if child.name == "data":
+                    tar.add(child, arcname="data")
+                else:
+                    tar.add(child, arcname=child.name)
         shutil.rmtree(stage)
         LOG.debug("Wrote compressed bundle to %s", pkg_path)
         return pkg_path
@@ -1792,6 +1948,30 @@ class WriteDots:
                     LOG.debug("Stage: source missing %s", src_path)
                     if warn_on_missing:
                         UI.warn(f"Source path missing: {src_path}")
+                    continue
+                if action == "tarball":
+                    tarball_path = self._create_tarball_payload(src_path, stage_dir, rel_path, ignored_paths)
+                    if not tarball_path:
+                        if warn_on_missing and ignored_paths and source_file_count:
+                            UI.warn(f"Ignored all matched files: {src_path}")
+                        continue
+                    data_rel = tarball_path.relative_to(stage_dir).as_posix()
+                    dst_rel = "" if rel_path in (".", "./") else rel_path
+                    manifest_entry = {
+                        "src": data_rel,
+                        "dst": str(Path(tgt_root) / dst_rel),
+                        "action": action,
+                    }
+                    if entry_metadata:
+                        for key, value in entry_metadata.items():
+                            if value is None:
+                                continue
+                            manifest_entry[key] = value
+                    if clean_target:
+                        manifest_entry["clean_target"] = True
+                    all_file_pairs.append(manifest_entry)
+                    any_staged = True
+                    LOG.debug("Staged tarball %s -> %s (pattern=%s)", tarball_path, tgt_root, rel_pattern)
                     continue
                 self._copy_path_to_stage(src_path, dest_path)
                 self._prune_ignored_staged_paths(dest_path, entry_stage_root, ignored_paths)
@@ -2887,6 +3067,24 @@ class DeezCLI:
             lines.extend(self._render_tree_lines(collapsed_child, prefix + extension))
         return lines
 
+    def _insert_tree_paths_recursive(self, tree: Dict[str, Any], dst_path: Path, home: Path, owner: Optional[str] = None) -> None:
+        self._insert_tree_path(
+            tree,
+            self._display_path_parts(str(dst_path), home=home),
+            owner=owner,
+            exists=self._path_exists_or_link(dst_path),
+        )
+        if dst_path.exists() and dst_path.is_dir():
+            for root, dirs, files in os.walk(dst_path):
+                for name in sorted(dirs + files):
+                    path = Path(root) / name
+                    self._insert_tree_path(
+                        tree,
+                        self._display_path_parts(str(path), home=home),
+                        owner=owner,
+                        exists=self._path_exists_or_link(path),
+                    )
+
     def _resolve_installed_dot_targets(self, requested: Optional[str]) -> List[str]:
         dots = sorted(self.manifest_manager.list_dots())
         if not dots:
@@ -2924,7 +3122,11 @@ class DeezCLI:
             if not dst_raw:
                 continue
             dst = os.path.normpath(dst_raw)
-            self._insert_tree_path(tree, self._display_path_parts(dst, home=Path(self.target_root)), exists=self._path_exists_or_link(Path(dst)))
+            dst_path = Path(dst)
+            if DeezUtils.normalize_action(entry.get("action")) == "tarball":
+                self._insert_tree_paths_recursive(tree, dst_path, home=Path(self.target_root))
+                continue
+            self._insert_tree_path(tree, self._display_path_parts(dst, home=Path(self.target_root)), exists=self._path_exists_or_link(dst_path))
         for line in self._render_tree_lines(tree):
             UI.plain(f"  {line}")
 
@@ -2943,7 +3145,11 @@ class DeezCLI:
                     if not raw_dst:
                         continue
                     dst = os.path.normpath(raw_dst)
-                    self._insert_tree_path(tree, self._display_path_parts(dst, home=Path(self.target_root)), owner=dot, exists=self._path_exists_or_link(Path(dst)))
+                    dst_path = Path(dst)
+                    if DeezUtils.normalize_action(entry.get("action")) == "tarball":
+                        self._insert_tree_paths_recursive(tree, dst_path, home=Path(self.target_root), owner=dot)
+                        continue
+                    self._insert_tree_path(tree, self._display_path_parts(dst, home=Path(self.target_root)), owner=dot, exists=self._path_exists_or_link(dst_path))
             for line in self._render_tree_lines(tree):
                 UI.plain(line)
             return
@@ -3471,7 +3677,14 @@ class DeezCLI:
         source_root_value = file_entry.get("source_root") if file_entry.get("source_root") is not None else dot_data.get("source_root")
         if source_root_value:
             expanded_source_root = DeezUtils.expand(source_root_value)
-            source_root = expanded_source_root if os.path.isabs(expanded_source_root) else os.path.join(resolved_source_dir, expanded_source_root)
+            if os.path.isabs(expanded_source_root):
+                source_root = expanded_source_root
+            else:
+                candidate_root = os.path.join(resolved_source_dir, expanded_source_root)
+                if not os.path.exists(candidate_root) and os.path.basename(os.path.normpath(resolved_source_dir)) == expanded_source_root:
+                    source_root = resolved_source_dir
+                else:
+                    source_root = candidate_root
         else:
             source_root = resolved_source_dir
         target_root = DeezUtils.expand(file_entry.get("target_root") or dot_data.get("target_root") or default_target_root)
@@ -3563,16 +3776,48 @@ class DeezCLI:
             "build_command": file_entry.get("build_command"),
         }
 
+    def _resolve_file_entry_source(
+        self,
+        dot_data: Dict[str, Any],
+        file_entry: Dict[str, Any],
+        source_dir: Optional[str],
+        git_handler: Optional[Any] = None,
+        target_branch: Optional[str] = None,
+    ) -> str:
+        source_text = file_entry.get("source") if file_entry.get("source") is not None else dot_data.get("source")
+        if not source_text:
+            return source_dir or self.source_dir
+        if git_handler is None:
+            return source_dir or self.source_dir
+        source_text = DeezUtils.expand(source_text)
+        branch = (
+            file_entry.get("branch")
+            or file_entry.get("git_branch")
+            or dot_data.get("branch")
+            or dot_data.get("git_branch")
+            or target_branch
+            or ""
+        )
+        return git_handler.prepare_source(source_text, None, branch, explicit_source_path=True)
+
     def _build_file_entry_records(
         self,
         dot_data: Dict[str, Any],
         default_target_root: str,
         source_dir: Optional[str] = None,
         for_export: bool = False,
+        git_handler: Optional[Any] = None,
+        target_branch: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         raw_file_entries = self._normalize_raw_file_entries(dot_data)
         return [
-            self._normalize_file_entry_record(dot_data, file_entry, default_target_root, source_dir, for_export=for_export)
+            self._normalize_file_entry_record(
+                dot_data,
+                file_entry,
+                default_target_root,
+                self._resolve_file_entry_source(dot_data, file_entry, source_dir, git_handler, target_branch),
+                for_export=for_export,
+            )
             for file_entry in raw_file_entries
         ]
 
@@ -3756,7 +4001,13 @@ class DeezCLI:
                 writer.execute_commands([build_command], cwd=dot_source_dir)
             section_home = os.path.expandvars(dot_data.get("home", global_home))
 
-            raw_file_entries = self._build_file_entry_records(dot_data, section_home, dot_source_dir)
+            raw_file_entries = self._build_file_entry_records(
+                dot_data,
+                section_home,
+                dot_source_dir,
+                git_handler=git_handler,
+                target_branch=dot_target_branch,
+            )
             file_entries: List[Dict[str, Any]] = []
             for file_entry in raw_file_entries:
                 entry_pre_command = file_entry["pre_command"]
@@ -3976,7 +4227,13 @@ class DeezCLI:
                     entry_action = DeezUtils.normalize_action(file_entry.get("action"))
                     source_path = bundle_data_dir / source_rel_path
                     if not writer._path_exists_or_link(source_path):
+                        source_path = temp_install_dir / source_rel_path
+                    if not writer._path_exists_or_link(source_path):
                         LOG.debug("Missing in bundle: %s", source_rel_path)
+                        continue
+                    if entry_action == "tarball":
+                        if writer._extract_tarball_payload(source_path, destination_path, clean_target=clean_target):
+                            deployed_pairs.append({"src": source_rel_path, "dst": destination_path, "action": entry_action})
                         continue
                     if writer._copy_with_action(source_path, destination_path, entry_action, clean_target=clean_target):
                         deployed_pairs.append({"src": source_rel_path, "dst": destination_path, "action": entry_action})
@@ -4116,17 +4373,21 @@ class DeezCLI:
                 backup_path = writer.backup_to_tarball(dot, manifest_entries, desc_data=backup_desc)
                 if backup_path:
                     self._backed_up_dots.add(dot)
-            # Only remove files with action 'sync', leave 'preserve' files untouched
-            sync_files = [DeezUtils.expand(entry["dst"]) for entry in manifest_entries if entry.get("dst") and DeezUtils.normalize_action(entry.get("action")) == "sync"]
+            # Remove files for sync and tarball actions, leaving preserve files untouched
+            uninstall_paths = [
+                DeezUtils.expand(entry["dst"])
+                for entry in manifest_entries
+                if entry.get("dst") and DeezUtils.normalize_action(entry.get("action")) in ("sync", "tarball")
+            ]
             if dry_run:
-                UI.plain(f"[DRY RUN] [UNINSTALL] Would remove dot '{dot}' with {len(sync_files)} sync-tracked files.")
-                for target_path in sync_files:
+                UI.plain(f"[DRY RUN] [UNINSTALL] Would remove dot '{dot}' with {len(uninstall_paths)} tracked files.")
+                for target_path in uninstall_paths:
                     UI.plain(f"  would remove: {target_path}")
                 continue
-            for target_path in sync_files:
+            for target_path in uninstall_paths:
                 try:
-                    writer._remove_existing_path(target_path)
-                    LOG.debug(f"Removed sync file: {target_path}")
+                    writer._remove_path_sudo(target_path)
+                    LOG.debug(f"Removed tracked path: {target_path}")
                 except Exception as e:
                     LOG.warning(f"Failed to remove {target_path}: {e}")
             if not dry_run:

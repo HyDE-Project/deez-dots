@@ -175,11 +175,30 @@ def _resolve_selected_sections(cli: Any, requested: object, action_label: str) -
 
 def _find_pkg_for_dots(pkg_paths: list[str], sections: list[str]) -> dict[str, str]:
     dot_to_pkg: dict[str, str] = {}
+    normalized_paths: dict[str, str] = {}
     for pkg_path in pkg_paths:
         basename = Path(pkg_path).name
-        for dot in sections:
-            if dot in basename:
-                dot_to_pkg[dot] = pkg_path
+        if basename.endswith(".tar.gz"):
+            normalized_name = basename[: -len(".tar.gz")]
+        elif basename.endswith(".tar"):
+            normalized_name = basename[: -len(".tar")]
+        else:
+            normalized_name = basename
+        normalized_paths[normalized_name] = pkg_path
+
+    for dot in sections:
+        if dot in normalized_paths:
+            dot_to_pkg[dot] = normalized_paths[dot]
+            continue
+        prefix_key = f"{dot}-"
+        matching = [pkg for name, pkg in normalized_paths.items() if name.startswith(prefix_key)]
+        if matching:
+            dot_to_pkg[dot] = matching[0]
+            continue
+        for name, pkg in normalized_paths.items():
+            if name == dot or name.startswith(prefix_key) or f"-{dot}-" in name or name.endswith(f"-{dot}"):
+                dot_to_pkg[dot] = pkg
+                break
     return dot_to_pkg
 
 

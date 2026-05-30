@@ -802,6 +802,26 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("kitty.conf", result.stdout)
         self.assertNotIn("hyprland.conf", result.stdout)
 
+    def test_dots_filetree_expands_tarball_destination_tree(self):
+        dot = "cursor-bibata-modern-ice"
+        destination = self.home_dir / ".local/share/icons/Bibata-Modern-Ice"
+        (destination / "cursors").mkdir(parents=True, exist_ok=True)
+        (destination / "cursors" / "pointer.png").write_text("dummy")
+        (destination / "cursor.theme").write_text("dummy")
+
+        self._write_installed_manifest(
+            dot,
+            files=[{"src": "Bibata-Modern-Ice.tar.gz", "dst": str(destination), "action": "tarball"}],
+        )
+
+        result = self.run_cli(["dots", "--filetree", dot])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Bibata-Modern-Ice", result.stdout)
+        self.assertIn("cursors", result.stdout)
+        self.assertIn("pointer.png", result.stdout)
+        self.assertIn("cursor.theme", result.stdout)
+
     def test_dots_healthcheck_reports_missing_and_changed_files(self):
         cache_dir = Path(self.xdg_cache) / "deez" / "dots"
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1004,6 +1024,41 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
         self.assertIn("[ok] Bundled hyprland ->", result.stdout)
+
+    def test_dots_deploy_with_prefix_dot_names_uses_the_correct_bundle_for_each_dot(self):
+        source_dir = Path(self.tmpdir.name) / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "cursor.txt").write_text("cursor content")
+        (source_dir / "hyprcursor.txt").write_text("hyprcursor content")
+
+        config_path = Path(self.tmpdir.name) / "deploy-prefix-names.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[cursor-bibata-modern-ice]\n'
+            'source_root = "."\n'
+            'target_root = "$HOME/.local/share/cursor"\n'
+            'paths = ["cursor.txt"]\n'
+            '\n'
+            '[hyprcursor-bibata-modern-ice]\n'
+            'source_root = "."\n'
+            'target_root = "$HOME/.local/share/hyprcursor"\n'
+            'paths = ["hyprcursor.txt"]\n'
+        )
+
+        result = self.run_cli(["dots", "--deploy", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled cursor-bibata-modern-ice ->", result.stdout)
+        self.assertIn("[ok] Bundled hyprcursor-bibata-modern-ice ->", result.stdout)
+        self.assertIn("Installed 'cursor-bibata-modern-ice'", result.stdout)
+        self.assertIn("Installed 'hyprcursor-bibata-modern-ice'", result.stdout)
+        self.assertTrue((self.home_dir / ".local/share/cursor/cursor.txt").exists())
+        self.assertTrue((self.home_dir / ".local/share/hyprcursor/hyprcursor.txt").exists())
 
     def test_dots_package_accepts_named_sections_after_flag(self):
         source_dir = Path(self.tmpdir.name) / "source-package-named"
@@ -1458,6 +1513,86 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn(f'source = "{archive_path}"', manifest_text)
         self.assertIn('src = "theme/cursor.theme"', manifest_text)
 
+    def test_dots_package_supports_local_tarball_source_root_matching_extracted_root(self):
+        archive_path = self._make_source_archive(
+            Path(self.tmpdir.name) / "bibata.tar.gz",
+            {
+                "Bibata-Modern-Ice/cursor.theme": "cursor theme",
+                "Bibata-Modern-Ice/index.theme": "index theme",
+            },
+        )
+        config_path = Path(self.tmpdir.name) / "tarball-root-match.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{archive_path}"\n'
+            'owner = "ful1e5"\n'
+            'version = "2.0.7"\n'
+            'branch = "lua"\n'
+            '\n'
+            '[cursor-bibata-modern-ice]\n'
+            'source_root = "Bibata-Modern-Ice"\n'
+            'target_root = "$HOME/.icons/Bibata-Modern-Ice"\n'
+            'paths = "."\n'
+            'action = "tarball"\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled cursor-bibata-modern-ice ->", result.stdout)
+        bundle_path = SCRIPT_DIR / "build" / "cursor-bibata-modern-ice-2.0.7.tar.gz"
+        self.assertTrue(bundle_path.exists())
+        with tarfile.open(bundle_path, "r:gz") as tar:
+            names = tar.getnames()
+            self.assertTrue(any(name.endswith("Bibata-Modern-Ice.tar.gz") for name in names))
+            manifest = tomllib.loads(tar.extractfile("manifest.toml").read().decode("utf-8"))
+        self.assertTrue(manifest["files"][0]["src"].endswith("Bibata-Modern-Ice.tar.gz"))
+
+    def test_dots_package_supports_local_tarball_source_root_matching_top_level_archive(self):
+        archive_path = Path(self.tmpdir.name) / "bibata-top-level.tar.gz"
+        source_root = Path(self.tmpdir.name) / "source-archive"
+        payload_root = source_root / "Bibata-Modern-Ice"
+        payload_root.mkdir(parents=True, exist_ok=True)
+        (payload_root / "cursor.theme").write_text("cursor theme")
+        (payload_root / "index.theme").write_text("index theme")
+        with tarfile.open(archive_path, "w:gz") as tar:
+            tar.add(payload_root, arcname="Bibata-Modern-Ice")
+
+        config_path = Path(self.tmpdir.name) / "tarball-root-top-level.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{archive_path}"\n'
+            'owner = "ful1e5"\n'
+            'version = "2.0.7"\n'
+            'branch = "lua"\n'
+            '\n'
+            '[cursor-bibata-modern-ice]\n'
+            'source_root = "Bibata-Modern-Ice"\n'
+            'target_root = "$HOME/.icons/Bibata-Modern-Ice"\n'
+            'paths = "."\n'
+            'action = "tarball"\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled cursor-bibata-modern-ice ->", result.stdout)
+
+        bundle_path = SCRIPT_DIR / "build" / "cursor-bibata-modern-ice-2.0.7.tar.gz"
+        self.assertTrue(bundle_path.exists())
+        with tarfile.open(bundle_path, "r:gz") as tar:
+            names = tar.getnames()
+            self.assertIn("Bibata-Modern-Ice.tar.gz", names)
+            self.assertNotIn("data/Bibata-Modern-Ice.tar.gz", names)
+            manifest = tomllib.loads(tar.extractfile("manifest.toml").read().decode("utf-8"))
+        self.assertEqual(manifest["files"][0]["src"], "Bibata-Modern-Ice.tar.gz")
+
+        install_result = self.run_cli(["dots", "--install", str(bundle_path)])
+        self.assertEqual(install_result.returncode, 0)
+        installed_file = self.home_dir / ".icons" / "Bibata-Modern-Ice" / "cursor.theme"
+        self.assertTrue(installed_file.exists())
+
     def test_dots_package_file_entries_inherit_dot_level_source(self):
         global_source = Path(self.tmpdir.name) / "global-source"
         (global_source / ".config/global").mkdir(parents=True, exist_ok=True)
@@ -1546,6 +1681,53 @@ class TestDeezCLI(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
+
+    def test_dots_package_supports_tarball_action_with_source_archive(self):
+        source_root = Path(self.tmpdir.name) / "source-archive"
+        payload_root = source_root / "Bibata-Modern-Ice"
+        payload_root.mkdir(parents=True, exist_ok=True)
+        (payload_root / "cursor.png").write_text("cursor content")
+        (payload_root / "README.md").write_text("readme")
+        symlink_path = payload_root / "cursor-link"
+        symlink_path.symlink_to("cursor.png")
+        archive_path = Path(self.tmpdir.name) / "bibata.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as tar:
+            tar.add(payload_root, arcname="payload", recursive=True)
+
+        config_path = Path(self.tmpdir.name) / "tarball-action.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{archive_path}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[cursor_bibata_modern_ice]\n'
+            '[[cursor_bibata_modern_ice.files]]\n'
+            'action = "tarball"\n'
+            'source_root = "."\n'
+            'target_root = "$HOME/.icons/Bibata-Modern-Ice"\n'
+            'paths = "."\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled cursor_bibata_modern_ice ->", result.stdout)
+
+        bundle_path = SCRIPT_DIR / "build" / "cursor_bibata_modern_ice-0.1.0.tar.gz"
+        with tarfile.open(bundle_path, "r:gz") as outer_tar:
+            names = outer_tar.getnames()
+            self.assertIn("payload.tar.gz", names)
+            self.assertNotIn("data/payload.tar.gz", names)
+            manifest_text = outer_tar.extractfile("manifest.toml").read().decode("utf-8")
+        self.assertIn('src = "payload.tar.gz"', manifest_text)
+        self.assertIn('action = "tarball"', manifest_text)
+
+        install_result = self.run_cli(["dots", "--install", str(bundle_path)])
+        self.assertEqual(install_result.returncode, 0)
+        installed_link = self.home_dir / ".icons" / "Bibata-Modern-Ice" / "cursor-link"
+        self.assertTrue(installed_link.is_symlink())
+        self.assertEqual(os.readlink(installed_link), "cursor.png")
 
     def test_dots_source_override_accepts_git_url(self):
         config_path = Path(self.tmpdir.name) / "git-url-source.toml"
@@ -3604,6 +3786,26 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("Uninstalled kitty", result.stdout)
         self.assertFalse(tracked_file.exists(), "Uninstall should remove tracked files with templated manifest paths")
         self.assertFalse((Path(self.xdg_data) / "deez" / "dots" / "kitty.toml").exists())
+
+    def test_dots_uninstall_tarball_action_removes_destination(self):
+        dot = "cursor-bibata-modern-ice"
+        manifest_manager = deez_module.ManifestManager(base_dir=Path(self.xdg_data) / "deez" / "dots")
+        destination = self.home_dir / ".local/share/icons/Bibata-Modern-Ice"
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "cursor.theme").write_text("dummy")
+
+        manifest_manager.save(
+            dot,
+            {"owner": "ful1e5", "name": dot, "version": "2.0.7"},
+            [{"src": "Bibata-Modern-Ice.tar.gz", "dst": str(destination), "action": "tarball"}],
+        )
+
+        result = self.run_cli(["dots", "--uninstall", dot], input_data="y\n")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Uninstalled", result.stdout)
+        self.assertFalse(destination.exists(), "Uninstall should remove tarball-installed destination directories")
+        self.assertFalse((Path(self.xdg_data) / "deez" / "dots" / f"{dot}.toml").exists())
 
     def test_dots_uninstall_backups_current_dot_state(self):
         dot = "kitty"
