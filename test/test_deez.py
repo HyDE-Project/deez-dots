@@ -18,7 +18,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
 from deez_dots.commands.dots import _should_overwrite_installed_dot
-from deez_dots.core import compare_versions
+from deez_dots.core import WriteDots, compare_versions
 
 # --- SAFETY FIX: Hijack environment BEFORE loading any deez modules ---
 # This prevents module-level constants in Deez from capturing the user's 
@@ -83,6 +83,10 @@ class TestDeezCLI(unittest.TestCase):
         self.xdg_config.mkdir(parents=True, exist_ok=True)
         self.xdg_data.mkdir(parents=True, exist_ok=True)
         self.xdg_cache.mkdir(parents=True, exist_ok=True)
+        build_dir = SCRIPT_DIR / "build"
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+        build_dir.mkdir(parents=True, exist_ok=True)
         self.env = {
             "HOME": str(self.home_dir),
             "XDG_CONFIG_HOME": str(self.xdg_config),
@@ -324,14 +328,14 @@ class TestDeezCLI(unittest.TestCase):
 
     def test_should_overwrite_installed_dot_when_newer_same_owner(self):
         cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
-        cli.args = argparse.Namespace(force=False)
+        cli.args = argparse.Namespace()
         cli.manifest_manager.load_desc = lambda dot: {"owner": "hyde_project", "version": "1.2.3"}
 
         self.assertTrue(_should_overwrite_installed_dot(cli, "kitty", "hyde_project", "1.2.4"))
 
     def test_should_prompt_when_new_bundle_is_older_same_owner(self):
         cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
-        cli.args = argparse.Namespace(force=False)
+        cli.args = argparse.Namespace()
         cli.manifest_manager.load_desc = lambda dot: {"owner": "hyde_project", "version": "1.2.3"}
 
         with patch.object(deez_module.UI, "read_input", return_value="n"):
@@ -505,7 +509,7 @@ class TestDeezCLI(unittest.TestCase):
             "no_deps_checks": False,
             "no_deps_install": False,
             "no_compress": False,
-            "force": False,
+            "rebuild": False,
             "dry_run": False,
         }
         values.update(overrides)
@@ -939,6 +943,35 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("Using auto-discovered config from current directory:", result.stdout)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
         self.assertTrue((work_dir / "build" / "kitty-0.1.0.tar.gz").exists())
+
+    def test_dots_package_reuses_existing_bundle_when_only_pre_command_is_present(self):
+        work_dir = Path(self.tmpdir.name) / "workspace-reuse"
+        source_dir = work_dir / "source"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        config_path = work_dir / "dots.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+            'pre_command = "echo pre"\n'
+        )
+        build_dir = work_dir / "build"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        expected_bundle = build_dir / "kitty-0.1.0.tar.gz"
+        expected_bundle.write_bytes(b"existing bundle")
+        with patch.object(WriteDots, "stage", side_effect=AssertionError("stage should not be called")):
+            result = self.run_cli_in_cwd(["dots", "--package", "--config", str(config_path)], cwd=work_dir)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[ok] Bundled kitty ->", result.stdout)
+        self.assertEqual(expected_bundle.read_bytes(), b"existing bundle")
 
     def test_dots_deploy_auto_discovers_current_directory_config(self):
         work_dir = Path(self.tmpdir.name) / "workspace-deploy"
@@ -2952,6 +2985,20 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(mocked_run.call_count, 1)
         self.assertFalse(mocked_run.call_args.kwargs["capture_output"])
 
+    def test_write_dots_execute_commands_streams_hook_output(self):
+        calls = []
+
+        def fake_runner(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return True, "", ""
+
+        writer = deez_module.WriteDots(runner=fake_runner)
+        writer.execute_commands(["echo ok"])
+
+        self.assertEqual(calls[0][0], "echo ok")
+        self.assertTrue(calls[0][1].get("stream_output"))
+        self.assertTrue(calls[0][1].get("passthrough_output"))
+
     def test_package_manager_update_primes_sudo_and_streams_live_output(self):
         calls = []
 
@@ -3065,12 +3112,12 @@ class TestDeezCLI(unittest.TestCase):
         self.assertTrue((stale_dir / "old.txt").exists())
         self.assertTrue(bundle_path.exists())
 
-    def test_dots_package_force_removes_stale_extracted_build_dir(self):
+    def test_dots_package_rebuild_removes_stale_extracted_build_dir(self):
         source_dir = Path(self.tmpdir.name) / "source"
         config_file = source_dir / "Configs/.config/kitty/kitty.conf"
         config_file.parent.mkdir(parents=True, exist_ok=True)
         config_file.write_text("font_size 12")
-        config_path = Path(self.tmpdir.name) / "package-force.toml"
+        config_path = Path(self.tmpdir.name) / "package-rebuild.toml"
         config_path.write_text(
             '[global]\n'
             f'home = "{self.home_dir}"\n'
@@ -3091,12 +3138,47 @@ class TestDeezCLI(unittest.TestCase):
         if bundle_path.exists():
             bundle_path.unlink()
 
-        result = run_deez(["dots", "--package", "--force", "--config", str(config_path)], env=self.env)
+        result = run_deez(["dots", "--package", "--rebuild", "--config", str(config_path)], env=self.env)
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("Removed existing extracted build directory:", result.stdout)
         self.assertFalse(stale_dir.exists())
         self.assertTrue(bundle_path.exists())
+
+    def test_dots_package_reuses_existing_bundle_without_rebuild(self):
+        source_dir = Path(self.tmpdir.name) / "source"
+        config_file = source_dir / "Configs/.config/kitty/kitty.conf"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text("font_size 12")
+        config_path = Path(self.tmpdir.name) / "package-reuse.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'source_root = "Configs/.config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty/kitty.conf"]\n'
+        )
+        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
+        if bundle_path.exists():
+            bundle_path.unlink()
+
+        first_result = run_deez(["dots", "--package", "--config", str(config_path)], env=self.env)
+        self.assertEqual(first_result.returncode, 0)
+        self.assertTrue(bundle_path.exists())
+        first_hash = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+        first_inode = bundle_path.stat().st_ino
+
+        second_result = run_deez(["dots", "--package", "--config", str(config_path)], env=self.env)
+        self.assertEqual(second_result.returncode, 0)
+        self.assertIn("[ok] Bundled kitty ->", second_result.stdout)
+        self.assertEqual(first_hash, hashlib.sha256(bundle_path.read_bytes()).hexdigest())
+        self.assertEqual(first_inode, bundle_path.stat().st_ino)
 
     def test_dots_export_warns_about_stale_extracted_build_dir(self):
         config_path = Path(self.tmpdir.name) / "export-stale.toml"
@@ -3126,8 +3208,8 @@ class TestDeezCLI(unittest.TestCase):
         self.assertTrue((stale_dir / "old.txt").exists())
         self.assertTrue(bundle_path.exists())
 
-    def test_dots_export_force_removes_stale_extracted_build_dir(self):
-        config_path = Path(self.tmpdir.name) / "export-force.toml"
+    def test_dots_export_rebuild_removes_stale_extracted_build_dir(self):
+        config_path = Path(self.tmpdir.name) / "export-rebuild.toml"
         config_path.write_text(
             '[global]\n'
             f'home = "{self.home_dir}"\n'
@@ -3147,7 +3229,7 @@ class TestDeezCLI(unittest.TestCase):
         if bundle_path.exists():
             bundle_path.unlink()
 
-        result = run_deez(["dots", "--export", "--force", "--config", str(config_path)], env=self.env)
+        result = run_deez(["dots", "--export", "--rebuild", "--config", str(config_path)], env=self.env)
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("Removed existing extracted build directory:", result.stdout)

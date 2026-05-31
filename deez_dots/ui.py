@@ -45,6 +45,11 @@ class UI:
         return f"{color}{label}{cls._RESET}"
 
     @classmethod
+    def style(cls, text: str, color: str) -> str:
+        """Return a color-styled string if colors are enabled."""
+        return cls._prefix(text, color)
+
+    @classmethod
     def _emit(cls, label: str, msg: str, color: str) -> None:
         with cls._output_lock:
             if cls._loader and cls._loader.is_running():

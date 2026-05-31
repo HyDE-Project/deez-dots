@@ -1288,16 +1288,18 @@ class WriteDots:
                 candidate = Path(cmd) if Path(cmd).is_absolute() else Path(cwd or ".") / cmd
                 if candidate.exists():
                     resolved = candidate
+            LOG.debug(f"Running command: {cmd}")
+            was_paused = UI.pause_loader()
             try:
                 if resolved and os.access(resolved, os.X_OK):
                     LOG.debug("Executing (executable): %s", resolved)
-                    success, out, err = self.runner([str(resolved)], cwd=cwd)
+                    success, out, err = self._call_runner([str(resolved)], cwd=cwd, stream_output=True, passthrough_output=True)
                 elif resolved and resolved.suffix == ".py":
                     LOG.debug("Executing (python): %s", resolved)
-                    success, out, err = self.runner([os.sys.executable, str(resolved)], cwd=cwd)
+                    success, out, err = self._call_runner([os.sys.executable, str(resolved)], cwd=cwd, stream_output=True, passthrough_output=True)
                 else:
                     LOG.debug("Executing (shell): %s", cmd)
-                    success, out, err = self.runner(cmd, shell=True, cwd=cwd)
+                    success, out, err = self._call_runner(cmd, shell=True, cwd=cwd, stream_output=True, passthrough_output=True)
                 if success:
                     continue
                 message = err or out or "command failed"
@@ -1313,6 +1315,17 @@ class WriteDots:
                 else:
                     UI.error(f"Command failed: {cmd}: {e}")
                     raise
+            finally:
+                UI.resume_loader(was_paused)
+
+    def _call_runner(self, *args: Any, **kwargs: Any) -> RunResult:
+        try:
+            return self.runner(*args, **kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument" in str(exc):
+                filtered_kwargs = {k: v for k, v in kwargs.items() if k not in {"stream_output", "passthrough_output"}}
+                return self.runner(*args, **filtered_kwargs)
+            raise
 
     def _run_sudo_command(self, command: List[str], description: str) -> bool:
         """Run a privileged command via sudo, showing prompts and output."""
@@ -1320,7 +1333,7 @@ class WriteDots:
             LOG.debug("sudo not available to perform privileged action: %s", description)
             return False
         UI.info(f"Privileged operation required: {description}")
-        UI.info(f"Running elevated command: sudo {' '.join(str(part) for part in command)}")
+        LOG.debug(f"Running elevated command: sudo {' '.join(str(part) for part in command)}")
         was_paused = UI.pause_loader()
         try:
             success, out, err = self.runner(
@@ -1437,6 +1450,28 @@ class WriteDots:
         base = Path(out_dir) if out_dir else Path.cwd() / "build"
         base.mkdir(parents=True, exist_ok=True)
         return str(base / f"{dot}-{safe_ver}.tar.gz")
+
+    def _output_exists(self, pkg_path: str) -> bool:
+        bundle_path = Path(pkg_path)
+        if bundle_path.exists():
+            return True
+        if pkg_path.endswith(".tar.gz"):
+            extracted_dir = Path(pkg_path[: -len(".tar.gz")])
+            if extracted_dir.exists():
+                return True
+        return False
+
+    def _remove_existing_output(self, pkg_path: str) -> None:
+        bundle_path = Path(pkg_path)
+        if bundle_path.exists():
+            if bundle_path.is_dir():
+                shutil.rmtree(bundle_path)
+            else:
+                bundle_path.unlink()
+        if pkg_path.endswith(".tar.gz"):
+            extracted_dir = Path(pkg_path[: -len(".tar.gz")])
+            if extracted_dir.exists():
+                shutil.rmtree(extracted_dir)
 
     @staticmethod
     def _expand_files(root_path: Union[str, Path]) -> List[str]:
@@ -1889,7 +1924,7 @@ class WriteDots:
                     extracted_dir.unlink()
                 UI.warn(f"Removed existing extracted build directory: {extracted_dir}")
             else:
-                UI.warn(f"Existing extracted build directory may be stale: {extracted_dir}. Use --force to remove it.")
+                UI.warn(f"Existing extracted build directory may be stale: {extracted_dir}. Use --rebuild to remove it.")
         Path(pkg_path).parent.mkdir(parents=True, exist_ok=True)
         with tarfile.open(pkg_path, "w:gz") as tar:
             for child in sorted(stage.iterdir()):
@@ -2046,6 +2081,12 @@ class WriteDots:
             if build_command:
                 desc_data["build_command"] = build_command
             pkg_path = self._pkg_path(dot, version, out_dir=out_dir)
+            if not overwrite_existing:
+                existing_bundle = Path(pkg_path)
+                if existing_bundle.is_file():
+                    LOG.debug("Reusing existing package output: %s", existing_bundle)
+                    UI.success(f"Bundled {dot} -> {existing_bundle}")
+                    return str(existing_bundle)
             out_path = self._write_bundle(stage_dir, pkg_path, desc_data, all_file_pairs, compress=compress, overwrite_existing=overwrite_existing)
             LOG.debug("Bundled %s -> %s", dot, out_path)
             UI.success(f"Bundled {dot} -> {out_path}")
@@ -2806,6 +2847,7 @@ class DeezCLI:
     ) -> Optional[str]:
         if not command:
             return None
+        LOG.debug(f"Executing {scope_label} pre_command: {command}")
         writer = WriteDots()
         try:
             writer.execute_commands([command], cwd=cwd, soft_fail=False)
@@ -3973,7 +4015,7 @@ class DeezCLI:
         ]
         return dot, bundle_entries, filtered_entries, kept_pairs
 
-    def _do_package(self, global_owner: str, global_home: str, global_version: str, git_url: str = "", target_branch: str = "", compress: bool = True, out_dir: Optional[str] = None, overwrite_existing: bool = False, sections: Optional[List[str]] = None, dry_run: bool = False) -> List[str]:
+    def _do_package(self, global_owner: str, global_home: str, global_version: str, git_url: str = "", target_branch: str = "", compress: bool = True, out_dir: Optional[str] = None, overwrite_existing: bool = False, rebuild: bool = False, sections: Optional[List[str]] = None, dry_run: bool = False) -> List[str]:
         writer = WriteDots()
         git_handler = GitHandler(self.main_config)
         pkg_paths: List[str] = []
@@ -3993,6 +4035,12 @@ class DeezCLI:
             pre_command = dot_data.get("pre_command")
             post_command = dot_data.get("post_command")
             build_command = dot_data.get("build_command")
+            pkg_path = writer._pkg_path(dot_section, section_version, out_dir=out_dir)
+            if not rebuild and Path(pkg_path).is_file():
+                LOG.debug("Reusing existing package bundle for %s: %s", dot_section, pkg_path)
+                UI.success(f"Bundled {dot_section} -> {pkg_path}")
+                pkg_paths.append(pkg_path)
+                continue
             if dry_run:
                 self._announce_dry_run_pre_command(pre_command, scope_label=f"dot '{dot_section}'")
             elif self._skip_on_failed_pre_command(pre_command, scope_label=f"dot '{dot_section}'", cwd=hook_cwd):
@@ -4045,7 +4093,7 @@ class DeezCLI:
                 pre_command=pre_command,
                 post_command=post_command,
                 build_command=build_command,
-                overwrite_existing=overwrite_existing,
+                overwrite_existing=(overwrite_existing or rebuild),
             )
             if pkg_path:
                 pkg_paths.append(pkg_path)

@@ -7,8 +7,6 @@ namespace normalization in other integrations.
 from __future__ import annotations
 
 import argparse
-import shutil
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,7 +33,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--skip-git", action="store_true", dest="skip_git", help="Skip git refresh operations when preparing source")
     parser.add_argument("--no-deps-install", action="store_true", dest="no_deps_install", help="Check dependencies but do not auto-install missing ones before install or deploy")
     parser.add_argument("--no-compress", action="store_true", dest="no_compress", help="Skip tar.gz packing; leave output as a plain directory (for inspection)")
-    parser.add_argument("--force", action="store_true", dest="force", help="Remove an existing extracted build directory beside the output tarball before writing")
+    parser.add_argument("--rebuild", action="store_true", dest="rebuild", help="Remove cached or existing build output before bundling")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would happen without making live changes")
 
 
@@ -150,6 +148,8 @@ def _prepare_global_pre_command(cli: Any, context: DotsRuntimeContext) -> None:
     if context.dry_run:
         cli._announce_dry_run_pre_command(context.global_pre_command, scope_label="global")
         return
+    if context.global_pre_command:
+        LOG.debug(f"Running global pre_command: {context.global_pre_command}")
     cli._require_pre_command(context.global_pre_command, scope_label="global", cwd=context.hook_cwd)
 
 
@@ -219,12 +219,14 @@ def _should_overwrite_installed_dot(cli: Any, dot: str, new_owner: str | None, n
     )
     if not conflict:
         return True
-    if getattr(cli.args, "force", False):
-        UI.info(f"Overwriting installed dot '{dot}' owned by {old_owner} with version {new_version} owned by {new_owner}.")
-        return True
+    colored_dot = UI.style(dot, UI._CYAN)
+    colored_old_version = UI.style(old_version, UI._GREEN)
+    colored_new_version = UI.style(new_version, UI._GREEN)
+    colored_old_owner = UI.style(old_owner, UI._MAGENTA)
+    colored_new_owner = UI.style(new_owner, UI._MAGENTA)
     prompt = (
-        f"Dot '{dot}' version {old_version} owned by {old_owner} is installed. "
-        f"Overwrite with version {new_version} owned by {new_owner}? [y/N]: "
+        f"Dot '{colored_dot}' version {colored_old_version} owned by {colored_old_owner} is installed. "
+        f"Overwrite with version {colored_new_version} owned by {colored_new_owner}? [y/N]: "
     )
     answer = UI.read_input(prompt).strip().lower()
     if answer in ("y", "yes"):
@@ -259,7 +261,7 @@ def execute(cli: Any) -> None:
     """Execute the normalized `deez dots` flow using an initialized CLI instance."""
     context = build_runtime_context(cli)
     args = cli.args
-    force = getattr(args, "force", False)
+    rebuild = bool(getattr(args, "rebuild", False))
     dry_run = bool(getattr(args, "dry_run", False))
     compress = not getattr(args, "no_compress", False)
     install_tarballs = getattr(args, "install_tarballs", []) or []
@@ -270,6 +272,7 @@ def execute(cli: Any) -> None:
         if not selected_sections:
             return
         if context.global_build_command:
+            LOG.debug(f"Running global build_command: {context.global_build_command}")
             WriteDots().execute_commands([context.global_build_command], cwd=cli.source_dir)
         _run_global_action(
             cli,
@@ -282,7 +285,9 @@ def execute(cli: Any) -> None:
             git_url=context.git_url,
             target_branch=context.target_branch,
             compress=compress,
-            overwrite_existing=force,
+            out_dir=None,
+            overwrite_existing=rebuild,
+            rebuild=rebuild,
             sections=selected_sections,
             dry_run=dry_run,
             require_pre_command=True,
@@ -302,7 +307,7 @@ def execute(cli: Any) -> None:
             context.global_version,
             selected_sections,
             compress=compress,
-            overwrite_existing=force,
+            overwrite_existing=rebuild,
             dry_run=dry_run,
             require_pre_command=True,
         )
@@ -325,36 +330,36 @@ def execute(cli: Any) -> None:
             return
         UI.set_loader_message("Resolving dependencies...")
         cli._resolve_config_dependencies(selected_sections)
-        tmp_dir = tempfile.mkdtemp(prefix="deez-deploy-")
         hook_runner = WriteDots() if context.global_post_command else None
-        try:
-            pkg_paths = _run_global_action(cli, context, "Bundling selected dots...", cli._do_package,
-                context.global_owner,
-                context.global_home,
-                context.global_version,
-                git_url=context.git_url,
-                target_branch=context.target_branch,
-                out_dir=tmp_dir,
-                sections=selected_sections,
-                compress=compress,
-                dry_run=dry_run,
-                require_pre_command=True,
-            )
-            if not pkg_paths:
-                UI.error("Deploy failed: bundling produced no bundles.")
-                raise SystemExit(1)
-            dot_to_pkg = _find_pkg_for_dots(pkg_paths, selected_sections)
-            missing_dots = [dot for dot in selected_sections if dot not in dot_to_pkg]
-            if missing_dots:
-                UI.error(f"Deploy failed: bundling failed for selected dots: {', '.join(missing_dots)}.")
-                raise SystemExit(1)
-            for dot in selected_sections:
-                pkg_path = dot_to_pkg.get(dot)
-                _deploy_dot(cli, context, dot, pkg_path)
-            if hook_runner is not None:
-                hook_runner.execute_commands([context.global_post_command], cwd=cli.source_dir)
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        cache_build_dir = Path(DeezUtils.xdg_cache_home()) / "deez" / "dots" / "build"
+        cache_build_dir.mkdir(parents=True, exist_ok=True)
+        pkg_paths = _run_global_action(cli, context, "Bundling selected dots...", cli._do_package,
+            context.global_owner,
+            context.global_home,
+            context.global_version,
+            git_url=context.git_url,
+            target_branch=context.target_branch,
+            out_dir=str(cache_build_dir),
+            sections=selected_sections,
+            compress=compress,
+            rebuild=rebuild,
+            dry_run=dry_run,
+            require_pre_command=True,
+        )
+        if not pkg_paths:
+            UI.error("Deploy failed: bundling produced no bundles.")
+            raise SystemExit(1)
+        dot_to_pkg = _find_pkg_for_dots(pkg_paths, selected_sections)
+        missing_dots = [dot for dot in selected_sections if dot not in dot_to_pkg]
+        if missing_dots:
+            UI.error(f"Deploy failed: bundling failed for selected dots: {', '.join(missing_dots)}.")
+            raise SystemExit(1)
+        for dot in selected_sections:
+            pkg_path = dot_to_pkg.get(dot)
+            _deploy_dot(cli, context, dot, pkg_path)
+        if hook_runner is not None:
+            LOG.debug(f"Running global post_command: {context.global_post_command}")
+            hook_runner.execute_commands([context.global_post_command], cwd=cli.source_dir)
         UI.success("Deploy complete")
         return
     if args.do_uninstall:
