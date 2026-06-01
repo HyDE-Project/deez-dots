@@ -944,8 +944,8 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
         self.assertTrue((work_dir / "build" / "kitty-0.1.0.tar.gz").exists())
 
-    def test_dots_package_reuses_existing_bundle_when_only_pre_command_is_present(self):
-        work_dir = Path(self.tmpdir.name) / "workspace-reuse"
+    def test_dots_package_rebuilds_invalid_existing_bundle(self):
+        work_dir = Path(self.tmpdir.name) / "workspace-rebuild"
         source_dir = work_dir / "source"
         work_dir.mkdir(parents=True, exist_ok=True)
         source_dir.mkdir(parents=True, exist_ok=True)
@@ -967,11 +967,14 @@ class TestDeezCLI(unittest.TestCase):
         build_dir.mkdir(parents=True, exist_ok=True)
         expected_bundle = build_dir / "kitty-0.1.0.tar.gz"
         expected_bundle.write_bytes(b"existing bundle")
-        with patch.object(WriteDots, "stage", side_effect=AssertionError("stage should not be called")):
-            result = self.run_cli_in_cwd(["dots", "--package", "--config", str(config_path)], cwd=work_dir)
+
+        result = self.run_cli_in_cwd(["dots", "--package", "--config", str(config_path)], cwd=work_dir)
+
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
-        self.assertEqual(expected_bundle.read_bytes(), b"existing bundle")
+        with tarfile.open(expected_bundle, "r:gz") as tar:
+            names = tar.getnames()
+        self.assertIn("manifest.toml", names)
 
     def test_dots_deploy_auto_discovers_current_directory_config(self):
         work_dir = Path(self.tmpdir.name) / "workspace-deploy"
@@ -1794,6 +1797,23 @@ class TestDeezCLI(unittest.TestCase):
     def test_prepare_source_uses_file_source_for_blob_file_url(self):
         handler = deez_module.GitHandler({})
         url = "https://github.com/notofonts/noto-cjk/blob/main/Sans/OTC/NotoSansCJK-Regular.ttc/"
+        with patch.object(deez_module.GitHandler, "prepare_file_source", return_value="/tmp/file-source") as prepare_file_source:
+            result = handler.prepare_source(url, None, "main", explicit_source_path=True)
+        prepare_file_source.assert_called_once_with(url)
+        self.assertEqual(result, "/tmp/file-source")
+
+    def test_is_source_url_accepts_hinted_blob_url(self):
+        url = "blob+https://github.com/notofonts/noto-cjk/blob/main/Sans/OTC/NotoSansCJK-Regular.ttc"
+        self.assertTrue(deez_module.GitHandler.is_source_url(url))
+        self.assertTrue(deez_module.GitHandler.is_file_source_url(url))
+        self.assertEqual(
+            deez_module.GitHandler.normalize_file_source_url(url),
+            "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTC/NotoSansCJK-Regular.ttc",
+        )
+
+    def test_prepare_source_uses_file_source_for_hinted_blob_url(self):
+        handler = deez_module.GitHandler({})
+        url = "blob+https://github.com/notofonts/noto-cjk/blob/main/Sans/OTC/NotoSansCJK-Regular.ttc"
         with patch.object(deez_module.GitHandler, "prepare_file_source", return_value="/tmp/file-source") as prepare_file_source:
             result = handler.prepare_source(url, None, "main", explicit_source_path=True)
         prepare_file_source.assert_called_once_with(url)

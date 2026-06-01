@@ -1894,6 +1894,22 @@ class WriteDots:
             tar.extractall(path=destination_path)
         return True
 
+    def _validate_bundle(self, pkg_path: str) -> bool:
+        bundle_path = Path(pkg_path)
+        if not bundle_path.is_file():
+            return False
+        try:
+            with tarfile.open(bundle_path, "r:gz") as tar:
+                manifest_member = tar.extractfile("manifest.toml")
+                if manifest_member is None:
+                    LOG.debug("Bundle validation failed: missing manifest.toml: %s", bundle_path)
+                    return False
+                manifest_member.read()
+        except Exception:
+            LOG.debug("Bundle validation failed: %s", bundle_path, exc_info=True)
+            return False
+        return True
+
     def _write_bundle(
         self,
         stage_dir: Union[str, Path],
@@ -1932,6 +1948,8 @@ class WriteDots:
                     tar.add(child, arcname="data")
                 else:
                     tar.add(child, arcname=child.name)
+        if not self._validate_bundle(pkg_path):
+            raise RuntimeError(f"Failed to validate newly written bundle: {pkg_path}")
         shutil.rmtree(stage)
         LOG.debug("Wrote compressed bundle to %s", pkg_path)
         return pkg_path
@@ -2084,9 +2102,12 @@ class WriteDots:
             if not overwrite_existing:
                 existing_bundle = Path(pkg_path)
                 if existing_bundle.is_file():
-                    LOG.debug("Reusing existing package output: %s", existing_bundle)
-                    UI.success(f"Bundled {dot} -> {existing_bundle}")
-                    return str(existing_bundle)
+                    if self._validate_bundle(str(existing_bundle)):
+                        LOG.debug("Reusing existing valid package output: %s", existing_bundle)
+                        UI.success(f"Bundled {dot} -> {existing_bundle}")
+                        return str(existing_bundle)
+                    LOG.warning("Existing package output is invalid, rebuilding: %s", existing_bundle)
+                    self._remove_existing_output(pkg_path)
             out_path = self._write_bundle(stage_dir, pkg_path, desc_data, all_file_pairs, compress=compress, overwrite_existing=overwrite_existing)
             LOG.debug("Bundled %s -> %s", dot, out_path)
             UI.success(f"Bundled {dot} -> {out_path}")
@@ -2280,9 +2301,22 @@ class GitHandler:
         return out.strip() if success else ""
 
     @staticmethod
+    def _parse_source_url(source: Optional[Union[str, Path]]) -> tuple[str, urllib.parse.ParseResult]:
+        source_text = str(source or "").strip()
+        parsed = urllib.parse.urlparse(source_text)
+        scheme = parsed.scheme or ""
+        if "+" in scheme:
+            hint, scheme = scheme.split("+", 1)
+            if scheme in ("http", "https", "file"):
+                source_text = source_text.split("+", 1)[1]
+                parsed = urllib.parse.urlparse(source_text)
+                return hint.lower(), parsed
+        return "", parsed
+
+    @staticmethod
     def is_source_url(source: Optional[Union[str, Path]]) -> bool:
         """Return True if the source string is a URL pointing to source content."""
-        parsed = urllib.parse.urlparse(str(source or "").strip())
+        _, parsed = GitHandler._parse_source_url(source)
         return parsed.scheme in ("http", "https", "file")
 
     @staticmethod
@@ -2299,30 +2333,43 @@ class GitHandler:
         )
 
     @staticmethod
+    def _is_github_file_url(parsed: urllib.parse.ParseResult) -> bool:
+        if parsed.netloc == "raw.githubusercontent.com":
+            return bool(Path(parsed.path).name)
+        if parsed.netloc == "github.com":
+            parts = parsed.path.strip("/").split("/")
+            return len(parts) >= 5 and parts[2] == "blob" and bool(Path(parsed.path).name)
+        return False
+
+    @staticmethod
     def is_file_source_url(source: Optional[Union[str, Path]]) -> bool:
         """Return True if the URL points to a single file source."""
-        parsed = urllib.parse.urlparse(str(source or "").strip())
+        hint, parsed = GitHandler._parse_source_url(source)
         if parsed.scheme not in ("http", "https", "file"):
             return False
         if GitHandler.is_release(str(source)):
             return False
         path = parsed.path.rstrip("/")
         suffix = Path(path).suffix
-        if suffix == ".git":
-            return False
-        return bool(suffix)
+        if suffix and suffix != ".git":
+            return True
+        if hint in ("blob", "raw"):
+            return bool(Path(path).name)
+        return GitHandler._is_github_file_url(parsed)
 
     @staticmethod
     def normalize_file_source_url(source: str) -> str:
         """Rewrite known file source URLs into direct download URLs."""
         source_text = str(source or "").strip()
-        parsed = urllib.parse.urlparse(source_text)
+        hint, parsed = GitHandler._parse_source_url(source_text)
         if parsed.scheme in ("http", "https") and parsed.netloc == "github.com":
             parts = parsed.path.split("/")
             if len(parts) >= 6 and parts[3] == "blob":
                 user, repo, branch = parts[1], parts[2], parts[4]
                 raw_path = "/".join(parts[5:])
                 return f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{raw_path}"
+        if hint and parsed.scheme in ("http", "https", "file"):
+            return urllib.parse.urlunparse(parsed)
         return source_text
 
     def prepare_file_source(self, source: Union[str, Path]) -> str:
@@ -2342,7 +2389,7 @@ class GitHandler:
         cached_file = content_root / file_name
 
         if self.is_source_url(source_text):
-            parsed = urllib.parse.urlparse(source_text)
+            _, parsed = self._parse_source_url(source_text)
             if parsed.scheme == "file":
                 local_file = self.file_url_to_path(source_text)
                 if not local_file.is_file():
@@ -2361,7 +2408,7 @@ class GitHandler:
     @staticmethod
     def file_url_to_path(url: str) -> Path:
         """Convert a file:// URL into a local filesystem path."""
-        parsed = urllib.parse.urlparse(url)
+        _, parsed = GitHandler._parse_source_url(url)
         path = urllib.request.url2pathname(parsed.path or "")
         if parsed.netloc and parsed.netloc not in ("", "localhost"):
             path = f"//{parsed.netloc}{path}"
@@ -2373,7 +2420,7 @@ class GitHandler:
         source_text = str(source).strip()
         if not source_text:
             return "source"
-        parsed = urllib.parse.urlparse(source_text)
+        _, parsed = GitHandler._parse_source_url(source_text)
         if parsed.scheme == "file":
             local_path = GitHandler.file_url_to_path(source_text)
             if local_path.exists():
@@ -2434,7 +2481,8 @@ class GitHandler:
         cache_root.mkdir(parents=True, exist_ok=True)
 
         if self.is_source_url(source_text):
-            parsed = urllib.parse.urlparse(source_text)
+            source_text = self.normalize_file_source_url(source_text)
+            _, parsed = self._parse_source_url(source_text)
             if parsed.scheme == "file":
                 local_archive = self.file_url_to_path(source_text)
                 if not local_archive.is_file():
@@ -4037,10 +4085,13 @@ class DeezCLI:
             build_command = dot_data.get("build_command")
             pkg_path = writer._pkg_path(dot_section, section_version, out_dir=out_dir)
             if not rebuild and Path(pkg_path).is_file():
-                LOG.debug("Reusing existing package bundle for %s: %s", dot_section, pkg_path)
-                UI.success(f"Bundled {dot_section} -> {pkg_path}")
-                pkg_paths.append(pkg_path)
-                continue
+                if writer._validate_bundle(pkg_path):
+                    LOG.debug("Reusing existing valid package bundle for %s: %s", dot_section, pkg_path)
+                    UI.success(f"Bundled {dot_section} -> {pkg_path}")
+                    pkg_paths.append(pkg_path)
+                    continue
+                LOG.warning("Existing package bundle is invalid, rebuilding: %s", pkg_path)
+                writer._remove_existing_output(pkg_path)
             if dry_run:
                 self._announce_dry_run_pre_command(pre_command, scope_label=f"dot '{dot_section}'")
             elif self._skip_on_failed_pre_command(pre_command, scope_label=f"dot '{dot_section}'", cwd=hook_cwd):
