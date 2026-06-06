@@ -1,24 +1,18 @@
 [global]
 name = "Dots Hub"
 owner = "Hyde-Project"
-# git = "https://github.com/Hyde-Project/hub.git"
-# branch = "master"
+git = "https://github.com/Hyde-Project/hub.git"
+branch = "master"
 version = "0.1.0"
-
 
 [waybar-opentabletdriver]
 preCmd = "echo 'you are installing waybar-opentabletdriver'"
 postCmd = "echo 'waybar-opentabletdriver is installed'"
 
-
 [[waybar-opentabletdriver.dependency]]
-yay = [ "opentabletdriver" ]
-
+yay = ["opentabletdriver"]
 
 [[waybar-opentabletdriver.files]]
 source_root = "./waybar/opentabletdriver/Configs/.config/waybar/"
 target_root = "${XDG_CONFIG_HOME}/waybar/"
-paths = [
-    "modules/opentabletdriver.jsonc",
-    "scripts/opentabletdriver.py",
-]
+paths = ["modules/opentabletdriver.jsonc", "scripts/opentabletdriver.py"]
