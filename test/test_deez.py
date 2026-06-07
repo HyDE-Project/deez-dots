@@ -4011,6 +4011,447 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(desc.get("hash"), hashlib.sha256(bundle_path.read_bytes()).hexdigest())
         self.assertNotIn("content_hash", entries[0])
 
+    def test_dots_link_manifest_keeps_preserve_entries_and_metadata(self):
+        source_dir = Path(self.tmpdir.name) / "source-link-manifest"
+        linked_source = source_dir / "Configs/.config/kitty/kitty.conf"
+        preserved_source = source_dir / "Configs/.config/kitty/theme.conf"
+        linked_source.parent.mkdir(parents=True, exist_ok=True)
+        linked_source.write_text("font_size 12")
+        preserved_source.write_text("include theme")
+
+        preserve_target = self.home_dir / ".config/kitty/theme.conf"
+        preserve_target.parent.mkdir(parents=True, exist_ok=True)
+        preserve_target.write_text("keep this")
+
+        main_config = {
+            "global": {
+                "home": str(self.home_dir),
+                "source": str(source_dir),
+                "owner": "hyde_project",
+                "version": "0.1.0",
+                "branch": "lua",
+            },
+            "kitty": {
+                "dependency": [{"yay": ["kitty"]}],
+                "pre_command": "echo 'Pre commands '",
+                "post_command": "echo 'HyDE backed up!'",
+                "files": [
+                    {
+                        "source_root": "Configs/.config",
+                        "target_root": "$HOME/.config",
+                        "paths": ["kitty/kitty.conf"],
+                        "action": "sync",
+                    },
+                    {
+                        "source_root": "Configs/.config",
+                        "target_root": "$HOME/.config",
+                        "paths": ["kitty/theme.conf"],
+                        "action": "preserve",
+                        "dependency": [{"yay": ["imagemagick", "hyprland"]}],
+                    },
+                ],
+            },
+        }
+
+        with patch.dict(os.environ, self.env, clear=False):
+            cli = self._make_cli(main_config, source_dir=source_dir)
+            cli.args = argparse.Namespace(no_backup=False)
+            cli._do_link(["kitty"])
+
+        manifest_manager = deez_module.ManifestManager(base_dir=Path(self.xdg_data) / "deez" / "dots")
+        desc = manifest_manager.load_desc("kitty")
+        entries = manifest_manager.get_file_entries("kitty")
+        entries_by_src = {entry["src"]: entry for entry in entries}
+        linked_target = self.home_dir / ".config/kitty/kitty.conf"
+
+        self.assertEqual(desc.get("origin"), "link")
+        self.assertEqual(desc.get("hash"), "LINK")
+        self.assertEqual(desc.get("owner"), "hyde_project")
+        self.assertEqual(desc.get("version"), "0.1.0")
+        self.assertEqual(desc.get("branch"), "lua")
+        self.assertEqual(desc.get("dependency"), [{"yay": ["kitty"]}])
+        self.assertEqual(desc.get("pre_command"), "echo 'Pre commands '")
+        self.assertEqual(desc.get("post_command"), "echo 'HyDE backed up!'")
+        self.assertTrue(desc.get("builddate"))
+        self.assertEqual(len(entries), 2)
+        self.assertTrue(linked_target.is_symlink())
+        self.assertEqual(linked_target.resolve(), linked_source.resolve())
+        self.assertFalse(preserve_target.is_symlink())
+        self.assertEqual(preserve_target.read_text(), "keep this")
+
+        linked_entry = entries_by_src["Configs/.config/kitty/kitty.conf"]
+        preserve_entry = entries_by_src["Configs/.config/kitty/theme.conf"]
+        self.assertTrue(linked_entry.get("installed"))
+        self.assertEqual(linked_entry.get("action"), "sync")
+        self.assertEqual(linked_entry.get("dst"), "${HOME}/.config/kitty/kitty.conf")
+        self.assertTrue(preserve_entry.get("installed"))
+        self.assertEqual(preserve_entry.get("action"), "preserve")
+        self.assertEqual(preserve_entry.get("dst"), "${HOME}/.config/kitty/theme.conf")
+        self.assertEqual(preserve_entry.get("dependency"), [{"yay": ["imagemagick", "hyprland"]}])
+
+    def test_dots_link_uninstalls_existing_tracked_targets_before_relink(self):
+        source_dir = Path(self.tmpdir.name) / "source-link-clean"
+        linked_source = source_dir / "Configs/.config/kitty/kitty.conf"
+        linked_source.parent.mkdir(parents=True, exist_ok=True)
+        linked_source.write_text("font_size 14")
+
+        old_target = self.home_dir / ".config/kitty/old.conf"
+        linked_target = self.home_dir / ".config/kitty/kitty.conf"
+        preserve_target = self.home_dir / ".config/kitty/theme.conf"
+        old_target.parent.mkdir(parents=True, exist_ok=True)
+        old_target.write_text("remove me")
+        linked_target.write_text("old content")
+        preserve_target.write_text("keep me")
+
+        self._write_installed_manifest(
+            "kitty",
+            owner="hyde_project",
+            version="1.0.0",
+            files=[
+                {"src": ".config/kitty/old.conf", "dst": str(old_target), "action": "sync"},
+                {"src": ".config/kitty/kitty.conf", "dst": str(linked_target), "action": "sync"},
+                {"src": ".config/kitty/theme.conf", "dst": str(preserve_target), "action": "preserve"},
+            ],
+        )
+
+        main_config = {
+            "global": {
+                "home": str(self.home_dir),
+                "source": str(source_dir),
+                "owner": "hyde_project",
+                "version": "2.0.0",
+            },
+            "kitty": {
+                "files": [
+                    {
+                        "source_root": "Configs/.config",
+                        "target_root": "$HOME/.config",
+                        "paths": ["kitty/kitty.conf"],
+                        "action": "sync",
+                    },
+                    {
+                        "source_root": "Configs/.config",
+                        "target_root": "$HOME/.config",
+                        "paths": ["kitty/theme.conf"],
+                        "action": "preserve",
+                    },
+                ],
+            },
+        }
+
+        with patch.dict(os.environ, self.env, clear=False):
+            cli = self._make_cli(main_config, source_dir=source_dir)
+            cli.args = argparse.Namespace(no_backup=False)
+            cli._do_link(["kitty"])
+
+        backup_base = Path(self.xdg_data) / "deez" / "backup" / "user"
+        backups = [p for p in backup_base.rglob("*.tar.gz") if any(part.startswith("kitty.") for part in p.parts)]
+        manifest_manager = deez_module.ManifestManager(base_dir=Path(self.xdg_data) / "deez" / "dots")
+        entries = manifest_manager.get_file_entries("kitty")
+
+        self.assertTrue(backups, "Expected relink to back up the existing installed dot before uninstalling it")
+        self.assertFalse(old_target.exists(), "Relink should clean tracked targets that are no longer in the manifest")
+        self.assertTrue(linked_target.is_symlink())
+        self.assertEqual(linked_target.resolve(), linked_source.resolve())
+        self.assertTrue(preserve_target.exists())
+        self.assertFalse(preserve_target.is_symlink())
+        self.assertEqual(preserve_target.read_text(), "keep me")
+        self.assertEqual({entry["src"] for entry in entries}, {"Configs/.config/kitty/kitty.conf", "Configs/.config/kitty/theme.conf"})
+
+    def test_dots_link_relink_keeps_preserve_targets_for_existing_link_manifest(self):
+        source_dir = Path(self.tmpdir.name) / "source-link-relink"
+        linked_source = source_dir / "Configs/.config/kitty/kitty.conf"
+        preserved_source = source_dir / "Configs/.config/kitty/theme.conf"
+        linked_source.parent.mkdir(parents=True, exist_ok=True)
+        linked_source.write_text("font_size 16")
+        preserved_source.write_text("source theme should not be linked")
+
+        linked_target = self.home_dir / ".config/kitty/kitty.conf"
+        preserve_target = self.home_dir / ".config/kitty/theme.conf"
+        linked_target.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(linked_source, linked_target)
+        preserve_target.write_text("user theme")
+
+        manifest_manager = deez_module.ManifestManager(base_dir=Path(self.xdg_data) / "deez" / "dots")
+        manifest_manager.save(
+            "kitty",
+            {
+                "name": "kitty",
+                "owner": "hyde_project",
+                "version": "1.0.0",
+                "hash": "LINK",
+                "origin": "link",
+            },
+            [
+                {
+                    "src": "Configs/.config/kitty/kitty.conf",
+                    "dst": deez_module.DeezUtils.template_path(str(linked_target)),
+                    "action": "sync",
+                    "installed": True,
+                },
+                {
+                    "src": "Configs/.config/kitty/theme.conf",
+                    "dst": deez_module.DeezUtils.template_path(str(preserve_target)),
+                    "action": "preserve",
+                    "installed": True,
+                },
+            ],
+        )
+
+        main_config = {
+            "global": {
+                "home": str(self.home_dir),
+                "source": str(source_dir),
+                "owner": "hyde_project",
+                "version": "2.0.0",
+            },
+            "kitty": {
+                "files": [
+                    {
+                        "source_root": "Configs/.config",
+                        "target_root": "$HOME/.config",
+                        "paths": ["kitty/kitty.conf"],
+                        "action": "sync",
+                    },
+                    {
+                        "source_root": "Configs/.config",
+                        "target_root": "$HOME/.config",
+                        "paths": ["kitty/theme.conf"],
+                        "action": "preserve",
+                    },
+                ],
+            },
+        }
+
+        with patch.dict(os.environ, self.env, clear=False):
+            cli = self._make_cli(main_config, source_dir=source_dir)
+            cli.args = argparse.Namespace(no_backup=False)
+            cli._do_link(["kitty"])
+
+        entries = manifest_manager.get_file_entries("kitty")
+        entries_by_src = {entry["src"]: entry for entry in entries}
+
+        self.assertTrue(linked_target.is_symlink())
+        self.assertEqual(linked_target.resolve(), linked_source.resolve())
+        self.assertTrue(preserve_target.exists())
+        self.assertFalse(preserve_target.is_symlink())
+        self.assertEqual(preserve_target.read_text(), "user theme")
+        self.assertEqual(entries_by_src["Configs/.config/kitty/theme.conf"].get("action"), "preserve")
+        self.assertTrue(entries_by_src["Configs/.config/kitty/theme.conf"].get("installed"))
+
+    def test_dots_link_runs_dot_and_file_pre_commands_and_post_command(self):
+        source_dir = Path(self.tmpdir.name) / "source-link-hooks"
+        source_root = source_dir / "Configs/.config/kitty"
+        source_root.mkdir(parents=True, exist_ok=True)
+        (source_root / "kitty.conf").write_text("font_size 13")
+        (source_root / "theme.conf").write_text("include theme")
+
+        main_config = {
+            "global": {
+                "home": str(self.home_dir),
+                "source": str(source_dir),
+                "owner": "hyde_project",
+                "version": "2.0.0",
+            },
+            "kitty": {
+                "pre_command": "dot-pre",
+                "post_command": "dot-post",
+                "files": [
+                    {
+                        "source_root": "Configs/.config/kitty",
+                        "target_root": "$HOME/.config/kitty",
+                        "paths": ["theme.conf"],
+                        "action": "sync",
+                        "pre_command": "file-pre",
+                    },
+                    {
+                        "source_root": "Configs/.config/kitty",
+                        "target_root": "$HOME/.config/kitty",
+                        "paths": ["kitty.conf"],
+                        "action": "sync",
+                    },
+                ],
+            },
+        }
+
+        calls = []
+
+        def fake_execute_commands(self, commands, cwd=None, soft_fail=True):
+            calls.append((tuple(commands), cwd, soft_fail))
+
+        with patch.dict(os.environ, self.env, clear=False):
+            cli = self._make_cli(main_config, source_dir=source_dir)
+            cli.args = argparse.Namespace(no_backup=False)
+            with patch.object(deez_module.WriteDots, "execute_commands", new=fake_execute_commands):
+                cli._do_link(["kitty"])
+
+        self.assertEqual(
+            calls,
+            [
+                (("dot-pre",), str(source_dir), False),
+                (("file-pre",), str(source_dir), False),
+                (("dot-post",), str(source_dir), True),
+            ],
+        )
+        self.assertTrue((self.home_dir / ".config/kitty/theme.conf").is_symlink())
+        self.assertTrue((self.home_dir / ".config/kitty/kitty.conf").is_symlink())
+
+    def test_dots_link_pre_command_skips_dot_and_file_scope(self):
+        source_dir = Path(self.tmpdir.name) / "source-link-pre-skip"
+        kitty_root = source_dir / "Configs/.config/kitty"
+        waybar_root = source_dir / "Configs/.config/waybar"
+        kitty_root.mkdir(parents=True, exist_ok=True)
+        waybar_root.mkdir(parents=True, exist_ok=True)
+        (kitty_root / "kitty.conf").write_text("font_size 14")
+        (waybar_root / "config.jsonc").write_text("{}")
+        (waybar_root / "style.css").write_text("*")
+
+        main_config = {
+            "global": {
+                "home": str(self.home_dir),
+                "source": str(source_dir),
+                "owner": "hyde_project",
+                "version": "2.0.0",
+            },
+            "kitty": {
+                "pre_command": "false",
+                "files": [
+                    {
+                        "source_root": "Configs/.config/kitty",
+                        "target_root": "$HOME/.config/kitty",
+                        "paths": ["kitty.conf"],
+                        "action": "sync",
+                    }
+                ],
+            },
+            "waybar": {
+                "files": [
+                    {
+                        "source_root": "Configs/.config/waybar",
+                        "target_root": "$HOME/.config/waybar",
+                        "paths": ["style.css"],
+                        "action": "sync",
+                        "pre_command": "false",
+                    },
+                    {
+                        "source_root": "Configs/.config/waybar",
+                        "target_root": "$HOME/.config/waybar",
+                        "paths": ["config.jsonc"],
+                        "action": "sync",
+                    },
+                ],
+            },
+        }
+
+        with patch.dict(os.environ, self.env, clear=False):
+            cli = self._make_cli(main_config, source_dir=source_dir)
+            cli.args = argparse.Namespace(no_backup=False)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli._do_link(["kitty", "waybar"])
+
+        stdout = output.getvalue()
+        self.assertIn("Skipping dot 'kitty': pre_command failed", stdout)
+        self.assertIn("Skipping file entry in 'waybar' (style.css): pre_command failed", stdout)
+        self.assertFalse((self.home_dir / ".config/kitty/kitty.conf").exists())
+        self.assertFalse((self.home_dir / ".config/waybar/style.css").exists())
+        self.assertTrue((self.home_dir / ".config/waybar/config.jsonc").is_symlink())
+
+    def test_dots_link_dry_run_announces_dot_and_file_pre_commands(self):
+        source_dir = Path(self.tmpdir.name) / "source-link-dry-pre"
+        source_root = source_dir / "Configs/.config/kitty"
+        source_root.mkdir(parents=True, exist_ok=True)
+        (source_root / "kitty.conf").write_text("font_size 15")
+        (source_root / "theme.conf").write_text("include theme")
+
+        main_config = {
+            "global": {
+                "home": str(self.home_dir),
+                "source": str(source_dir),
+                "owner": "hyde_project",
+                "version": "2.0.0",
+            },
+            "kitty": {
+                "pre_command": "false",
+                "files": [
+                    {
+                        "source_root": "Configs/.config/kitty",
+                        "target_root": "$HOME/.config/kitty",
+                        "paths": ["theme.conf"],
+                        "action": "sync",
+                        "pre_command": "false",
+                    },
+                    {
+                        "source_root": "Configs/.config/kitty",
+                        "target_root": "$HOME/.config/kitty",
+                        "paths": ["kitty.conf"],
+                        "action": "sync",
+                    },
+                ],
+            },
+        }
+
+        with patch.dict(os.environ, self.env, clear=False):
+            cli = self._make_cli(main_config, source_dir=source_dir)
+            cli.args = argparse.Namespace(no_backup=False)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli._do_link(["kitty"], dry_run=True)
+
+        stdout = output.getvalue()
+        self.assertIn("[DRY RUN] Would run dot 'kitty' pre_command: false (assuming success)", stdout)
+        self.assertIn("[DRY RUN] Would run file entry in 'kitty' (theme.conf) pre_command: false (assuming success)", stdout)
+        self.assertIn("[DRY RUN] [LINK] Would link 2 paths for 'kitty'.", stdout)
+        self.assertFalse((self.home_dir / ".config/kitty/kitty.conf").exists())
+
+    def test_dots_link_directory_path_creates_file_symlinks_only(self):
+        source_dir = Path(self.tmpdir.name) / "source-link-directory"
+        source_root = source_dir / "Configs/.config/kitty"
+        source_root.mkdir(parents=True, exist_ok=True)
+        (source_root / "kitty.conf").write_text("font_size 18")
+        (source_root / "theme.conf").write_text("include colors")
+
+        main_config = {
+            "global": {
+                "home": str(self.home_dir),
+                "source": str(source_dir),
+                "owner": "hyde_project",
+                "version": "2.0.0",
+            },
+            "kitty": {
+                "files": [
+                    {
+                        "source_root": "Configs/.config",
+                        "target_root": "$HOME/.config",
+                        "paths": ["kitty"],
+                        "action": "sync",
+                    }
+                ],
+            },
+        }
+
+        with patch.dict(os.environ, self.env, clear=False):
+            cli = self._make_cli(main_config, source_dir=source_dir)
+            cli.args = argparse.Namespace(no_backup=False)
+            cli._do_link(["kitty"])
+
+        target_dir = self.home_dir / ".config/kitty"
+        kitty_target = target_dir / "kitty.conf"
+        theme_target = target_dir / "theme.conf"
+        manifest_manager = deez_module.ManifestManager(base_dir=Path(self.xdg_data) / "deez" / "dots")
+        entries = manifest_manager.get_file_entries("kitty")
+
+        self.assertTrue(target_dir.is_dir())
+        self.assertFalse(target_dir.is_symlink())
+        self.assertTrue(kitty_target.is_symlink())
+        self.assertTrue(theme_target.is_symlink())
+        self.assertEqual(kitty_target.resolve(), (source_root / "kitty.conf").resolve())
+        self.assertEqual(theme_target.resolve(), (source_root / "theme.conf").resolve())
+        self.assertEqual(
+            {entry["src"] for entry in entries},
+            {"Configs/.config/kitty/kitty.conf", "Configs/.config/kitty/theme.conf"},
+        )
+
     def test_dots_uninstall_interactive_cancel(self):
         self._write_installed_manifest(
             "kitty",

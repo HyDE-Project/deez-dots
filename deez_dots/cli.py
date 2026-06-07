@@ -150,6 +150,8 @@ def _initialize_command_state(args: argparse.Namespace) -> None:
     args.restore_dots = []
     args.do_downgrade = False
     args.downgrade_dots = []
+    args.do_link = False
+    args.link_sections = None
     args.from_stage = False
     args.backup_list = False
     args.backup_prune = False

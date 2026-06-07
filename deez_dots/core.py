@@ -1790,6 +1790,19 @@ class WriteDots:
             current.rmdir()
             current = parent
 
+    def _link_one(self, src: Union[str, Path], dst: Union[str, Path]) -> bool:
+        """Create a symlink at dst pointing to src. Removes existing target first."""
+        src_path = Path(src)
+        dst_path = Path(dst)
+        if not src_path.exists():
+            UI.error(f"Source does not exist: {src_path}")
+            return False
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        if dst_path.exists() or dst_path.is_symlink():
+            WriteDots._remove_existing_path(dst_path)
+        os.symlink(src_path, dst_path)
+        return True
+
     @staticmethod
     def _copy_with_action(src_path: Union[str, Path], tgt_path: Union[str, Path], action: str, clean_target: bool = False) -> bool:
         action = DeezUtils.normalize_action(action)
@@ -3247,6 +3260,7 @@ class DeezCLI:
 
     def _healthcheck_dot(self, dot: str) -> Dict[str, Any]:
         desc = self.manifest_manager.load_desc(dot)
+        is_link_dot = desc.get("hash") == "LINK"
         tracked_entries = []
         for entry in self.manifest_manager.get_file_entries(dot):
             raw_dst = str(DeezUtils.expand(entry.get("dst") or "")).strip()
@@ -3259,7 +3273,7 @@ class DeezCLI:
         expected_bundle_hash = str(desc.get("hash") or "").strip()
         bundle_path = self.cache_manager.bundle_path_for_hash(expected_bundle_hash)
         bundle_available = False
-        if bundle_path is not None:
+        if not is_link_dot and bundle_path is not None:
             actual_bundle_hash = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
             bundle_available = actual_bundle_hash == expected_bundle_hash
         status = {
@@ -3279,6 +3293,18 @@ class DeezCLI:
             path = Path(dst)
             if not self._path_exists_or_link(path):
                 status["missing"].append(dst)
+                continue
+            if is_link_dot:
+                # For LINK dots: verify symlink target matches expected source
+                if path.is_symlink():
+                    actual_target = os.readlink(path)
+                    expected_target = os.path.normpath(str(entry.get("src") or ""))
+                    if actual_target == expected_target or os.path.realpath(path) == os.path.realpath(expected_target):
+                        status["ok"].append(dst)
+                    else:
+                        status["changed"].append(f"{dst} (expected target {expected_target})")
+                else:
+                    status["changed"].append(f"{dst} (not a symlink)")
                 continue
             expected_hash = self._bundle_entry_hash(bundle_path, entry.get("src")) if bundle_available and bundle_path else None
             if expected_hash is not None:
@@ -4063,6 +4089,194 @@ class DeezCLI:
         ]
         return dot, bundle_entries, filtered_entries, kept_pairs
 
+    def _iter_link_entry_pairs(self, entry: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+        src_root = Path(entry["src_root"])
+        archive_root = entry.get("archive_root") or ""
+        pairs: List[Tuple[str, str, str]] = []
+        for _rel_pattern, rel_path in WriteDots._expand_relative_paths(src_root, entry["rel_paths"]):
+            src_path = src_root / rel_path
+            if not WriteDots._path_exists_or_link(src_path):
+                continue
+            expanded_files = WriteDots._expand_files(src_path)
+            if src_path.is_dir():
+                for expanded_file in expanded_files:
+                    expanded_file_path = Path(expanded_file)
+                    rel_suffix = expanded_file_path.relative_to(src_path).as_posix()
+                    manifest_rel = Path(rel_path, rel_suffix).as_posix() if rel_path not in (".", "./") else rel_suffix
+                    manifest_src = PurePosixPath(archive_root, manifest_rel).as_posix() if archive_root else PurePosixPath(manifest_rel).as_posix()
+                    dst = os.path.join(entry["tgt_root"], manifest_rel)
+                    pairs.append((str(expanded_file_path), manifest_src, dst))
+                continue
+            manifest_rel = Path(rel_path).as_posix() if rel_path not in (".", "./") else src_path.name
+            manifest_src = PurePosixPath(archive_root, manifest_rel).as_posix() if archive_root else PurePosixPath(manifest_rel).as_posix()
+            dst = os.path.join(entry["tgt_root"], manifest_rel)
+            pairs.append((str(src_path), manifest_src, dst))
+        return pairs
+
+    def _do_link(self, sections: Optional[List[str]] = None, dry_run: bool = False) -> None:
+        """Symlink local source paths to target locations directly (no tarballs)."""
+        selected = sections if sections else self.dotfile_sections
+        if not selected:
+            UI.error("No dots selected for linking.")
+            return
+        writer = WriteDots()
+        git_handler = GitHandler(self.main_config)
+        for dot in selected:
+            dot_data = self.main_config.get(dot, {})
+            if not isinstance(dot_data, dict):
+                UI.error(f"Dot '{dot}' has no config section.")
+                continue
+            source_dir = dot_data.get("source") or self.source_dir
+            source_dir = os.path.abspath(DeezUtils.expand(source_dir))
+            if not os.path.exists(source_dir):
+                UI.error(f"Source '{source_dir}' does not exist (required for --link). Skipping '{dot}'.")
+                continue
+            hook_cwd = self._hook_cwd(source_dir)
+            dot_pre_command = dot_data.get("pre_command")
+            dot_post_command = dot_data.get("post_command")
+            if dry_run:
+                self._announce_dry_run_pre_command(dot_pre_command, scope_label=f"dot '{dot}'")
+            elif self._skip_on_failed_pre_command(dot_pre_command, scope_label=f"dot '{dot}'", cwd=hook_cwd):
+                continue
+            section_home = DeezUtils.expand(dot_data.get("home", self.target_root))
+            section_owner = DeezUtils.normalize_owner(dot_data.get("owner") or self.global_config.get("owner", "unknown"))
+            section_version = dot_data.get("version") or self.global_config.get("version") or "unknown"
+            raw_file_entries = self._build_file_entry_records(dot_data, section_home, source_dir)
+            file_entries: List[Dict[str, Any]] = []
+            for file_entry in raw_file_entries:
+                entry_pre_command = file_entry.get("pre_command")
+                if dry_run:
+                    self._announce_dry_run_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot, file_entry))
+                elif self._skip_on_failed_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot, file_entry), cwd=hook_cwd):
+                    continue
+                file_entries.append(file_entry)
+            if not file_entries:
+                UI.info(f"'{dot}' skipped — all file entries failed pre_command.")
+                continue
+            manifest_entries: List[Dict[str, Any]] = []
+            link_entries: List[Dict[str, Any]] = []
+            for entry in file_entries:
+                entry_action = DeezUtils.normalize_action(entry.get("action"))
+                entry_metadata = dict(entry.get("entry_metadata") or {})
+                entry_pairs = self._iter_link_entry_pairs(entry)
+                if not entry_pairs:
+                    sample_rel_paths = entry["rel_paths"] if isinstance(entry["rel_paths"], list) else [entry["rel_paths"]]
+                    if entry_action == "preserve":
+                        archive_root = entry.get("archive_root") or ""
+                        for sample_rel_path in sample_rel_paths:
+                            rel_path = str(sample_rel_path or "").strip()
+                            if not rel_path or rel_path in (".", "./") or any(ch in rel_path for ch in "*?["):
+                                continue
+                            manifest_src = PurePosixPath(archive_root, rel_path).as_posix() if archive_root else PurePosixPath(rel_path).as_posix()
+                            dst = os.path.join(entry["tgt_root"], rel_path)
+                            entry_pairs.append(("", manifest_src, dst))
+                    if not entry_pairs:
+                        for sample_rel_path in sample_rel_paths:
+                            src = os.path.abspath(os.path.join(entry["src_root"], str(sample_rel_path or "")))
+                            UI.error(f"Source does not exist: {src}")
+                        continue
+                for src, manifest_src, dst in entry_pairs:
+                    manifest_entry = {
+                        "src": manifest_src,
+                        "dst": dst,
+                        "action": entry_action,
+                        "installed": False,
+                    }
+                    for key, value in entry_metadata.items():
+                        if value is not None:
+                            manifest_entry[key] = value
+                    if entry.get("clean_target"):
+                        manifest_entry["clean_target"] = True
+                    manifest_entries.append(manifest_entry)
+                    if entry_action == "preserve":
+                        dst_path = Path(dst)
+                        if dst_path.exists() or dst_path.is_symlink():
+                            manifest_entry["installed"] = True
+                        continue
+                    link_entries.append({"src": src, "dst": dst, "manifest": manifest_entry})
+            if not link_entries and not any(entry.get("installed") for entry in manifest_entries):
+                UI.info(f"'{dot}' skipped — no valid source paths.")
+                continue
+            existing_desc = self.manifest_manager.load_desc(dot)
+            if existing_desc:
+                if dry_run:
+                    existing_owner = DeezUtils.normalize_owner(existing_desc.get("owner", "unknown"))
+                    UI.plain(f"[DRY RUN] Would uninstall installed dot '{dot}' owned by {existing_owner}.")
+                else:
+                    self._do_uninstall([dot], dry_run=False, confirm=False, remove_manifest=True)
+            # Backup existing target files before creating symlinks
+            no_backup = getattr(self.args, "no_backup", False)
+            if not dry_run and not no_backup and not existing_desc:
+                existing_backup_entries: List[Dict[str, Any]] = []
+                for le in link_entries:
+                    dst_path = Path(le["dst"])
+                    if dst_path.exists() and not dst_path.is_symlink():
+                        existing_backup_entries.append({"dst": le["dst"], "action": le["manifest"]["action"]})
+                if existing_backup_entries:
+                    backup_desc = {"name": dot, "owner": section_owner, "version": section_version}
+                    backup_path = writer.backup_to_tarball(dot, existing_backup_entries, desc_data=backup_desc)
+                    if backup_path:
+                        self._backed_up_dots.add(dot)
+            if dry_run:
+                UI.plain(f"[DRY RUN] [LINK] Would link {len(link_entries)} paths for '{dot}'.")
+                for le in link_entries:
+                    UI.plain(f"  link {le['src']} -> {le['dst']}")
+                continue
+            linked_count = 0
+            for le in link_entries:
+                if writer._link_one(le["src"], le["dst"]):
+                    le["manifest"]["installed"] = True
+                    linked_count += 1
+            directories: List[str] = []
+            seen_dirs = set()
+            for manifest_entry in manifest_entries:
+                dst = manifest_entry.get("dst")
+                if not dst:
+                    continue
+                parent_dir = str(Path(dst).parent)
+                if parent_dir not in seen_dirs:
+                    seen_dirs.add(parent_dir)
+                    directories.append(parent_dir)
+            link_source = dot_data.get("source")
+            if link_source is None:
+                link_source = self.global_config.get("source")
+            if not link_source:
+                link_source = source_dir
+            meta: Dict[str, Any] = {
+                "name": dot,
+                "owner": section_owner,
+                "hash": "LINK",
+                "version": section_version,
+                "builddate": str(int(time.time())),
+                "installdate": str(int(time.time())),
+                "source": link_source,
+                "origin": "link",
+            }
+            branch = dot_data.get("branch") or dot_data.get("git_branch") or self.global_config.get("branch") or self.global_config.get("git_branch")
+            if branch:
+                meta["branch"] = branch
+            dependency = DeezUtils.normalize_dependency_blocks(dot_data.get("dependency") or dot_data.get("depends"))
+            if dependency:
+                meta["dependency"] = dependency
+            conflicts = self._normalize_conflict_names(dot_data.get("conflicts"))
+            if conflicts:
+                meta["conflicts"] = conflicts
+            for key in ("pre_command", "post_command", "build_command"):
+                val = dot_data.get(key)
+                if val is not None:
+                    meta[key] = val
+            githash = git_handler.get_githash(source_dir)
+            if githash:
+                meta["githash"] = githash
+            if directories:
+                meta["directories"] = directories
+            self.manifest_manager.save(dot, meta, manifest_entries)
+            if dot_post_command:
+                writer.execute_commands([dot_post_command], cwd=hook_cwd)
+            UI.success(f"Linked '{dot}': {linked_count} paths linked")
+        if selected:
+            UI.success("Linking complete")
+
     def _do_package(self, global_owner: str, global_home: str, global_version: str, git_url: str = "", target_branch: str = "", compress: bool = True, out_dir: Optional[str] = None, overwrite_existing: bool = False, rebuild: bool = False, sections: Optional[List[str]] = None, dry_run: bool = False) -> List[str]:
         writer = WriteDots()
         git_handler = GitHandler(self.main_config)
@@ -4467,17 +4681,27 @@ class DeezCLI:
         no_backup = getattr(self.args, "no_backup", False)
         for dot in selected_dots:
             manifest_entries = self.manifest_manager.get_file_entries(dot)
-            if not dry_run and not no_backup and dot not in self._backed_up_dots:
-                backup_desc = self.manifest_manager.load_desc(dot) or {}
+            desc = self.manifest_manager.load_desc(dot) or {}
+            is_link = desc.get("hash") == "LINK"
+            if not dry_run and not no_backup and dot not in self._backed_up_dots and not is_link:
+                backup_desc = desc or {}
                 backup_path = writer.backup_to_tarball(dot, manifest_entries, desc_data=backup_desc)
                 if backup_path:
                     self._backed_up_dots.add(dot)
-            # Remove files for sync and tarball actions, leaving preserve files untouched
-            uninstall_paths = [
-                DeezUtils.expand(entry["dst"])
-                for entry in manifest_entries
-                if entry.get("dst") and DeezUtils.normalize_action(entry.get("action")) in ("sync", "tarball")
-            ]
+            if is_link:
+                # For LINK dots: remove only linked/install-managed targets and keep preserve entries immune.
+                uninstall_paths = [
+                    DeezUtils.expand(entry["dst"])
+                    for entry in manifest_entries
+                    if entry.get("dst") and DeezUtils.normalize_action(entry.get("action")) in ("sync", "tarball")
+                ]
+            else:
+                # Remove files for sync and tarball actions, leaving preserve files untouched
+                uninstall_paths = [
+                    DeezUtils.expand(entry["dst"])
+                    for entry in manifest_entries
+                    if entry.get("dst") and DeezUtils.normalize_action(entry.get("action")) in ("sync", "tarball")
+                ]
             if dry_run:
                 UI.plain(f"[DRY RUN] [UNINSTALL] Would remove dot '{dot}' with {len(uninstall_paths)} tracked files.")
                 for target_path in uninstall_paths:

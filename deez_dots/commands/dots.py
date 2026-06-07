@@ -18,6 +18,7 @@ from ..ui import UI
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     """Register dotfile-operation flags on the provided parser."""
+    parser.add_argument("--link", nargs="*", metavar="DOT", help="Symlink local source paths to target locations (no tarballs); omit names for interactive selection or specify dot names")
     parser.add_argument("--package", nargs="*", metavar="DOT", help="Pull from git source and bundle dots into tar.gz artifacts (no live changes); omit names for interactive selection or specify dot names or 'all'")
     parser.add_argument("--export", nargs="*", metavar="DOT", help="Snapshot live dots from $HOME into tar.gz bundles (reverse of --package); omit names for interactive selection or specify dot names or 'all'")
     parser.add_argument("--install", nargs="+", metavar="TARBALL", help="Install from one or more bundle tar.gz files")
@@ -57,8 +58,22 @@ def normalize_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     action_restore = restore_val is not None
     downgrade_val = getattr(args, "downgrade", None)
     action_downgrade = downgrade_val is not None
+    link_val = getattr(args, "link", None)
+    action_link = link_val is not None
     action_list = bool(getattr(args, "list", False))
-    if not any([action_package, action_export, action_install, action_deploy, action_uninstall, action_filetree, action_healthcheck, action_restore, action_downgrade, action_list]):
+    
+    # Collect mutually exclusive actions
+    action_flags = []
+    if action_package: action_flags.append("--package")
+    if action_export: action_flags.append("--export")
+    if action_install: action_flags.append("--install")
+    if action_deploy: action_flags.append("--deploy")
+    if action_uninstall: action_flags.append("--uninstall")
+    if action_link: action_flags.append("--link")
+    if len(action_flags) > 1:
+        parser.error(f"Conflicting actions: {' and '.join(action_flags)}. These cannot be combined.")
+    
+    if not any([action_package, action_export, action_install, action_deploy, action_uninstall, action_link, action_filetree, action_healthcheck, action_restore, action_downgrade, action_list]):
         parser.print_help()
         return False
     args.do_package = action_package
@@ -70,6 +85,8 @@ def normalize_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     args.from_stage = action_install
     args.do_deploy = action_deploy
     args.deploy_sections = normalize_requested_sections(deploy_val)
+    args.do_link = action_link
+    args.link_sections = normalize_requested_sections(link_val)
     args.do_uninstall = action_uninstall
     args.uninstall_dots = list(uninstall_val) if uninstall_val else []
     args.do_filetree = action_filetree
@@ -89,6 +106,7 @@ def should_auto_discover_config(args: argparse.Namespace) -> bool:
     return bool(
         getattr(args, "do_package", False)
         or getattr(args, "do_deploy", False)
+        or getattr(args, "do_link", False)
         or (getattr(args, "do_export", False) and not getattr(args, "export_sections", None))
     )
 
@@ -97,7 +115,7 @@ def config_error(args: argparse.Namespace, config_file_path: str | None) -> str 
     """Return a user-facing config error when the invocation cannot proceed."""
     if getattr(args, "do_export", False) and not getattr(args, "export_sections", None) and not config_file_path:
         return "Blank --export requires a config file. Use --config or run it from a directory containing dots.toml."
-    if (getattr(args, "do_package", False) or getattr(args, "do_deploy", False)) and not config_file_path:
+    if (getattr(args, "do_package", False) or getattr(args, "do_deploy", False) or getattr(args, "do_link", False)) and not config_file_path:
         return "No config file provided. Use --config or place dots.toml in the current directory."
     return None
 
@@ -266,7 +284,20 @@ def execute(cli: Any) -> None:
     compress = not getattr(args, "no_compress", False)
     install_tarballs = getattr(args, "install_tarballs", []) or []
 
-    if args.do_package:
+    if getattr(args, "do_link", False):
+        selected_sections = _resolve_selected_sections(cli, getattr(args, "link_sections", None), "link")
+        if not selected_sections:
+            return
+        _run_global_action(
+            cli,
+            context,
+            "Linking dots...",
+            cli._do_link,
+            selected_sections,
+            dry_run,
+        )
+        return
+    if getattr(args, "do_package", False):
         _debug_source(context)
         selected_sections = _resolve_selected_sections(cli, getattr(args, "package_sections", None), "bundle")
         if not selected_sections:
@@ -293,7 +324,7 @@ def execute(cli: Any) -> None:
             require_pre_command=True,
         )
         return
-    if args.do_export:
+    if getattr(args, "do_export", False):
         selected_sections = _resolve_selected_sections(cli, getattr(args, "export_sections", None), "export")
         if not selected_sections:
             return
@@ -312,7 +343,7 @@ def execute(cli: Any) -> None:
             require_pre_command=True,
         )
         return
-    if args.do_install:
+    if getattr(args, "do_install", False):
         _run_global_action(
             cli,
             context,
@@ -323,7 +354,7 @@ def execute(cli: Any) -> None:
             require_pre_command=True,
         )
         return
-    if args.do_deploy:
+    if getattr(args, "do_deploy", False):
         _debug_source(context)
         selected_sections = _resolve_selected_sections(cli, getattr(args, "deploy_sections", None), "deploy")
         if not selected_sections:
@@ -362,7 +393,7 @@ def execute(cli: Any) -> None:
             hook_runner.execute_commands([context.global_post_command], cwd=cli.source_dir)
         UI.success("Deploy complete")
         return
-    if args.do_uninstall:
+    if getattr(args, "do_uninstall", False):
         _run_global_action(
             cli,
             context,
@@ -372,7 +403,7 @@ def execute(cli: Any) -> None:
             dry_run,
         )
         return
-    if args.do_filetree:
+    if getattr(args, "do_filetree", False):
         _run_global_action(
             cli,
             context,
@@ -381,7 +412,7 @@ def execute(cli: Any) -> None:
             getattr(args, "filetree_target", "all"),
         )
         return
-    if args.do_healthcheck:
+    if getattr(args, "do_healthcheck", False):
         _run_global_action(
             cli,
             context,
@@ -390,7 +421,7 @@ def execute(cli: Any) -> None:
             getattr(args, "healthcheck_target", "all"),
         )
         return
-    if args.do_restore:
+    if getattr(args, "do_restore", False):
         _run_global_action(
             cli,
             context,
@@ -400,7 +431,7 @@ def execute(cli: Any) -> None:
             dry_run,
         )
         return
-    if args.do_downgrade:
+    if getattr(args, "do_downgrade", False):
         _run_global_action(
             cli,
             context,
