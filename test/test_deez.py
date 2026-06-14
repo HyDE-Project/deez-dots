@@ -4452,6 +4452,86 @@ class TestDeezCLI(unittest.TestCase):
             {"Configs/.config/kitty/kitty.conf", "Configs/.config/kitty/theme.conf"},
         )
 
+    def test_dots_link_directory_path_respects_ignored_paths(self):
+        source_dir = Path(self.tmpdir.name) / "source-link-ignored"
+        source_root = source_dir / "Configs/.config"
+        gtk_root = source_root / "gtk-3.0"
+        qt5_root = source_root / "qt5ct"
+        qt5_colors_root = qt5_root / "colors"
+        qt6_root = source_root / "qt6ct"
+        qt6_colors_root = qt6_root / "colors"
+        gtk_root.mkdir(parents=True, exist_ok=True)
+        qt5_colors_root.mkdir(parents=True, exist_ok=True)
+        qt6_colors_root.mkdir(parents=True, exist_ok=True)
+        (gtk_root / "settings.ini").write_text("local gtk settings")
+        (gtk_root / "gtk.css").write_text("theme css")
+        (qt5_root / "qt5ct.conf").write_text("qt5 config")
+        (qt5_colors_root / "wallbash.conf").write_text("qt5 wallbash")
+        (qt5_colors_root / "keep.conf").write_text("qt5 keep")
+        (qt6_root / "qt6ct.conf").write_text("qt6 config")
+        (qt6_colors_root / "wallbash.conf").write_text("qt6 wallbash")
+        (qt6_colors_root / "keep.conf").write_text("qt6 keep")
+
+        main_config = {
+            "global": {
+                "home": str(self.home_dir),
+                "source": str(source_dir),
+                "owner": "hyde_project",
+                "version": "2.0.0",
+            },
+            "hyde": {
+                "files": [
+                    {
+                        "source_root": "Configs/.config",
+                        "target_root": "$HOME/.config",
+                        "paths": ["gtk-3.0", "qt5ct", "qt6ct"],
+                        "ignored_paths": [
+                            "gtk-3.0/settings.ini",
+                            "qt5ct/qt5ct.conf",
+                            "qt6ct/qt6ct.conf",
+                            "qt5ct/colors/wallbash.conf",
+                            "qt6ct/colors/wallbash.conf",
+                        ],
+                        "action": "sync",
+                    }
+                ],
+            },
+        }
+
+        with patch.dict(os.environ, self.env, clear=False):
+            cli = self._make_cli(main_config, source_dir=source_dir)
+            cli.args = argparse.Namespace(no_backup=False)
+            cli._do_link(["hyde"])
+
+        gtk_settings_target = self.home_dir / ".config/gtk-3.0/settings.ini"
+        gtk_css_target = self.home_dir / ".config/gtk-3.0/gtk.css"
+        qt5_conf_target = self.home_dir / ".config/qt5ct/qt5ct.conf"
+        qt5_wallbash_target = self.home_dir / ".config/qt5ct/colors/wallbash.conf"
+        qt5_keep_target = self.home_dir / ".config/qt5ct/colors/keep.conf"
+        qt6_conf_target = self.home_dir / ".config/qt6ct/qt6ct.conf"
+        qt6_wallbash_target = self.home_dir / ".config/qt6ct/colors/wallbash.conf"
+        qt6_keep_target = self.home_dir / ".config/qt6ct/colors/keep.conf"
+
+        manifest_manager = deez_module.ManifestManager(base_dir=Path(self.xdg_data) / "deez" / "dots")
+        entries = manifest_manager.get_file_entries("hyde")
+
+        self.assertFalse(gtk_settings_target.exists())
+        self.assertTrue(gtk_css_target.is_symlink())
+        self.assertFalse(qt5_conf_target.exists())
+        self.assertFalse(qt5_wallbash_target.exists())
+        self.assertTrue(qt5_keep_target.is_symlink())
+        self.assertFalse(qt6_conf_target.exists())
+        self.assertFalse(qt6_wallbash_target.exists())
+        self.assertTrue(qt6_keep_target.is_symlink())
+        self.assertEqual(
+            {entry["src"] for entry in entries},
+            {
+                "Configs/.config/gtk-3.0/gtk.css",
+                "Configs/.config/qt5ct/colors/keep.conf",
+                "Configs/.config/qt6ct/colors/keep.conf",
+            },
+        )
+
     def test_dots_uninstall_interactive_cancel(self):
         self._write_installed_manifest(
             "kitty",

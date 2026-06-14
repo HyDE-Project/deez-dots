@@ -4092,10 +4092,14 @@ class DeezCLI:
     def _iter_link_entry_pairs(self, entry: Dict[str, Any]) -> List[Tuple[str, str, str]]:
         src_root = Path(entry["src_root"])
         archive_root = entry.get("archive_root") or ""
+        ignored_paths = entry.get("ignored_paths") or []
         pairs: List[Tuple[str, str, str]] = []
         for _rel_pattern, rel_path in WriteDots._expand_relative_paths(src_root, entry["rel_paths"]):
             src_path = src_root / rel_path
             if not WriteDots._path_exists_or_link(src_path):
+                continue
+            normalized_rel_path = Path(rel_path).as_posix() if rel_path not in (".", "./") else src_path.name
+            if WriteDots._matches_ignored_path(normalized_rel_path, ignored_paths):
                 continue
             expanded_files = WriteDots._expand_files(src_path)
             if src_path.is_dir():
@@ -4103,11 +4107,13 @@ class DeezCLI:
                     expanded_file_path = Path(expanded_file)
                     rel_suffix = expanded_file_path.relative_to(src_path).as_posix()
                     manifest_rel = Path(rel_path, rel_suffix).as_posix() if rel_path not in (".", "./") else rel_suffix
+                    if WriteDots._matches_ignored_path(manifest_rel, ignored_paths):
+                        continue
                     manifest_src = PurePosixPath(archive_root, manifest_rel).as_posix() if archive_root else PurePosixPath(manifest_rel).as_posix()
                     dst = os.path.join(entry["tgt_root"], manifest_rel)
                     pairs.append((str(expanded_file_path), manifest_src, dst))
                 continue
-            manifest_rel = Path(rel_path).as_posix() if rel_path not in (".", "./") else src_path.name
+            manifest_rel = normalized_rel_path
             manifest_src = PurePosixPath(archive_root, manifest_rel).as_posix() if archive_root else PurePosixPath(manifest_rel).as_posix()
             dst = os.path.join(entry["tgt_root"], manifest_rel)
             pairs.append((str(src_path), manifest_src, dst))
