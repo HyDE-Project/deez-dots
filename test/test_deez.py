@@ -640,7 +640,7 @@ class TestDeezCLI(unittest.TestCase):
                 str(Path(self.tmpdir.name) / "hyprland.tar.gz"),
             ]
 
-        with patch.object(deez_module.DeezCLI, "_can_prompt_for_selection", return_value=True), patch("builtins.input", side_effect=AssertionError("interactive prompt should not be used")), patch.object(cli, "_resolve_config_dependencies", return_value=None), patch.object(cli, "_do_package", side_effect=fake_do_package), patch.object(cli, "_do_install", return_value=None):
+        with patch.object(deez_module.DeezCLI, "_can_prompt_for_selection", return_value=True), patch("builtins.input", side_effect=AssertionError("interactive prompt should not be used")), patch.object(cli, "_resolve_config_dependencies", return_value=(["kitty", "hyprland"], [])), patch.object(cli, "_do_package", side_effect=fake_do_package), patch.object(cli, "_do_install", return_value=None):
             cli.run()
 
         self.assertEqual(captured["sections"], ["kitty", "hyprland"])
@@ -1960,9 +1960,9 @@ class TestDeezCLI(unittest.TestCase):
         result = self.run_cli(["dots", "--package", "--config", str(config_path)])
 
         self.assertEqual(result.returncode, 0)
-        self.assertIn("Skipping dot 'kitty': pre_command failed", result.stdout)
+        # pre_command should not run during bundling; it is saved in the manifest for install/deploy
+        self.assertIn("[ok] Bundled kitty ->", result.stdout)
         self.assertIn("[ok] Bundled waybar ->", result.stdout)
-        self.assertNotIn("[ok] Bundled kitty ->", result.stdout)
 
     def test_dots_package_file_pre_command_failure_skips_only_that_entry(self):
         source_dir = Path(self.tmpdir.name) / "source-file-pre"
@@ -1996,12 +1996,13 @@ class TestDeezCLI(unittest.TestCase):
         result = self.run_cli(["dots", "--package", "--config", str(config_path)])
 
         self.assertEqual(result.returncode, 0)
-        self.assertIn("Skipping file entry in 'kitty-file-pre' (theme.conf): pre_command failed", result.stdout)
+        # pre_command should not run during bundling; both entries should be bundled and commands saved in manifest
+        self.assertIn("[ok] Bundled kitty-file-pre ->", result.stdout)
         self.assertTrue(bundle_path.exists())
         with tarfile.open(bundle_path, "r:gz") as tar:
             manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
         self.assertIn('src = ".config/kitty/kitty.conf"', manifest_text)
-        self.assertNotIn('src = ".config/kitty/theme.conf"', manifest_text)
+        self.assertIn('src = ".config/kitty/theme.conf"', manifest_text)
 
     def test_dots_package_without_config_shows_clear_error(self):
         result = self.run_cli(["dots", "--package"])

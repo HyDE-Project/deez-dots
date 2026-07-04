@@ -163,6 +163,7 @@ def _initialize_command_state(args: argparse.Namespace) -> None:
     args.no_deps_checks = getattr(args, "no_deps_checks", False)
     args.skip_git = getattr(args, "skip_git", False)
     args.no_deps_install = getattr(args, "no_deps_install", False)
+    args.skip_unresolved_deps = getattr(args, "skip_unresolved_deps", False)
     args.no_compress = getattr(args, "no_compress", False)
     args.rebuild = getattr(args, "rebuild", False)
     args.dry_run = getattr(args, "dry_run", False)

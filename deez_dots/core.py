@@ -3615,18 +3615,19 @@ class DeezCLI:
         target_dots: List[str],
         *,
         install_intro: str,
-    ) -> None:
+    ) -> Tuple[Dict[str, List[str]], List[Dict[str, List[str]]]]:
+        """Resolve dependency blocks. Returns (resolved_map, unresolved_blocks). Raises on hard error unless skip_on_unresolved is set."""
         if getattr(self.args, "no_deps_checks", False):
-            return
+            return {}, []
         if not dependency_blocks:
-            return
+            return {}, []
 
         dependency_map, unresolved = self.package_manager_instance.resolve_dependency_blocks(
             dependency_blocks,
             self.available_package_managers,
         )
         if not dependency_map and not unresolved:
-            return
+            return {}, []
 
         if self.available_package_managers:
             UI.progress(f"Detected package managers: {', '.join(self.available_package_managers)}")
@@ -3666,11 +3667,18 @@ class DeezCLI:
         satisfied, missing = self._check_dependency_status(dependency_map)
 
         if unresolved:
-            UI.error(f"Dependency managers unavailable for: {', '.join(target_dots)}")
-            for block in unresolved:
-                for manager, packages in block.items():
-                    UI.error(f"  {manager}: {', '.join(packages)}")
-            raise SystemExit(1)
+            if getattr(self.args, "skip_unresolved_deps", False):
+                UI.warn("Skipping dots with unavailable package managers (--skip-unresolved-deps):")
+                for block in unresolved:
+                    for manager, packages in block.items():
+                        UI.warn(f"  {manager}: {', '.join(packages)}")
+                UI.warn("Remaining dots will be processed.")
+            else:
+                UI.error(f"Dependency managers unavailable for: {', '.join(target_dots)}")
+                for block in unresolved:
+                    for manager, packages in block.items():
+                        UI.error(f"  {manager}: {', '.join(packages)}")
+                raise SystemExit(1)
 
         generic_missing = missing.get("system", [])
         if generic_missing:
@@ -3682,31 +3690,74 @@ class DeezCLI:
         if not install_missing:
             if missing.get("system") is None:
                 UI.progress("Dependency checks complete")
-            return
+            return dependency_map, unresolved
         if getattr(self.args, "no_deps_install", False):
             UI.warn(f"Missing dependencies for: {', '.join(target_dots)}")
             for manager, packages in install_missing.items():
                 UI.warn(f"  {manager}: {', '.join(packages)}")
             UI.warn("Skipping dependency installation because --no-deps-install was provided.")
-            return
+            return dependency_map, unresolved
 
         UI.progress(f"{install_intro}: {', '.join(target_dots)}")
         for manager, packages in install_missing.items():
             UI.progress(f"Installing via {manager}: {', '.join(packages)}")
         if not self.package_manager_instance.install_packages(install_missing):
             raise SystemExit(1)
+        return dependency_map, unresolved
 
-    def _resolve_config_dependencies(self, selected_sections: List[str]) -> None:
+    def _resolve_config_dependencies(self, selected_sections: List[str]) -> Tuple[List[str], List[Dict[str, List[str]]]]:
+        """Resolve deps for selected sections. Returns (resolved_sections, unresolved_blocks).
+        Uses --skip-unresolved-deps to filter dots with no available manager.
+        """
         subset_config: Dict[str, Any] = {"global": dict(self.main_config.get("global", {}))}
         for section in selected_sections:
             if section in self.main_config:
                 subset_config[section] = self.main_config.get(section, {})
         dependency_blocks = self.package_manager_instance.collect_dependency_blocks(subset_config)
-        self._resolve_dependency_blocks(
+        _, unresolved = self._resolve_dependency_blocks(
             dependency_blocks,
             selected_sections,
             install_intro="Installing dependencies before packaging and file transfer",
         )
+        if not unresolved:
+            return selected_sections, []
+
+        # Determine which sections are affected by unresolved blocks
+        safe_managers = set(self.available_package_managers) if self.available_package_managers else set()
+
+        def section_has_only_unavailable_deps(section: str) -> bool:
+            """Return True if ALL dependency blocks for section have no available manager."""
+            section_data = self.main_config.get(section, {})
+            s_blocks = self.package_manager_instance.collect_dependency_blocks({section: section_data})
+            if not s_blocks:
+                return False  # No deps = no issue
+            for block in s_blocks:
+                has_some_manager = False
+                for key in block:
+                    if key == "system" or key in safe_managers:
+                        has_some_manager = True
+                        break
+                if not has_some_manager:
+                    # This block has no available manager; section would be skipped
+                    pass
+                else:
+                    # At least one block has a manager - section can proceed
+                    return False
+            return True  # All blocks had unavailable managers
+
+        skipped = [s for s in selected_sections if section_has_only_unavailable_deps(s)]
+        resolved = [s for s in selected_sections if s not in skipped]
+
+        if skipped and getattr(self.args, "skip_unresolved_deps", False):
+            UI.warn("Skipping dots with unavailable package managers (--skip-unresolved-deps):")
+            for s in skipped:
+                UI.warn(f"  {s}")
+            return resolved, unresolved
+        if skipped:
+            UI.error(f"Dependency managers unavailable for: {', '.join(skipped)}")
+            UI.error("Use --skip-unresolved-deps to skip dots with missing package managers.")
+            raise SystemExit(1)
+        return selected_sections, unresolved
 
     def _resolve_bundle_dependencies(
         self,
@@ -4312,12 +4363,6 @@ class DeezCLI:
                     continue
                 LOG.warning("Existing package bundle is invalid, rebuilding: %s", pkg_path)
                 writer._remove_existing_output(pkg_path)
-            if dry_run:
-                self._announce_dry_run_pre_command(pre_command, scope_label=f"dot '{dot_section}'")
-            elif self._skip_on_failed_pre_command(pre_command, scope_label=f"dot '{dot_section}'", cwd=hook_cwd):
-                continue
-            if build_command:
-                writer.execute_commands([build_command], cwd=dot_source_dir)
             section_home = os.path.expandvars(dot_data.get("home", global_home))
 
             raw_file_entries = self._build_file_entry_records(
@@ -4329,14 +4374,6 @@ class DeezCLI:
             )
             file_entries: List[Dict[str, Any]] = []
             for file_entry in raw_file_entries:
-                entry_pre_command = file_entry["pre_command"]
-                if dry_run:
-                    self._announce_dry_run_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, file_entry))
-                elif self._skip_on_failed_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, file_entry), cwd=hook_cwd):
-                    continue
-                entry_build_command = file_entry.get("build_command")
-                if entry_build_command:
-                    writer.execute_commands([entry_build_command], cwd=dot_source_dir)
                 file_entries.append(
                     {
                         "src_root": file_entry["src_root"],
@@ -4387,10 +4424,6 @@ class DeezCLI:
                 section_owner = DeezUtils.normalize_owner(dot_data.get("owner") or global_owner)
                 section_version = dot_data.get("version", global_version)
                 section_home = os.path.expandvars(dot_data.get("home", global_home))
-                if dry_run:
-                    self._announce_dry_run_pre_command(dot_data.get("pre_command"), scope_label=f"dot '{dot_section}'")
-                elif self._skip_on_failed_pre_command(dot_data.get("pre_command"), scope_label=f"dot '{dot_section}'", cwd=hook_cwd):
-                    continue
                 manifest_meta = {
                     "name": dot_section,
                     "owner": section_owner,
@@ -4406,11 +4439,6 @@ class DeezCLI:
                 UI.plain(f"[EXPORT] Capturing dot: {dot_section}")
                 file_entries: List[Dict[str, Any]] = []
                 for file_entry in self._build_file_entry_records(dot_data, section_home, self.source_dir, for_export=True):
-                    entry_pre_command = file_entry["pre_command"]
-                    if dry_run:
-                        self._announce_dry_run_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, file_entry))
-                    elif self._skip_on_failed_pre_command(entry_pre_command, scope_label=self._file_entry_label(dot_section, file_entry), cwd=hook_cwd):
-                        continue
                     file_entries.append(
                         {
                             "src_root": file_entry["src_root"],

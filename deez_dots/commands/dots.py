@@ -33,6 +33,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-deps-checks", action="store_true", dest="no_deps_checks", help="Skip dependency checks before install or deploy")
     parser.add_argument("--skip-git", action="store_true", dest="skip_git", help="Skip git refresh operations when preparing source")
     parser.add_argument("--no-deps-install", action="store_true", dest="no_deps_install", help="Check dependencies but do not auto-install missing ones before install or deploy")
+    parser.add_argument("--skip-unresolved-deps", action="store_true", dest="skip_unresolved_deps", help="Skip dots whose dependency blocks reference unavailable package managers (e.g. yay on systems without yay)")
     parser.add_argument("--no-compress", action="store_true", dest="no_compress", help="Skip tar.gz packing; leave output as a plain directory (for inspection)")
     parser.add_argument("--rebuild", action="store_true", dest="rebuild", help="Remove cached or existing build output before bundling")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would happen without making live changes")
@@ -98,6 +99,7 @@ def normalize_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     args.do_downgrade = action_downgrade
     args.downgrade_dots = list(downgrade_val) if downgrade_val else []
     args.list = action_list
+    args.skip_unresolved_deps = bool(getattr(args, "skip_unresolved_deps", False))
     return True
 
 
@@ -360,7 +362,16 @@ def execute(cli: Any) -> None:
         if not selected_sections:
             return
         UI.set_loader_message("Resolving dependencies...")
-        cli._resolve_config_dependencies(selected_sections)
+        resolved_sections, _ = cli._resolve_config_dependencies(selected_sections)
+        # Use resolved list when --skip-unresolved-deps filters, otherwise use full list
+        sections_to_deploy = resolved_sections if resolved_sections else selected_sections
+        if not sections_to_deploy:
+            UI.error("No deployable dots after dependency resolution.")
+            raise SystemExit(1)
+        # Warn if some were filtered
+        skipped = set(selected_sections) - set(sections_to_deploy)
+        if skipped:
+            UI.warn(f"Skipped dots (unresolved deps): {', '.join(sorted(skipped))}")
         hook_runner = WriteDots() if context.global_post_command else None
         cache_build_dir = Path(DeezUtils.xdg_cache_home()) / "deez" / "dots" / "build"
         cache_build_dir.mkdir(parents=True, exist_ok=True)
@@ -371,7 +382,7 @@ def execute(cli: Any) -> None:
             git_url=context.git_url,
             target_branch=context.target_branch,
             out_dir=str(cache_build_dir),
-            sections=selected_sections,
+            sections=sections_to_deploy,
             compress=compress,
             rebuild=rebuild,
             dry_run=dry_run,
@@ -380,12 +391,12 @@ def execute(cli: Any) -> None:
         if not pkg_paths:
             UI.error("Deploy failed: bundling produced no bundles.")
             raise SystemExit(1)
-        dot_to_pkg = _find_pkg_for_dots(pkg_paths, selected_sections)
-        missing_dots = [dot for dot in selected_sections if dot not in dot_to_pkg]
+        dot_to_pkg = _find_pkg_for_dots(pkg_paths, sections_to_deploy)
+        missing_dots = [dot for dot in sections_to_deploy if dot not in dot_to_pkg]
         if missing_dots:
             UI.error(f"Deploy failed: bundling failed for selected dots: {', '.join(missing_dots)}.")
             raise SystemExit(1)
-        for dot in selected_sections:
+        for dot in sections_to_deploy:
             pkg_path = dot_to_pkg.get(dot)
             _deploy_dot(cli, context, dot, pkg_path)
         if hook_runner is not None:
