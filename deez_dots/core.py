@@ -4248,7 +4248,12 @@ class DeezCLI:
                     if entry_action == "preserve":
                         dst_path = Path(dst)
                         if dst_path.exists() or dst_path.is_symlink():
-                            manifest_entry["installed"] = True
+                            overwrite_preserve = getattr(self.args, "overwrite_preserve", False)
+                            if not overwrite_preserve:
+                                manifest_entry["installed"] = True
+                                continue
+                        if src:
+                            link_entries.append({"src": src, "dst": dst, "manifest": manifest_entry})
                         continue
                     link_entries.append({"src": src, "dst": dst, "manifest": manifest_entry})
             if not link_entries and not any(entry.get("installed") for entry in manifest_entries):

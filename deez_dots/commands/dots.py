@@ -37,6 +37,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-compress", action="store_true", dest="no_compress", help="Skip tar.gz packing; leave output as a plain directory (for inspection)")
     parser.add_argument("--rebuild", action="store_true", dest="rebuild", help="Remove cached or existing build output before bundling")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would happen without making live changes")
+    parser.add_argument("--overwrite-preserve", action="store_true", dest="overwrite_preserve", help="When used with --link, force symlink creation even for preserve-action entries whose targets already exist")
 
 
 def normalize_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> bool:
