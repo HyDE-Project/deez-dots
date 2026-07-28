@@ -1819,6 +1819,29 @@ class TestDeezCLI(unittest.TestCase):
         prepare_file_source.assert_called_once_with(url)
         self.assertEqual(result, "/tmp/file-source")
 
+    def test_is_file_source_url_accepts_gitlab_package_file_url(self):
+        url = "https://gitlab.gnome.org/GNOME/cantarell-fonts/-/package_files/1278/download"
+        self.assertTrue(deez_module.GitHandler.is_source_url(url))
+        self.assertTrue(deez_module.GitHandler.is_file_source_url(url))
+        parsed = urllib.parse.urlparse(url)
+        self.assertTrue(deez_module.GitHandler._is_archive_download_url(parsed))
+
+    def test_is_file_source_url_accepts_generic_download_url(self):
+        """Test that any URL ending in /download is treated as a file source."""
+        url = "https://example.com/some/path/download"
+        self.assertTrue(deez_module.GitHandler.is_source_url(url))
+        self.assertTrue(deez_module.GitHandler.is_file_source_url(url))
+        parsed = urllib.parse.urlparse(url)
+        self.assertTrue(deez_module.GitHandler._is_archive_download_url(parsed))
+
+    def test_prepare_source_uses_file_source_for_gitlab_package_file_url(self):
+        handler = deez_module.GitHandler({})
+        url = "https://gitlab.gnome.org/GNOME/cantarell-fonts/-/package_files/1278/download"
+        with patch.object(deez_module.GitHandler, "prepare_file_source", return_value="/tmp/file-source") as prepare_file_source:
+            result = handler.prepare_source(url, None, "main", explicit_source_path=True)
+        prepare_file_source.assert_called_once_with(url)
+        self.assertEqual(result, "/tmp/file-source")
+
     def test_root_global_overrides_before_subcommand_override_config(self):
         config_path = self._write_git_config(git_url="https://github.com/example/original.git", git_branch="main")
         source_override = Path(self.tmpdir.name) / "root-source-override"

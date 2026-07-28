@@ -2355,6 +2355,20 @@ class GitHandler:
         return False
 
     @staticmethod
+    def _is_archive_download_url(parsed: urllib.parse.ParseResult) -> bool:
+        """Detect URLs that are likely archive downloads even without file extensions.
+        
+        This catches URLs without extensions that return archives:
+        - GitLab: /-/package_files/ID/download
+        - GitHub release assets with /download
+        - Any other platform's download URLs
+        """
+        path = parsed.path.rstrip("/")
+        if path.endswith("/download"):
+            return True
+        return False
+
+    @staticmethod
     def is_file_source_url(source: Optional[Union[str, Path]]) -> bool:
         """Return True if the URL points to a single file source."""
         hint, parsed = GitHandler._parse_source_url(source)
@@ -2368,6 +2382,8 @@ class GitHandler:
             return True
         if hint in ("blob", "raw"):
             return bool(Path(path).name)
+        if GitHandler._is_archive_download_url(parsed):
+            return True
         return GitHandler._is_github_file_url(parsed)
 
     @staticmethod
@@ -2390,6 +2406,11 @@ class GitHandler:
         source_text = str(source).strip()
         if self.is_source_url(source_text):
             source_text = self.normalize_file_source_url(source_text)
+        
+        # Check if this URL pattern suggests it's an archive download
+        _, parsed_for_archive = self._parse_source_url(str(source).strip())
+        is_archive_download = self._is_archive_download_url(parsed_for_archive)
+        
         cache_key = self.archive_cache_key(source_text)
         cache_root = self.source_cache_dir / "files" / cache_key
         content_root = cache_root / "content"
@@ -2415,6 +2436,51 @@ class GitHandler:
             if not local_file.is_file():
                 raise RuntimeError(f"Source file '{local_file}' does not exist.")
             shutil.copy2(local_file, cached_file)
+        
+        # For URLs that look like archive downloads, try to detect and extract them
+        if is_archive_download and cached_file.exists() and cached_file.stat().st_size > 0:
+            try:
+                # Try to detect if it's a zip file by checking magic bytes and extension
+                is_zip = False
+                is_tar = False
+                
+                # Check magic bytes for zip
+                try:
+                    with open(cached_file, 'rb') as f:
+                        magic = f.read(4)
+                        is_zip = magic.startswith(b'PK\x03\x04') or magic.startswith(b'PK\x05\x06') or magic.startswith(b'PK\x07\x08')
+                except Exception:
+                    pass
+                
+                # Also check if tarfile can open it
+                if not is_zip:
+                    try:
+                        with tarfile.open(cached_file, 'r:*'):
+                            is_tar = True
+                    except Exception:
+                        pass
+                
+                if is_zip or is_tar:
+                    archive_type = "ZIP" if is_zip else "TAR"
+                    LOG.debug(f"Detected {archive_type} archive from download URL, extracting")
+                    extract_dir = content_root / "extracted"
+                    extract_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    if is_zip:
+                        with zipfile.ZipFile(cached_file, 'r') as zf:
+                            zf.extractall(extract_dir)
+                    else:
+                        with tarfile.open(cached_file, 'r:*') as tar:
+                            tar.extractall(path=extract_dir)
+                    
+                    # Remove the archive and move extracted content to content_root
+                    cached_file.unlink()
+                    for item in extract_dir.iterdir():
+                        item.rename(content_root / item.name)
+                    extract_dir.rmdir()
+            except Exception as e:
+                LOG.debug(f"Could not extract archive from download URL: {e}")
+                # If extraction fails, just leave the file as-is
 
         return str(content_root)
 
