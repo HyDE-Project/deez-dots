@@ -4709,16 +4709,69 @@ class TestExtractTarballPayload(unittest.TestCase):
         (source_root / "cursors").mkdir(parents=True)
         (source_root / "cursors" / "left_ptr").write_text("cursor\n")
         (source_root / "index.theme").write_text("[Icon Theme]\n")
+        target_root = self.root / "target" / "Example"
 
-        entries = []
-        stage_dir = self.root / "stage"
-        for rel_path in ("index.theme", "cursors"):
-            src_path = source_root / rel_path
-            payload = self.writer._create_tarball_payload(src_path, stage_dir, rel_path, [])
-            self.assertIsNotNone(payload)
-            entries.append((rel_path, "self" if src_path.is_dir() else "parent"))
+        file_pairs, any_staged = self.writer._stage_file_entries(
+            [
+                {
+                    "src_root": str(source_root),
+                    "tgt_root": str(target_root),
+                    "rel_paths": ["index.theme", "cursors"],
+                    "action": "tarball",
+                }
+            ],
+            self.root / "stage",
+        )
 
-        self.assertEqual(entries, [("index.theme", "parent"), ("cursors", "self")])
+        self.assertTrue(any_staged)
+        recorded = {Path(pair["dst"]).name: pair.get("tarball_root") for pair in file_pairs}
+        self.assertEqual(recorded, {"index.theme": "parent", "cursors": "self"})
+
+        # The recorded layout has to survive a real deployment, not just staging.
+        for pair in file_pairs:
+            payload = self.root / "stage" / pair["src"]
+            self.assertTrue(
+                self.writer._extract_tarball_payload(
+                    payload, pair["dst"], tarball_root=pair.get("tarball_root")
+                )
+            )
+        self.assertTrue((target_root / "index.theme").is_file())
+        self.assertTrue((target_root / "cursors" / "left_ptr").is_file())
+
+    def test_payload_escaping_the_destination_is_refused(self):
+        payload = self.root / "evil.tar.gz"
+        with tarfile.open(payload, "w:gz") as tar:
+            escaping = tarfile.TarInfo("../escaped")
+            escaping.size = 0
+            tar.addfile(escaping, io.BytesIO(b""))
+
+        destination = self.root / "target" / "Example"
+        with self.assertRaises(ValueError):
+            self.writer._extract_tarball_payload(payload, destination, tarball_root="self")
+        self.assertFalse((self.root / "target" / "escaped").exists())
+
+    def test_payload_with_an_absolute_member_is_refused(self):
+        payload = self.root / "absolute.tar.gz"
+        with tarfile.open(payload, "w:gz") as tar:
+            absolute = tarfile.TarInfo("/etc/passwd")
+            absolute.size = 0
+            tar.addfile(absolute, io.BytesIO(b""))
+
+        destination = self.root / "target" / "Example"
+        with self.assertRaises(ValueError):
+            self.writer._extract_tarball_payload(payload, destination, tarball_root="self")
+
+    def test_payload_with_an_escaping_symlink_is_refused(self):
+        payload = self.root / "symlink.tar.gz"
+        with tarfile.open(payload, "w:gz") as tar:
+            link = tarfile.TarInfo("passwd")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../../../../etc/passwd"
+            tar.addfile(link)
+
+        destination = self.root / "target" / "Example"
+        with self.assertRaises(ValueError):
+            self.writer._extract_tarball_payload(payload, destination, tarball_root="self")
 
 
 if __name__ == "__main__":

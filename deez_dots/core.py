@@ -1896,6 +1896,32 @@ class WriteDots:
             return destination_path.parent
         return destination_path
 
+    @staticmethod
+    def _assert_tarball_members_contained(archive: Path, extraction_root: Path) -> None:
+        """Reject payloads whose members would land outside the extraction root.
+
+        Absolute names, parent traversal and link targets pointing out of the tree
+        are all refused. This runs before either extraction path, so the guarantee
+        does not depend on the behaviour of the external tar implementation used
+        by the privileged branch.
+        """
+        root = Path(os.path.abspath(extraction_root))
+        with tarfile.open(archive, "r:*") as tar:
+            members = tar.getmembers()
+        for member in members:
+            names = [member.name]
+            if member.issym() or member.islnk():
+                names.append(member.linkname)
+            for name in names:
+                if not name:
+                    continue
+                if os.path.isabs(name) or name.startswith("/"):
+                    raise ValueError(f"Refusing tarball member with an absolute path: {member.name}")
+                base = root / os.path.dirname(member.name) if name is member.linkname else root
+                resolved = Path(os.path.normpath(os.path.join(str(base), name)))
+                if resolved != root and root not in resolved.parents:
+                    raise ValueError(f"Refusing tarball member outside the destination: {member.name}")
+
     def _extract_tarball_payload(
         self,
         archive_path: Union[str, Path],
@@ -1906,6 +1932,7 @@ class WriteDots:
         archive = Path(archive_path)
         destination_path = Path(destination)
         extraction_root = self._tarball_extraction_root(archive, destination_path, tarball_root)
+        self._assert_tarball_members_contained(archive, extraction_root)
         if clean_target and destination_path.exists():
             if destination_path.is_dir() and not destination_path.is_symlink():
                 backup_parent = destination_path.parent
@@ -1937,8 +1964,12 @@ class WriteDots:
             return True
 
         extraction_root.mkdir(parents=True, exist_ok=True)
+        # "data" is the filter Python 3.14 applies by default; requesting it
+        # explicitly keeps the same behaviour on the older interpreters this
+        # project still supports.
+        extract_kwargs: Dict[str, Any] = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
         with tarfile.open(archive, "r:*") as tar:
-            tar.extractall(path=extraction_root)
+            tar.extractall(path=extraction_root, **extract_kwargs)
         return True
 
     def _validate_bundle(self, pkg_path: str) -> bool:
