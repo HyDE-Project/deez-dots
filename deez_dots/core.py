@@ -1869,9 +1869,43 @@ class WriteDots:
         shutil.copy2(src, tgt)
         return True
 
-    def _extract_tarball_payload(self, archive_path: Union[str, Path], destination: Union[str, Path], clean_target: bool = False) -> bool:
+    @staticmethod
+    def _tarball_extraction_root(archive: Path, destination_path: Path, tarball_root: Optional[str] = None) -> Path:
+        """Resolve the directory a payload has to be extracted into.
+
+        A payload staged from a directory carries members relative to that
+        directory, so it belongs directly in the recorded destination. A payload
+        staged from a single file carries the file name instead, so extracting it
+        into the recorded destination would nest the file inside a directory
+        named after itself. Those extract into the parent.
+
+        Bundles record which of the two applies. Older bundles predate the field,
+        so their layout is inferred from the payload, which is accurate except for
+        a directory holding a single file named after that directory.
+        """
+        if tarball_root == "parent":
+            return destination_path.parent
+        if tarball_root == "self":
+            return destination_path
+        try:
+            with tarfile.open(archive, "r:*") as tar:
+                members = tar.getmembers()
+        except (tarfile.TarError, OSError):
+            return destination_path
+        if len(members) == 1 and members[0].isfile() and members[0].name == destination_path.name:
+            return destination_path.parent
+        return destination_path
+
+    def _extract_tarball_payload(
+        self,
+        archive_path: Union[str, Path],
+        destination: Union[str, Path],
+        clean_target: bool = False,
+        tarball_root: Optional[str] = None,
+    ) -> bool:
         archive = Path(archive_path)
         destination_path = Path(destination)
+        extraction_root = self._tarball_extraction_root(archive, destination_path, tarball_root)
         if clean_target and destination_path.exists():
             if destination_path.is_dir() and not destination_path.is_symlink():
                 backup_parent = destination_path.parent
@@ -1895,16 +1929,16 @@ class WriteDots:
             else:
                 self._remove_path_sudo(destination_path)
 
-        if not self._is_writable_path(destination_path):
-            if not self._run_sudo_command(["mkdir", "-p", str(destination_path)], "create tarball destination directory"):
-                raise PermissionError(f"Unable to prepare destination path: {destination_path}")
-            if not self._run_sudo_command(["tar", "-xf", str(archive), "-C", str(destination_path)], "extract tarball payload"):
-                raise RuntimeError(f"Failed to extract tarball payload into {destination_path}")
+        if not self._is_writable_path(extraction_root):
+            if not self._run_sudo_command(["mkdir", "-p", str(extraction_root)], "create tarball destination directory"):
+                raise PermissionError(f"Unable to prepare destination path: {extraction_root}")
+            if not self._run_sudo_command(["tar", "-xf", str(archive), "-C", str(extraction_root)], "extract tarball payload"):
+                raise RuntimeError(f"Failed to extract tarball payload into {extraction_root}")
             return True
 
-        destination_path.mkdir(parents=True, exist_ok=True)
+        extraction_root.mkdir(parents=True, exist_ok=True)
         with tarfile.open(archive, "r:*") as tar:
-            tar.extractall(path=destination_path)
+            tar.extractall(path=extraction_root)
         return True
 
     def _validate_bundle(self, pkg_path: str) -> bool:
@@ -2027,6 +2061,11 @@ class WriteDots:
                         "src": data_rel,
                         "dst": str(Path(tgt_root) / dst_rel),
                         "action": action,
+                        # A payload staged from a file carries the file name, so it
+                        # extracts into the parent of "dst"; one staged from a
+                        # directory carries paths relative to it and extracts into
+                        # "dst" itself.
+                        "tarball_root": "self" if src_path.is_dir() else "parent",
                     }
                     if entry_metadata:
                         for key, value in entry_metadata.items():
@@ -4650,7 +4689,12 @@ class DeezCLI:
                         LOG.debug("Missing in bundle: %s", source_rel_path)
                         continue
                     if entry_action == "tarball":
-                        if writer._extract_tarball_payload(source_path, destination_path, clean_target=clean_target):
+                        if writer._extract_tarball_payload(
+                            source_path,
+                            destination_path,
+                            clean_target=clean_target,
+                            tarball_root=file_entry.get("tarball_root"),
+                        ):
                             deployed_pairs.append({"src": source_rel_path, "dst": destination_path, "action": entry_action})
                         continue
                     if writer._copy_with_action(source_path, destination_path, entry_action, clean_target=clean_target):
