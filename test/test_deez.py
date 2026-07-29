@@ -4619,5 +4619,160 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("Deps:", result.stdout)
 
 
+class TestExtractTarballPayload(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="deez_tarball_test_")
+        self.root = Path(self.tmpdir.name)
+        self.writer = WriteDots()
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def stage_payload(self, source: Path, rel_path: str) -> Path:
+        stage_dir = self.root / "stage" / rel_path.replace("/", "_")
+        payload = self.writer._create_tarball_payload(source, stage_dir, rel_path, [])
+        self.assertIsNotNone(payload, "payload was not staged")
+        return payload
+
+    def test_single_file_payload_lands_at_the_recorded_path(self):
+        source_dir = self.root / "src"
+        source_dir.mkdir()
+        source_file = source_dir / "index.theme"
+        source_file.write_text("[Icon Theme]\nName=Example\n")
+
+        payload = self.stage_payload(source_file, "index.theme")
+        destination = self.root / "target" / "Example" / "index.theme"
+
+        self.assertTrue(self.writer._extract_tarball_payload(payload, destination))
+        self.assertTrue(destination.is_file())
+        self.assertEqual(destination.read_text(), "[Icon Theme]\nName=Example\n")
+        self.assertFalse((destination / "index.theme").exists(), "payload was nested inside a directory")
+
+    def test_single_file_payload_replaces_an_existing_file(self):
+        source_dir = self.root / "src"
+        source_dir.mkdir()
+        source_file = source_dir / "index.theme"
+        source_file.write_text("new\n")
+
+        payload = self.stage_payload(source_file, "index.theme")
+        destination = self.root / "target" / "Example" / "index.theme"
+        destination.parent.mkdir(parents=True)
+        destination.write_text("stale\n")
+
+        self.assertTrue(self.writer._extract_tarball_payload(payload, destination))
+        self.assertTrue(destination.is_file())
+        self.assertEqual(destination.read_text(), "new\n")
+
+    def test_directory_payload_keeps_the_recorded_path_as_its_root(self):
+        source_dir = self.root / "src" / "cursors"
+        (source_dir / "nested").mkdir(parents=True)
+        (source_dir / "left_ptr").write_text("cursor\n")
+        (source_dir / "nested" / "watch").write_text("cursor\n")
+
+        payload = self.stage_payload(source_dir, "cursors")
+        destination = self.root / "target" / "Example" / "cursors"
+
+        self.assertTrue(self.writer._extract_tarball_payload(payload, destination))
+        self.assertTrue((destination / "left_ptr").is_file())
+        self.assertTrue((destination / "nested" / "watch").is_file())
+        self.assertFalse((destination / "cursors").exists(), "payload was nested inside a directory")
+
+    def test_directory_payload_with_one_file_is_not_mistaken_for_a_file_payload(self):
+        source_dir = self.root / "src" / "cursors"
+        source_dir.mkdir(parents=True)
+        (source_dir / "cursors").write_text("same name as its directory\n")
+
+        payload = self.stage_payload(source_dir, "cursors")
+        destination = self.root / "target" / "Example" / "cursors"
+
+        self.assertTrue(self.writer._extract_tarball_payload(payload, destination, tarball_root="self"))
+        self.assertTrue(destination.is_dir())
+        self.assertTrue((destination / "cursors").is_file())
+
+    def test_recorded_layout_takes_precedence_over_the_payload(self):
+        source_dir = self.root / "src"
+        source_dir.mkdir()
+        source_file = source_dir / "index.theme"
+        source_file.write_text("recorded\n")
+        payload = self.stage_payload(source_file, "index.theme")
+
+        as_parent = self.root / "parent" / "Example" / "index.theme"
+        self.assertTrue(self.writer._extract_tarball_payload(payload, as_parent, tarball_root="parent"))
+        self.assertTrue(as_parent.is_file())
+
+        as_self = self.root / "self" / "Example" / "index.theme"
+        self.assertTrue(self.writer._extract_tarball_payload(payload, as_self, tarball_root="self"))
+        self.assertTrue((as_self / "index.theme").is_file())
+
+    def test_staged_entry_records_the_payload_layout(self):
+        source_root = self.root / "src"
+        (source_root / "cursors").mkdir(parents=True)
+        (source_root / "cursors" / "left_ptr").write_text("cursor\n")
+        (source_root / "index.theme").write_text("[Icon Theme]\n")
+        target_root = self.root / "target" / "Example"
+
+        file_pairs, any_staged = self.writer._stage_file_entries(
+            [
+                {
+                    "src_root": str(source_root),
+                    "tgt_root": str(target_root),
+                    "rel_paths": ["index.theme", "cursors"],
+                    "action": "tarball",
+                }
+            ],
+            self.root / "stage",
+        )
+
+        self.assertTrue(any_staged)
+        recorded = {Path(pair["dst"]).name: pair.get("tarball_root") for pair in file_pairs}
+        self.assertEqual(recorded, {"index.theme": "parent", "cursors": "self"})
+
+        # The recorded layout has to survive a real deployment, not just staging.
+        for pair in file_pairs:
+            payload = self.root / "stage" / pair["src"]
+            self.assertTrue(
+                self.writer._extract_tarball_payload(
+                    payload, pair["dst"], tarball_root=pair.get("tarball_root")
+                )
+            )
+        self.assertTrue((target_root / "index.theme").is_file())
+        self.assertTrue((target_root / "cursors" / "left_ptr").is_file())
+
+    def test_payload_escaping_the_destination_is_refused(self):
+        payload = self.root / "evil.tar.gz"
+        with tarfile.open(payload, "w:gz") as tar:
+            escaping = tarfile.TarInfo("../escaped")
+            escaping.size = 0
+            tar.addfile(escaping, io.BytesIO(b""))
+
+        destination = self.root / "target" / "Example"
+        with self.assertRaises(ValueError):
+            self.writer._extract_tarball_payload(payload, destination, tarball_root="self")
+        self.assertFalse((self.root / "target" / "escaped").exists())
+
+    def test_payload_with_an_absolute_member_is_refused(self):
+        payload = self.root / "absolute.tar.gz"
+        with tarfile.open(payload, "w:gz") as tar:
+            absolute = tarfile.TarInfo("/etc/passwd")
+            absolute.size = 0
+            tar.addfile(absolute, io.BytesIO(b""))
+
+        destination = self.root / "target" / "Example"
+        with self.assertRaises(ValueError):
+            self.writer._extract_tarball_payload(payload, destination, tarball_root="self")
+
+    def test_payload_with_an_escaping_symlink_is_refused(self):
+        payload = self.root / "symlink.tar.gz"
+        with tarfile.open(payload, "w:gz") as tar:
+            link = tarfile.TarInfo("passwd")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../../../../etc/passwd"
+            tar.addfile(link)
+
+        destination = self.root / "target" / "Example"
+        with self.assertRaises(ValueError):
+            self.writer._extract_tarball_payload(payload, destination, tarball_root="self")
+
+
 if __name__ == "__main__":
     unittest.main()
