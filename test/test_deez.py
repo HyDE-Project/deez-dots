@@ -2427,6 +2427,77 @@ class TestDeezCLI(unittest.TestCase):
         self.assertFalse((stale_dir / "removed-upstream.conf").exists())
         self.assertTrue((self.home_dir / ".config" / "kitty.old" / "removed-upstream.conf").exists())
 
+    def test_dots_deploy_clean_target_leaves_unflagged_targets_untouched(self):
+        source_dir = Path(self.tmpdir.name) / "source"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/fish").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        (source_dir / ".config/fish/config.fish").write_text("set -g fish_greeting")
+        clean_dir = self.home_dir / ".config" / "kitty"
+        merged_dir = self.home_dir / ".config" / "fish"
+        clean_dir.mkdir(parents=True, exist_ok=True)
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        (clean_dir / "removed-upstream.conf").write_text("orphan")
+        (merged_dir / "local.fish").write_text("kept")
+        config_path = Path(self.tmpdir.name) / "mixed-clean-deploy.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'clean_target = true\n'
+            'action = "sync"\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty"]\n'
+            '[[kitty.files]]\n'
+            'action = "sync"\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["fish"]\n'
+        )
+
+        result = self.run_cli(["dots", "--deploy", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse((clean_dir / "removed-upstream.conf").exists())
+        self.assertTrue((merged_dir / "local.fish").exists())
+        self.assertFalse((self.home_dir / ".config" / "fish.old").exists())
+
+    def test_dots_deploy_clean_target_spares_a_root_holding_preserve_entries(self):
+        source_dir = Path(self.tmpdir.name) / "source"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        target_dir = self.home_dir / ".config" / "kitty"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / "user-owned.conf").write_text("mine")
+        config_path = Path(self.tmpdir.name) / "preserve-clean-deploy.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'clean_target = true\n'
+            'action = "preserve"\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty"]\n'
+        )
+
+        result = self.run_cli(["dots", "--deploy", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue((target_dir / "user-owned.conf").exists())
+        self.assertFalse((self.home_dir / ".config" / "kitty.old").exists())
+
     def test_write_dots_copy_with_action_sync_clean_target_moves_existing_dir(self):
         writer = deez_module.WriteDots()
         src_dir = Path(self.tmpdir.name) / "src"

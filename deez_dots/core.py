@@ -4716,46 +4716,67 @@ class DeezCLI:
                 deployed_pairs: List[Dict[str, Any]] = []
                 adopted_pairs: List[Dict[str, Any]] = []
                 bundle_data_dir = temp_install_dir / "data"
-                clean_target = bundle.get("clean_target", False)
-                # A dot asking for a clean target expects the directory replaced,
-                # not merged into. Move each declared root aside once, before any
-                # file lands, so files the source dropped do not linger.
-                if clean_target and not dry_run:
-                    archived_roots = set()
-                    for file_entry in filtered_entries:
-                        root_value = file_entry.get("clean_root")
-                        if not root_value:
-                            continue
-                        if DeezUtils.normalize_action(file_entry.get("action")) == "preserve":
-                            continue
-                        root_path = os.path.normpath(str(DeezUtils.expand(root_value)))
-                        if root_path in archived_roots:
-                            continue
-                        archived_roots.add(root_path)
-                        archived_path = writer.archive_existing_path(root_path)
-                        if archived_path:
-                            UI.info(f"Cleaned '{root_path}' -> '{archived_path}'")
+                # Sources are resolved before anything is written, so a root is
+                # never moved aside on behalf of a payload missing from the
+                # bundle, which would empty the target and install nothing.
+                deployable: List[Dict[str, Any]] = []
                 for file_entry in filtered_entries:
                     source_rel_path = file_entry.get("src")
-                    destination_path = DeezUtils.expand(file_entry.get("dst"))
-                    destination_path = os.path.normpath(str(destination_path)) if destination_path else ""
-                    entry_action = DeezUtils.normalize_action(file_entry.get("action"))
                     source_path = bundle_data_dir / source_rel_path
                     if not writer._path_exists_or_link(source_path):
                         source_path = temp_install_dir / source_rel_path
                     if not writer._path_exists_or_link(source_path):
                         LOG.debug("Missing in bundle: %s", source_rel_path)
                         continue
+                    destination_path = DeezUtils.expand(file_entry.get("dst"))
+                    deployable.append(
+                        {
+                            "entry": file_entry,
+                            "src_rel": source_rel_path,
+                            "src_path": source_path,
+                            "dst": os.path.normpath(str(destination_path)) if destination_path else "",
+                            "action": DeezUtils.normalize_action(file_entry.get("action")),
+                            "clean_target": bool(file_entry.get("clean_target", False)),
+                        }
+                    )
+                # A dot asking for a clean target expects the directory replaced,
+                # not merged into, so each declared root is moved aside once
+                # before any file lands. Roots holding a preserve entry are left
+                # alone: those files belong to the user, not to the dot.
+                if not dry_run:
+                    preserved_roots = {
+                        os.path.normpath(str(DeezUtils.expand(item["entry"].get("clean_root"))))
+                        for item in deployable
+                        if item["action"] == "preserve" and item["entry"].get("clean_root")
+                    }
+                    archived_roots = set()
+                    for item in deployable:
+                        root_value = item["entry"].get("clean_root")
+                        if not root_value or not item["clean_target"] or item["action"] == "preserve":
+                            continue
+                        root_path = os.path.normpath(str(DeezUtils.expand(root_value)))
+                        if root_path in preserved_roots or root_path in archived_roots:
+                            continue
+                        archived_roots.add(root_path)
+                        archived_path = writer.archive_existing_path(root_path)
+                        if archived_path:
+                            UI.info(f"Cleaned '{root_path}' -> '{archived_path}'")
+                for item in deployable:
+                    source_rel_path = item["src_rel"]
+                    source_path = item["src_path"]
+                    destination_path = item["dst"]
+                    entry_action = item["action"]
+                    entry_clean_target = item["clean_target"]
                     if entry_action == "tarball":
                         if writer._extract_tarball_payload(
                             source_path,
                             destination_path,
-                            clean_target=clean_target,
-                            tarball_root=file_entry.get("tarball_root"),
+                            clean_target=entry_clean_target,
+                            tarball_root=item["entry"].get("tarball_root"),
                         ):
                             deployed_pairs.append({"src": source_rel_path, "dst": destination_path, "action": entry_action})
                         continue
-                    if writer._copy_with_action(source_path, destination_path, entry_action, clean_target=clean_target):
+                    if writer._copy_with_action(source_path, destination_path, entry_action, clean_target=entry_clean_target):
                         deployed_pairs.append({"src": source_rel_path, "dst": destination_path, "action": entry_action})
                     elif entry_action == "preserve" and Path(destination_path).exists():
                         adopted_pairs.append({"src": source_rel_path, "dst": destination_path, "action": entry_action})
