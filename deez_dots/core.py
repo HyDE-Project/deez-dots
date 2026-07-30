@@ -1620,8 +1620,12 @@ class WriteDots:
         appended_count = 0
         # Staging flattens a directory into one entry per file, so the directory
         # itself would be lost. Record it while it is still known, otherwise
-        # install has no way to tell which target it may clean.
-        clean_root = str(Path(target_root) / str(matched_rel)) if clean_target and staged.is_dir() else ""
+        # install has no way to tell which target it may clean. A path of "."
+        # collapses onto target_root, which defaults to the section home, so it
+        # is refused: no dot may declare the whole home directory cleanable.
+        clean_root = ""
+        if clean_target and staged.is_dir() and str(matched_rel) not in (".", "", "/"):
+            clean_root = DeezUtils.template_path(str(Path(target_root) / str(matched_rel)))
         for staged_file in self._expand_files(staged):
             data_rel = Path(staged_file).relative_to(data_dir).as_posix()
             if staged.is_dir():
@@ -4638,6 +4642,73 @@ class DeezCLI:
                 )
         UI.info("Export complete")
 
+    def _prune_clean_roots(self, dot: str, deployable: List[Dict[str, Any]]) -> None:
+        """Move files the dot no longer ships out of the roots it declared cleanable.
+
+        Only files are moved, and only those absent from this deployment and
+        untracked by another dot, so a dot cannot take a neighbour's files or the
+        user's own with it. A root is refused unless it holds at least one file
+        of this deployment, which keeps a mistaken declaration from reaching the
+        home directory or an XDG root.
+        """
+        protected = {
+            os.path.normpath(str(Path(DeezUtils.home_dir()))),
+            os.path.normpath(str(Path(DeezUtils.xdg_config_home()))),
+            os.path.normpath(str(Path(DeezUtils.xdg_data_home()))),
+            os.path.normpath(str(Path(DeezUtils.xdg_cache_home()))),
+            os.path.abspath(os.sep),
+        }
+
+        roots: Dict[str, bool] = {}
+        root_files: Dict[str, set] = {}
+        for item in deployable:
+            root_value = item["entry"].get("clean_root")
+            if not root_value:
+                continue
+            root_path = os.path.normpath(str(DeezUtils.expand(root_value)))
+            cleanable = bool(item["clean_target"]) and item["action"] != "preserve"
+            roots[root_path] = roots.get(root_path, True) and cleanable
+            root_files.setdefault(root_path, set())
+
+        if not roots:
+            return
+
+        deployed_targets = {item["dst"] for item in deployable if item["dst"]}
+        for root_path in roots:
+            prefix = root_path + os.sep
+            root_files[root_path] = {target for target in deployed_targets if target.startswith(prefix)}
+
+        owner_index = self.manifest_manager.build_owner_index()
+
+        for root_path, cleanable in roots.items():
+            if not cleanable or root_path in protected or not root_files[root_path]:
+                continue
+            root = Path(root_path)
+            if not root.is_dir() or root.is_symlink():
+                continue
+            stale: List[Path] = []
+            for existing in root.rglob("*"):
+                if existing.is_dir() and not existing.is_symlink():
+                    continue
+                existing_path = os.path.normpath(str(existing))
+                if existing_path in root_files[root_path]:
+                    continue
+                other_owner = owner_index.get(existing_path) or owner_index.get(DeezUtils.template_path(existing_path))
+                if other_owner and other_owner != dot:
+                    continue
+                stale.append(existing)
+            if not stale:
+                continue
+            attic = root.parent / (root.name + ".old")
+            for existing in stale:
+                relative = existing.relative_to(root)
+                moved_to = attic / relative
+                moved_to.parent.mkdir(parents=True, exist_ok=True)
+                if moved_to.exists() or moved_to.is_symlink():
+                    WriteDots._remove_existing_path(moved_to)
+                shutil.move(str(existing), str(moved_to))
+            UI.info(f"Pruned {len(stale)} stale file(s) from '{root_path}' -> '{attic}'")
+
     def _do_install(self, tarballs: List[str], dry_run: bool = False, prechecked_dependencies: bool = False, uninstall_existing: bool = False) -> None:
         writer = WriteDots()
         no_backup = getattr(self.args, "no_backup", False)
@@ -4717,8 +4788,15 @@ class DeezCLI:
                 adopted_pairs: List[Dict[str, Any]] = []
                 bundle_data_dir = temp_install_dir / "data"
                 # Sources are resolved before anything is written, so a root is
-                # never moved aside on behalf of a payload missing from the
-                # bundle, which would empty the target and install nothing.
+                # never pruned on behalf of a payload missing from the bundle,
+                # which would empty the target and install nothing.
+                # Bundles built before clean_root existed, and those written by
+                # export(), carry the flag only at the top level. That is the
+                # fallback, and only when no entry states it, so a mixed bundle
+                # keeps per-entry precision.
+                bundle_clean_target = bool(bundle.get("clean_target", False)) and not any(
+                    "clean_target" in file_entry for file_entry in filtered_entries
+                )
                 deployable: List[Dict[str, Any]] = []
                 for file_entry in filtered_entries:
                     source_rel_path = file_entry.get("src")
@@ -4736,31 +4814,14 @@ class DeezCLI:
                             "src_path": source_path,
                             "dst": os.path.normpath(str(destination_path)) if destination_path else "",
                             "action": DeezUtils.normalize_action(file_entry.get("action")),
-                            "clean_target": bool(file_entry.get("clean_target", False)),
+                            # Bundles built before clean_root existed, and those
+                            # written by export(), carry the flag only at the top
+                            # level, so that stays the fallback.
+                            "clean_target": bool(file_entry.get("clean_target", bundle_clean_target)),
                         }
                     )
-                # A dot asking for a clean target expects the directory replaced,
-                # not merged into, so each declared root is moved aside once
-                # before any file lands. Roots holding a preserve entry are left
-                # alone: those files belong to the user, not to the dot.
                 if not dry_run:
-                    preserved_roots = {
-                        os.path.normpath(str(DeezUtils.expand(item["entry"].get("clean_root"))))
-                        for item in deployable
-                        if item["action"] == "preserve" and item["entry"].get("clean_root")
-                    }
-                    archived_roots = set()
-                    for item in deployable:
-                        root_value = item["entry"].get("clean_root")
-                        if not root_value or not item["clean_target"] or item["action"] == "preserve":
-                            continue
-                        root_path = os.path.normpath(str(DeezUtils.expand(root_value)))
-                        if root_path in preserved_roots or root_path in archived_roots:
-                            continue
-                        archived_roots.add(root_path)
-                        archived_path = writer.archive_existing_path(root_path)
-                        if archived_path:
-                            UI.info(f"Cleaned '{root_path}' -> '{archived_path}'")
+                    self._prune_clean_roots(dot, deployable)
                 for item in deployable:
                     source_rel_path = item["src_rel"]
                     source_path = item["src_path"]

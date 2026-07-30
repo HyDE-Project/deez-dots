@@ -2394,7 +2394,119 @@ class TestDeezCLI(unittest.TestCase):
         self.assertTrue(manifest["files"])
         for entry in manifest["files"]:
             self.assertTrue(entry.get("clean_target"))
-            self.assertTrue(str(entry.get("clean_root", "")).endswith("/.config/kitty"))
+            clean_root = str(entry.get("clean_root", ""))
+            self.assertTrue(clean_root.startswith("${"), f"clean_root not templated: {clean_root}")
+            self.assertTrue(clean_root.endswith("/.config/kitty"))
+            self.assertNotIn(str(self.home_dir), clean_root)
+
+    def test_dots_package_refuses_a_clean_root_of_the_whole_target(self):
+        source_dir = Path(self.tmpdir.name) / "source"
+        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
+        if bundle_path.exists():
+            bundle_path.unlink()
+        (source_dir / "keepme").mkdir(parents=True, exist_ok=True)
+        (source_dir / "keepme/shipped.conf").write_text("shipped")
+        precious = self.home_dir / "IMPORTANT.txt"
+        precious.write_text("do not move me")
+        config_path = Path(self.tmpdir.name) / "whole-home-clean.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'clean_target = true\n'
+            'action = "sync"\n'
+            'paths = ["."]\n'
+        )
+
+        result = self.run_cli(["dots", "--deploy", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(precious.exists(), "a clean_target of '.' moved the home directory aside")
+        self.assertFalse((self.home_dir.parent / f"{self.home_dir.name}.old").exists())
+
+    def test_dots_deploy_clean_target_does_not_accumulate_copies(self):
+        source_dir = Path(self.tmpdir.name) / "source"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        target_dir = self.home_dir / ".config" / "kitty"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / "removed-upstream.conf").write_text("orphan")
+        config_path = Path(self.tmpdir.name) / "repeat-clean-deploy.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'clean_target = true\n'
+            'action = "sync"\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty"]\n'
+        )
+
+        for _ in range(3):
+            result = self.run_cli(["dots", "--deploy", "--config", str(config_path)])
+            self.assertEqual(result.returncode, 0)
+
+        siblings = sorted(p.name for p in (self.home_dir / ".config").iterdir())
+        self.assertEqual(siblings, ["kitty", "kitty.old"], f"deploys accumulated copies: {siblings}")
+        self.assertTrue((target_dir / "kitty.conf").exists())
+
+    def test_dots_deploy_clean_target_spares_files_owned_by_another_dot(self):
+        source_dir = Path(self.tmpdir.name) / "source"
+        (source_dir / ".config/shared").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/shared/kitty.conf").write_text("font_size 12")
+        neighbour_source = Path(self.tmpdir.name) / "neighbour-source"
+        (neighbour_source / "shared").mkdir(parents=True, exist_ok=True)
+        (neighbour_source / "shared/neighbour.conf").write_text("neighbour")
+        neighbour_config = Path(self.tmpdir.name) / "neighbour.toml"
+        neighbour_config.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{neighbour_source}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[neighbour]\n'
+            '[[neighbour.files]]\n'
+            'action = "sync"\n'
+            'source_root = "shared"\n'
+            'target_root = "$HOME/.config/shared"\n'
+            'paths = ["neighbour.conf"]\n'
+        )
+        cleaner_config = Path(self.tmpdir.name) / "cleaner.toml"
+        cleaner_config.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'clean_target = true\n'
+            'action = "sync"\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["shared"]\n'
+        )
+
+        self.assertEqual(self.run_cli(["dots", "--deploy", "--config", str(neighbour_config)]).returncode, 0)
+        shared_dir = self.home_dir / ".config" / "shared"
+        self.assertTrue((shared_dir / "neighbour.conf").exists())
+
+        self.assertEqual(self.run_cli(["dots", "--deploy", "--config", str(cleaner_config)]).returncode, 0)
+
+        self.assertTrue((shared_dir / "neighbour.conf").exists(), "a clean_target dot took another dot's file")
 
     def test_dots_deploy_clean_target_moves_stale_target_aside(self):
         source_dir = Path(self.tmpdir.name) / "source"
