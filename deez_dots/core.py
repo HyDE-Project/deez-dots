@@ -1618,6 +1618,10 @@ class WriteDots:
         staged = Path(staged_path)
         matched_rel = PurePosixPath(str(matched_rel_path or ".").strip())
         appended_count = 0
+        # Staging flattens a directory into one entry per file, so the directory
+        # itself would be lost. Record it while it is still known, otherwise
+        # install has no way to tell which target it may clean.
+        clean_root = str(Path(target_root) / str(matched_rel)) if clean_target and staged.is_dir() else ""
         for staged_file in self._expand_files(staged):
             data_rel = Path(staged_file).relative_to(data_dir).as_posix()
             if staged.is_dir():
@@ -1637,6 +1641,8 @@ class WriteDots:
                     manifest_entry[key] = value
             if clean_target:
                 manifest_entry["clean_target"] = True
+                if clean_root:
+                    manifest_entry["clean_root"] = clean_root
             file_pairs.append(manifest_entry)
             appended_count += 1
         return appended_count
@@ -1804,6 +1810,23 @@ class WriteDots:
         return True
 
     @staticmethod
+    def archive_existing_path(tgt_path: Union[str, Path]) -> Optional[Path]:
+        """Move an existing target aside to a free ``.old`` name, returning where it went."""
+        tgt = Path(tgt_path)
+        if not tgt.exists() and not tgt.is_symlink():
+            return None
+        backup_parent = tgt.parent
+        backup_name = tgt.name + ".old"
+        backup_path = backup_parent / backup_name
+        counter = 1
+        while backup_path.exists() or backup_path.is_symlink():
+            backup_path = backup_parent / f"{backup_name}.{counter}"
+            counter += 1
+        shutil.move(str(tgt), str(backup_path))
+        LOG.debug("Clean build: moved existing %s -> %s", tgt, backup_path)
+        return backup_path
+
+    @staticmethod
     def _copy_with_action(src_path: Union[str, Path], tgt_path: Union[str, Path], action: str, clean_target: bool = False) -> bool:
         action = DeezUtils.normalize_action(action)
         src = Path(src_path)
@@ -1813,15 +1836,7 @@ class WriteDots:
                 return False
             if tgt.exists() or tgt.is_symlink():
                 if tgt.is_dir() and not tgt.is_symlink() and clean_target:
-                    backup_parent = tgt.parent
-                    backup_name = tgt.name + ".old"
-                    backup_path = backup_parent / backup_name
-                    counter = 1
-                    while backup_path.exists():
-                        backup_path = backup_parent / f"{backup_name}.{counter}"
-                        counter += 1
-                    shutil.move(str(tgt), str(backup_path))
-                    LOG.debug("Clean build: moved existing %s -> %s", tgt, backup_path)
+                    WriteDots.archive_existing_path(tgt)
                 else:
                     WriteDots._remove_existing_path(tgt)
             tgt.parent.mkdir(parents=True, exist_ok=True)
@@ -1830,15 +1845,7 @@ class WriteDots:
         if src.is_dir():
             if action == "sync":
                 if tgt.exists() and clean_target:
-                    backup_parent = tgt.parent
-                    backup_name = tgt.name + ".old"
-                    backup_path = backup_parent / backup_name
-                    counter = 1
-                    while backup_path.exists():
-                        backup_path = backup_parent / f"{backup_name}.{counter}"
-                        counter += 1
-                    shutil.move(str(tgt), str(backup_path))
-                    LOG.debug("Clean build: moved existing %s -> %s", tgt, backup_path)
+                    WriteDots.archive_existing_path(tgt)
                 if not tgt.exists():
                     shutil.copytree(src, tgt)
                     return True
@@ -2166,6 +2173,8 @@ class WriteDots:
                 "builddate": str(int(time.time())),
                 "origin": "package",
             }
+            if any(bool(pair.get("clean_target", False)) for pair in all_file_pairs):
+                desc_data["clean_target"] = True
             if source_url:
                 desc_data["source"] = source_url
             if branch:
@@ -4708,6 +4717,24 @@ class DeezCLI:
                 adopted_pairs: List[Dict[str, Any]] = []
                 bundle_data_dir = temp_install_dir / "data"
                 clean_target = bundle.get("clean_target", False)
+                # A dot asking for a clean target expects the directory replaced,
+                # not merged into. Move each declared root aside once, before any
+                # file lands, so files the source dropped do not linger.
+                if clean_target and not dry_run:
+                    archived_roots = set()
+                    for file_entry in filtered_entries:
+                        root_value = file_entry.get("clean_root")
+                        if not root_value:
+                            continue
+                        if DeezUtils.normalize_action(file_entry.get("action")) == "preserve":
+                            continue
+                        root_path = os.path.normpath(str(DeezUtils.expand(root_value)))
+                        if root_path in archived_roots:
+                            continue
+                        archived_roots.add(root_path)
+                        archived_path = writer.archive_existing_path(root_path)
+                        if archived_path:
+                            UI.info(f"Cleaned '{root_path}' -> '{archived_path}'")
                 for file_entry in filtered_entries:
                     source_rel_path = file_entry.get("src")
                     destination_path = DeezUtils.expand(file_entry.get("dst"))

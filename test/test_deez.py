@@ -2359,6 +2359,74 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(manifest["dependency"][0]["yay"], ["kitty"])
         self.assertEqual(manifest["files"][0]["dependency"][0]["pacman"], ["nvidia-utils"])
 
+    def test_dots_package_bundle_records_clean_target_and_root(self):
+        source_dir = Path(self.tmpdir.name) / "source"
+        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
+        if bundle_path.exists():
+            bundle_path.unlink()
+        config_file = source_dir / ".config/kitty/kitty.conf"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text("font_size 12")
+        config_path = Path(self.tmpdir.name) / "clean-package.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'clean_target = true\n'
+            'action = "sync"\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty"]\n'
+        )
+
+        result = self.run_cli(["dots", "--package", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(bundle_path.exists())
+        with tarfile.open(bundle_path, "r:gz") as tar:
+            manifest = deez_module.toml.loads(tar.extractfile("manifest.toml").read().decode("utf-8"))
+        self.assertTrue(manifest.get("clean_target"))
+        self.assertTrue(manifest["files"])
+        for entry in manifest["files"]:
+            self.assertTrue(entry.get("clean_target"))
+            self.assertTrue(str(entry.get("clean_root", "")).endswith("/.config/kitty"))
+
+    def test_dots_deploy_clean_target_moves_stale_target_aside(self):
+        source_dir = Path(self.tmpdir.name) / "source"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        stale_dir = self.home_dir / ".config" / "kitty"
+        stale_dir.mkdir(parents=True, exist_ok=True)
+        (stale_dir / "removed-upstream.conf").write_text("orphan")
+        config_path = Path(self.tmpdir.name) / "clean-deploy.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'clean_target = true\n'
+            'action = "sync"\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty"]\n'
+        )
+
+        result = self.run_cli(["dots", "--deploy", "--config", str(config_path)])
+
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue((stale_dir / "kitty.conf").exists())
+        self.assertFalse((stale_dir / "removed-upstream.conf").exists())
+        self.assertTrue((self.home_dir / ".config" / "kitty.old" / "removed-upstream.conf").exists())
+
     def test_write_dots_copy_with_action_sync_clean_target_moves_existing_dir(self):
         writer = deez_module.WriteDots()
         src_dir = Path(self.tmpdir.name) / "src"
