@@ -17,7 +17,7 @@ from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest.mock import patch
-from deez_dots.commands.dots import _should_overwrite_installed_dot
+from deez_dots.commands.dots import _should_overwrite_installed_dot, _should_reinstall_dot, _bundle_hash_matches_cache
 from deez_dots.core import WriteDots, compare_versions
 
 # --- SAFETY FIX: Hijack environment BEFORE loading any deez modules ---
@@ -72,6 +72,25 @@ def run_deez(args, env=None, input_data=None, cwd=None):
     return result
 
 
+def _bundle_path(result: subprocess.CompletedProcess) -> Path | None:
+    """Extract the bundle path from a package/export CLI result.
+
+    Parses output lines like::
+
+        [ok] Bundled kitty -> /path/kitty-0.1.0+3f7a2b1e.tar.gz
+        [ok] Exported kitty -> /path/kitty-0.1.0.tar.gz
+
+    and returns the path.
+    """
+    for line in (result.stdout or "").splitlines():
+        if (" Bundled " in line or " Exported " in line) and " -> " in line:
+            path_str = line.split(" -> ")[-1].strip()
+            p = Path(path_str)
+            if p.exists():
+                return p
+    return None
+
+
 class TestDeezCLI(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory(prefix="deez_test_")
@@ -114,6 +133,51 @@ class TestDeezCLI(unittest.TestCase):
         env_vars["PWD"] = str(cwd)
         return run_deez(args, env=env_vars, input_data=input_data, cwd=cwd)
 
+    def _find_bundle(self, dot: str, version: str, build_dir: Path | None = None) -> Path | None:
+        """Find a bundle file matching ``{dot}-{version}+*.tar.gz``.
+
+        The content-hash suffix (``+3f7a2b1e``) makes exact-name matching
+        impossible, so we scan the build directory for a matching prefix.
+        ``build_dir`` defaults to ``SCRIPT_DIR / "build"``.
+        """
+        base = build_dir or (SCRIPT_DIR / "build")
+        prefix = f"{dot}-{version}+"
+        for p in base.iterdir():
+            if p.name.startswith(prefix) and p.name.endswith(".tar.gz"):
+                return p
+        return None
+
+    def _bundle_path(self, result: subprocess.CompletedProcess) -> Path | None:
+        """Extract the bundle path from a package/export CLI result.
+
+        Parses output lines like::
+
+            [ok] Bundled kitty -> /path/kitty-0.1.0+3f7a2b1e.tar.gz
+            [ok] Exported kitty -> /path/kitty-0.1.0.tar.gz
+
+        and returns the path.  Handles both compressed (``.tar.gz``) and
+        uncompressed (directory) outputs.
+        """
+        for line in (result.stdout or "").splitlines():
+            if " Bundled " in line and " -> " in line:
+                path_str = line.split(" -> ")[-1].strip()
+                p = Path(path_str)
+                if p.exists():
+                    return p
+                # Try in SCRIPT_DIR/build if path is relative
+                alt = SCRIPT_DIR / "build" / p.name
+                if alt.exists():
+                    return alt
+            if " Exported " in line and " -> " in line:
+                path_str = line.split(" -> ")[-1].strip()
+                p = Path(path_str)
+                if p.exists():
+                    return p
+                alt = SCRIPT_DIR / "build" / p.name
+                if alt.exists():
+                    return alt
+        return None
+
     def run_entrypoint(self, argv):
         output = io.StringIO()
         with patch.object(sys, "argv", argv), patch.dict(os.environ, self.env, clear=False), redirect_stdout(output):
@@ -126,6 +190,20 @@ class TestDeezCLI(unittest.TestCase):
         with patch.object(sys, "argv", argv), patch.dict(os.environ, self.env, clear=False), redirect_stdout(output):
             deez_module.main()
         return output.getvalue()
+
+    def _find_bundle(self, dot: str, version: str, build_dir: Path | None = None) -> Path | None:
+        """Find a bundle file matching ``{dot}-{version}+*.tar.gz``.
+
+        The content-hash suffix (``+3f7a2b1e``) makes exact-name matching
+        impossible, so we scan the build directory for a matching prefix.
+        ``build_dir`` defaults to ``SCRIPT_DIR / "build"``.
+        """
+        base = build_dir or (SCRIPT_DIR / "build")
+        prefix = f"{dot}-{version}+"
+        for p in base.iterdir():
+            if p.name.startswith(prefix) and p.name.endswith(".tar.gz"):
+                return p
+        return None
 
     def _write_package_config(self):
         source_dir = Path(self.tmpdir.name) / "source"
@@ -340,6 +418,167 @@ class TestDeezCLI(unittest.TestCase):
 
         with patch.object(deez_module.UI, "read_input", return_value="n"):
             self.assertFalse(_should_overwrite_installed_dot(cli, "kitty", "hyde_project", "1.2.2"))
+
+    def test_should_reprompt_on_empty_input_then_confirm(self):
+        cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
+        cli.args = argparse.Namespace()
+        cli.manifest_manager.load_desc = lambda dot: {"owner": "hyde_project", "version": "1.2.3"}
+
+        with patch.object(deez_module.UI, "read_input", side_effect=["", "y"]):
+            self.assertTrue(_should_overwrite_installed_dot(cli, "kitty", "hyde_project", "1.2.2"))
+
+    def test_should_reprompt_on_invalid_input_then_cancel(self):
+        cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
+        cli.args = argparse.Namespace()
+        cli.manifest_manager.load_desc = lambda dot: {"owner": "hyde_project", "version": "1.2.3"}
+
+        with patch.object(deez_module.UI, "read_input", side_effect=["maybe", "n"]):
+            self.assertFalse(_should_overwrite_installed_dot(cli, "kitty", "hyde_project", "1.2.2"))
+
+    def test_should_reinstall_dot_when_hash_differs(self):
+        """Test that _should_reinstall_dot returns True when bundle content hash differs."""
+        cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
+        cli.args = argparse.Namespace()
+
+        # Mock existing manifest with a hash
+        old_hash = "a" * 64  # 64-char SHA256
+        cli.manifest_manager.load_desc = lambda dot: {
+            "owner": "hyde_project",
+            "version": "1.0.0+oldhash",
+            "hash": old_hash,
+        }
+
+        # Create a bundle with different content (different hash)
+        bundle_content = b"new bundle content"
+        new_hash = hashlib.sha256(bundle_content).hexdigest()
+        bundle_path = Path(self.tmpdir.name) / "new-bundle.tar.gz"
+        bundle_path.write_bytes(bundle_content)
+
+        # Mock _read_bundle_manifest to return bundle with new hash
+        cli._read_bundle_manifest = lambda p: {
+            "name": "kitty",
+            "owner": "hyde_project",
+            "version": "1.0.0+newhash",
+        }
+
+        # Should reinstall because hash differs
+        self.assertTrue(_should_reinstall_dot(cli, "kitty", str(bundle_path)))
+
+    def test_should_not_reinstall_dot_when_hash_matches(self):
+        """Test that _should_reinstall_dot returns False when bundle content hash matches."""
+        cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
+        cli.args = argparse.Namespace()
+
+        # Create bundle content and compute its hash
+        bundle_content = b"same bundle content"
+        expected_hash = hashlib.sha256(bundle_content).hexdigest()
+        bundle_path = Path(self.tmpdir.name) / "same-bundle.tar.gz"
+        bundle_path.write_bytes(bundle_content)
+
+        # Mock existing manifest with the same hash
+        cli.manifest_manager.load_desc = lambda dot: {
+            "owner": "hyde_project",
+            "version": "1.0.0+contenthash",
+            "hash": expected_hash,
+        }
+
+        # Mock _read_bundle_manifest
+        cli._read_bundle_manifest = lambda p: {
+            "name": "kitty",
+            "owner": "hyde_project",
+            "version": "1.0.0+contenthash",
+        }
+
+        # Should NOT reinstall because hash matches
+        self.assertFalse(_should_reinstall_dot(cli, "kitty", str(bundle_path)))
+
+    def test_should_reinstall_dot_when_no_existing_manifest(self):
+        """Test that _should_reinstall_dot returns True for first-time install."""
+        cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
+        cli.args = argparse.Namespace()
+
+        # No existing manifest
+        cli.manifest_manager.load_desc = lambda dot: {}
+
+        bundle_path = Path(self.tmpdir.name) / "new-bundle.tar.gz"
+        bundle_path.write_bytes(b"bundle content")
+
+        cli._read_bundle_manifest = lambda p: {
+            "name": "kitty",
+            "owner": "hyde_project",
+            "version": "1.0.0",
+        }
+
+        # Should reinstall (first install)
+        self.assertTrue(_should_reinstall_dot(cli, "kitty", str(bundle_path)))
+
+    def test_should_reinstall_dot_when_owner_differs(self):
+        """Test that _should_reinstall_dot returns True when owner differs."""
+        cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
+        cli.args = argparse.Namespace()
+
+        bundle_content = b"bundle content"
+        bundle_hash = hashlib.sha256(bundle_content).hexdigest()
+        bundle_path = Path(self.tmpdir.name) / "bundle.tar.gz"
+        bundle_path.write_bytes(bundle_content)
+
+        # Existing manifest with different owner
+        cli.manifest_manager.load_desc = lambda dot: {
+            "owner": "other_owner",
+            "version": "1.0.0",
+            "hash": bundle_hash,
+        }
+
+        cli._read_bundle_manifest = lambda p: {
+            "name": "kitty",
+            "owner": "hyde_project",
+            "version": "1.0.0",
+        }
+
+        # Should reinstall because owner differs
+        self.assertTrue(_should_reinstall_dot(cli, "kitty", str(bundle_path)))
+
+    def test_should_reinstall_dot_fallback_to_version_when_no_hash(self):
+        """Test fallback to version comparison when manifest has no hash."""
+        cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
+        cli.args = argparse.Namespace()
+
+        # Old manifest without hash (pre-hash era)
+        cli.manifest_manager.load_desc = lambda dot: {
+            "owner": "hyde_project",
+            "version": "1.0.0",
+        }
+
+        bundle_path = Path(self.tmpdir.name) / "bundle.tar.gz"
+        bundle_path.write_bytes(b"bundle content")
+
+        cli._read_bundle_manifest = lambda p: {
+            "name": "kitty",
+            "owner": "hyde_project",
+            "version": "1.0.1",  # Newer version
+        }
+
+        # Should reinstall because version is newer (fallback behavior)
+        self.assertTrue(_should_reinstall_dot(cli, "kitty", str(bundle_path)))
+
+    def test_bundle_hash_matches_cache(self):
+        """Test _bundle_hash_matches_cache helper function."""
+        cli = self._make_cli({"global": {"owner": "hyde_project", "version": "0.1.0"}})
+        cli.args = argparse.Namespace()
+
+        bundle_content = b"test bundle content"
+        expected_hash = hashlib.sha256(bundle_content).hexdigest()
+        bundle_path = Path(self.tmpdir.name) / "bundle.tar.gz"
+        bundle_path.write_bytes(bundle_content)
+
+        # Should match
+        self.assertTrue(_bundle_hash_matches_cache(cli, str(bundle_path), expected_hash))
+
+        # Should not match different hash
+        self.assertFalse(_bundle_hash_matches_cache(cli, str(bundle_path), "b" * 64))
+
+        # Should not match for missing file
+        self.assertFalse(_bundle_hash_matches_cache(cli, "/nonexistent/path.tar.gz", expected_hash))
 
     def test_query_selectable_installed_and_cache_options(self):
         file_path = self.home_dir / ".config/kitty/kitty.conf"
@@ -942,7 +1181,9 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("Using auto-discovered config from current directory:", result.stdout)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
-        self.assertTrue((work_dir / "build" / "kitty-0.1.0.tar.gz").exists())
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
+        self.assertTrue(bundle_path.exists())
 
     def test_dots_package_rebuilds_invalid_existing_bundle(self):
         work_dir = Path(self.tmpdir.name) / "workspace-rebuild"
@@ -965,14 +1206,15 @@ class TestDeezCLI(unittest.TestCase):
         )
         build_dir = work_dir / "build"
         build_dir.mkdir(parents=True, exist_ok=True)
-        expected_bundle = build_dir / "kitty-0.1.0.tar.gz"
-        expected_bundle.write_bytes(b"existing bundle")
 
         result = self.run_cli_in_cwd(["dots", "--package", "--config", str(config_path)], cwd=work_dir)
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
-        with tarfile.open(expected_bundle, "r:gz") as tar:
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
+        self.assertTrue(bundle_path.exists())
+        with tarfile.open(bundle_path, "r:gz") as tar:
             names = tar.getnames()
         self.assertIn("manifest.toml", names)
 
@@ -1536,14 +1778,14 @@ class TestDeezCLI(unittest.TestCase):
             'target_root = "$HOME/.local/share/icons"\n'
             'paths = "cursor.theme"\n'
         )
-        bundle_path = SCRIPT_DIR / "build" / "cursor_theme-0.1.0.tar.gz"
-        if bundle_path.exists():
-            bundle_path.unlink()
+        # bundle_path resolved from result below
 
         result = self.run_cli(["dots", "--package", "--config", str(config_path)])
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled cursor_theme ->", result.stdout)
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         with tarfile.open(bundle_path, "r:gz") as tar:
             manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
         self.assertIn(f'source = "{archive_path}"', manifest_text)
@@ -1577,7 +1819,8 @@ class TestDeezCLI(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled cursor-bibata-modern-ice ->", result.stdout)
-        bundle_path = SCRIPT_DIR / "build" / "cursor-bibata-modern-ice-2.0.7.tar.gz"
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
         with tarfile.open(bundle_path, "r:gz") as tar:
             names = tar.getnames()
@@ -1615,7 +1858,8 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled cursor-bibata-modern-ice ->", result.stdout)
 
-        bundle_path = SCRIPT_DIR / "build" / "cursor-bibata-modern-ice-2.0.7.tar.gz"
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
         with tarfile.open(bundle_path, "r:gz") as tar:
             names = tar.getnames()
@@ -1652,14 +1896,14 @@ class TestDeezCLI(unittest.TestCase):
             'target_root = "$HOME/.config"\n'
             'paths = ["kitty/kitty.conf"]\n'
         )
-        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
-        if bundle_path.exists():
-            bundle_path.unlink()
+        # bundle_path resolved from result below
 
         result = self.run_cli(["dots", "--package", "--config", str(config_path)])
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         with tarfile.open(bundle_path, "r:gz") as tar:
             manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
         self.assertIn(f'source = "{archive_path}"', manifest_text)
@@ -1684,14 +1928,14 @@ class TestDeezCLI(unittest.TestCase):
             '[[kitty.files]]\n'
             'paths = ["kitty/kitty.conf"]\n'
         )
-        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
-        if bundle_path.exists():
-            bundle_path.unlink()
+        # bundle_path resolved from result below
 
         result = self.run_cli(["dots", "--package", "--config", str(config_path)])
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         with tarfile.open(bundle_path, "r:gz") as tar:
             manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
         self.assertIn(f'source = "{archive_path}"', manifest_text)
@@ -1750,7 +1994,8 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("[ok] Bundled cursor_bibata_modern_ice ->", result.stdout)
 
-        bundle_path = SCRIPT_DIR / "build" / "cursor_bibata_modern_ice-0.1.0.tar.gz"
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         with tarfile.open(bundle_path, "r:gz") as outer_tar:
             names = outer_tar.getnames()
             self.assertIn("payload.tar.gz", names)
@@ -1992,9 +2237,7 @@ class TestDeezCLI(unittest.TestCase):
         (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
         (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
         (source_dir / ".config/kitty/theme.conf").write_text("include theme")
-        bundle_path = SCRIPT_DIR / "build" / "kitty-file-pre-2.0.0.tar.gz"
-        if bundle_path.exists():
-            bundle_path.unlink()
+        # bundle_path resolved from result below
         config_path = Path(self.tmpdir.name) / "file-pre.toml"
         config_path.write_text(
             '[global]\n'
@@ -2021,6 +2264,8 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         # pre_command should not run during bundling; both entries should be bundled and commands saved in manifest
         self.assertIn("[ok] Bundled kitty-file-pre ->", result.stdout)
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
         with tarfile.open(bundle_path, "r:gz") as tar:
             manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
@@ -2119,9 +2364,7 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("[ok] Exported kitty ->", result.stdout)
 
     def test_dots_export_installed_manifest_skips_non_home_files(self):
-        bundle_path = SCRIPT_DIR / "build" / "kitty-home-only-9.9.9.tar.gz"
-        if bundle_path.exists():
-            bundle_path.unlink()
+        # bundle_path resolved from result below
         self._write_installed_manifest(
             "kitty-home-only",
             version="9.9.9",
@@ -2138,6 +2381,8 @@ class TestDeezCLI(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("[EXPORT] Capturing installed dot: kitty-home-only", result.stdout)
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
         with tarfile.open(bundle_path, "r:gz") as tar:
             manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
@@ -2227,6 +2472,20 @@ class TestDeezCLI(unittest.TestCase):
         for value, expected in cases:
             with self.subTest(value=value):
                 self.assertEqual(deez_module.DeezUtils.normalize_action(value), expected)
+
+    def test_extract_tarball_payload_returns_false_when_sudo_unavailable(self):
+        writer = deez_module.WriteDots()
+        archive = Path(self.tmpdir.name) / "payload.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.addfile(tarfile.TarInfo("index.theme"), io.BytesIO(b""))
+        destination = Path(self.tmpdir.name) / "readonly-dest"
+        destination.mkdir(parents=True, exist_ok=True)
+        destination.chmod(0o555)
+
+        with patch.object(writer, "_run_sudo_command", return_value=False):
+            with patch.object(writer, "_is_writable_path", return_value=False):
+                result = writer._extract_tarball_payload(archive, destination, clean_target=False)
+        self.assertFalse(result)
 
     def test_expand_env_recursively_handles_nested_structures(self):
         value = {
@@ -2325,9 +2584,7 @@ class TestDeezCLI(unittest.TestCase):
 
     def test_dots_package_bundle_persists_dot_and_file_dependencies(self):
         source_dir = Path(self.tmpdir.name) / "source"
-        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
-        if bundle_path.exists():
-            bundle_path.unlink()
+        # bundle_path resolved from result below
         config_file = source_dir / ".config/kitty/kitty.conf"
         config_file.parent.mkdir(parents=True, exist_ok=True)
         config_file.write_text("font_size 12")
@@ -2353,6 +2610,8 @@ class TestDeezCLI(unittest.TestCase):
         result = self.run_cli(["dots", "--package", "--config", str(config_path)])
 
         self.assertEqual(result.returncode, 0)
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
         with tarfile.open(bundle_path, "r:gz") as tar:
             manifest = deez_module.toml.loads(tar.extractfile("manifest.toml").read().decode("utf-8"))
@@ -2650,15 +2909,15 @@ class TestDeezCLI(unittest.TestCase):
         config_file.write_text("monitor=,preferred,auto,1")
         state_file.write_text("return {}")
 
-        bundle_path = SCRIPT_DIR / "build" / "hyprland-1.2.3.tar.gz"
-        if bundle_path.exists():
-            bundle_path.unlink()
+        # bundle_path resolved from result below
 
         result = run_deez(["dots", "--export", "--config", str(config_path)], env=self.env)
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("[EXPORT] Capturing dot: hyprland", result.stdout)
         self.assertEqual(result.stdout.count("[ok] Exported hyprland ->"), 1)
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
 
         with tarfile.open(bundle_path, "r:gz") as tar:
@@ -2894,9 +3153,7 @@ class TestDeezCLI(unittest.TestCase):
             'target_root = "$HOME/.config"\n'
             'paths = ["kitty/kitty.conf", "kitty/missing.conf"]\n'
         )
-        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
-        if bundle_path.exists():
-            bundle_path.unlink()
+        # bundle_path resolved from result below
 
         result = run_deez(["dots", "--package", "--config", str(config_path)], env=self.env)
 
@@ -2904,6 +3161,8 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("[warn] Source path missing:", result.stdout)
         self.assertIn("kitty/missing.conf", result.stdout)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
         with tarfile.open(bundle_path, "r:gz") as tar:
             archived_names = tar.getnames()
@@ -2940,9 +3199,7 @@ class TestDeezCLI(unittest.TestCase):
             'paths = "."\n'
             'ignored_paths = ["*.conf"]\n'
         )
-        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
-        if bundle_path.exists():
-            bundle_path.unlink()
+        # bundle_path resolved from result below
 
         result = run_deez(["dots", "--package", "--config", str(config_path)], env=self.env)
 
@@ -2950,6 +3207,8 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("[warn] Ignored all matched files:", result.stdout)
         self.assertIn("Configs/.local/share/kitty", result.stdout)
         self.assertIn("[ok] Bundled kitty ->", result.stdout)
+        bundle_path = self._bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         with tarfile.open(bundle_path, "r:gz") as tar:
             archived_names = tar.getnames()
             manifest_text = tar.extractfile("manifest.toml").read().decode("utf-8")
@@ -3142,18 +3401,27 @@ class TestDeezCLI(unittest.TestCase):
             'target_root = "$HOME/.config"\n'
             'paths = ["kitty/kitty.conf"]\n'
         )
-        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
-        stale_dir = SCRIPT_DIR / "build" / "kitty-0.1.0"
+
+        # First run to create the bundle and get the actual content-hash suffix
+        first_result = run_deez(["dots", "--package", "--config", str(config_path)], env=self.env)
+        self.assertEqual(first_result.returncode, 0)
+        bundle_path = _bundle_path(first_result)
+        self.assertIsNotNone(bundle_path)
+        self.assertTrue(bundle_path.exists())
+
+        # Create stale directory at the extracted path (bundle path without .tar.gz suffix)
+        stale_dir = Path(str(bundle_path)[:-len(".tar.gz")])
         stale_dir.mkdir(parents=True, exist_ok=True)
         (stale_dir / "old.txt").write_text("stale")
-        if bundle_path.exists():
-            bundle_path.unlink()
 
+        # Second run should warn about stale extracted directory
         result = run_deez(["dots", "--package", "--config", str(config_path)], env=self.env)
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("Existing extracted build directory may be stale:", result.stdout)
         self.assertTrue((stale_dir / "old.txt").exists())
+        bundle_path = _bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
 
     def test_dots_package_rebuild_removes_stale_extracted_build_dir(self):
@@ -3175,18 +3443,27 @@ class TestDeezCLI(unittest.TestCase):
             'target_root = "$HOME/.config"\n'
             'paths = ["kitty/kitty.conf"]\n'
         )
-        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
-        stale_dir = SCRIPT_DIR / "build" / "kitty-0.1.0"
+
+        # First run to create the bundle and get the actual content-hash suffix
+        first_result = run_deez(["dots", "--package", "--config", str(config_path)], env=self.env)
+        self.assertEqual(first_result.returncode, 0)
+        bundle_path = _bundle_path(first_result)
+        self.assertIsNotNone(bundle_path)
+        self.assertTrue(bundle_path.exists())
+
+        # Create stale directory at the extracted path
+        stale_dir = Path(str(bundle_path)[:-len(".tar.gz")])
         stale_dir.mkdir(parents=True, exist_ok=True)
         (stale_dir / "old.txt").write_text("stale")
-        if bundle_path.exists():
-            bundle_path.unlink()
 
+        # Second run with --rebuild should remove stale directory
         result = run_deez(["dots", "--package", "--rebuild", "--config", str(config_path)], env=self.env)
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("Removed existing extracted build directory:", result.stdout)
         self.assertFalse(stale_dir.exists())
+        bundle_path = _bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
 
     def test_dots_package_reuses_existing_bundle_without_rebuild(self):
@@ -3208,12 +3485,11 @@ class TestDeezCLI(unittest.TestCase):
             'target_root = "$HOME/.config"\n'
             'paths = ["kitty/kitty.conf"]\n'
         )
-        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
-        if bundle_path.exists():
-            bundle_path.unlink()
 
         first_result = run_deez(["dots", "--package", "--config", str(config_path)], env=self.env)
         self.assertEqual(first_result.returncode, 0)
+        bundle_path = _bundle_path(first_result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
         first_hash = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
         first_inode = bundle_path.stat().st_ino
@@ -3221,6 +3497,8 @@ class TestDeezCLI(unittest.TestCase):
         second_result = run_deez(["dots", "--package", "--config", str(config_path)], env=self.env)
         self.assertEqual(second_result.returncode, 0)
         self.assertIn("[ok] Bundled kitty ->", second_result.stdout)
+        bundle_path = _bundle_path(second_result)
+        self.assertIsNotNone(bundle_path)
         self.assertEqual(first_hash, hashlib.sha256(bundle_path.read_bytes()).hexdigest())
         self.assertEqual(first_inode, bundle_path.stat().st_ino)
 
@@ -3238,18 +3516,17 @@ class TestDeezCLI(unittest.TestCase):
         export_file = self.home_dir / ".config/kitty/kitty.conf"
         export_file.parent.mkdir(parents=True, exist_ok=True)
         export_file.write_text("dummy")
-        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
         stale_dir = SCRIPT_DIR / "build" / "kitty-0.1.0"
         stale_dir.mkdir(parents=True, exist_ok=True)
         (stale_dir / "old.txt").write_text("stale")
-        if bundle_path.exists():
-            bundle_path.unlink()
 
         result = run_deez(["dots", "--export", "--config", str(config_path)], env=self.env)
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("Existing extracted build directory may be stale:", result.stdout)
         self.assertTrue((stale_dir / "old.txt").exists())
+        bundle_path = _bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
 
     def test_dots_export_rebuild_removes_stale_extracted_build_dir(self):
@@ -3266,18 +3543,17 @@ class TestDeezCLI(unittest.TestCase):
         export_file = self.home_dir / ".config/kitty/kitty.conf"
         export_file.parent.mkdir(parents=True, exist_ok=True)
         export_file.write_text("dummy")
-        bundle_path = SCRIPT_DIR / "build" / "kitty-0.1.0.tar.gz"
         stale_dir = SCRIPT_DIR / "build" / "kitty-0.1.0"
         stale_dir.mkdir(parents=True, exist_ok=True)
         (stale_dir / "old.txt").write_text("stale")
-        if bundle_path.exists():
-            bundle_path.unlink()
 
         result = run_deez(["dots", "--export", "--rebuild", "--config", str(config_path)], env=self.env)
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("Removed existing extracted build directory:", result.stdout)
         self.assertFalse(stale_dir.exists())
+        bundle_path = _bundle_path(result)
+        self.assertIsNotNone(bundle_path)
         self.assertTrue(bundle_path.exists())
 
     def test_dots_deploy_fails_when_package_produces_no_bundles(self):
