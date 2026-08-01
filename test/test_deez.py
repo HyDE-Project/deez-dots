@@ -2473,7 +2473,7 @@ class TestDeezCLI(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(deez_module.DeezUtils.normalize_action(value), expected)
 
-    def test_extract_tarball_payload_returns_false_when_sudo_unavailable(self):
+    def test_extract_tarball_payload_raises_permission_error_when_sudo_unavailable(self):
         writer = deez_module.WriteDots()
         archive = Path(self.tmpdir.name) / "payload.tar.gz"
         with tarfile.open(archive, "w:gz") as tar:
@@ -2484,8 +2484,8 @@ class TestDeezCLI(unittest.TestCase):
 
         with patch.object(writer, "_run_sudo_command", return_value=False):
             with patch.object(writer, "_is_writable_path", return_value=False):
-                result = writer._extract_tarball_payload(archive, destination, clean_target=False)
-        self.assertFalse(result)
+                with self.assertRaises(PermissionError):
+                    writer._extract_tarball_payload(archive, destination, clean_target=False)
 
     def test_expand_env_recursively_handles_nested_structures(self):
         value = {
