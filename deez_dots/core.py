@@ -4736,14 +4736,26 @@ class DeezCLI:
             if not stale:
                 continue
             attic = root.parent / (root.name + ".old")
+            moved = 0
             for existing in stale:
                 relative = existing.relative_to(root)
                 moved_to = attic / relative
-                moved_to.parent.mkdir(parents=True, exist_ok=True)
-                if moved_to.exists() or moved_to.is_symlink():
-                    WriteDots._remove_existing_path(moved_to)
-                shutil.move(str(existing), str(moved_to))
-            UI.info(f"Pruned {len(stale)} stale file(s) from '{root_path}' -> '{attic}'")
+                # A file that cannot be moved — a read-only parent, a path
+                # taken away underneath us — is reported and stepped over. The
+                # deployment that follows is what the user asked for, and
+                # raising here would abandon it with the root half pruned.
+                try:
+                    moved_to.parent.mkdir(parents=True, exist_ok=True)
+                    if moved_to.exists() or moved_to.is_symlink():
+                        WriteDots._remove_existing_path(moved_to)
+                    shutil.move(str(existing), str(moved_to))
+                except OSError as exc:
+                    LOG.warning("Failed to prune %s: %s", existing, exc)
+                    UI.warn(f"Could not prune stale file {existing}: {exc}")
+                    continue
+                moved += 1
+            if moved:
+                UI.info(f"Pruned {moved} stale file(s) from '{root_path}' -> '{attic}'")
 
     def _do_install(self, tarballs: List[str], dry_run: bool = False, prechecked_dependencies: bool = False, uninstall_existing: bool = False) -> None:
         writer = WriteDots()

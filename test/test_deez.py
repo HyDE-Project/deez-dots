@@ -2797,6 +2797,48 @@ class TestDeezCLI(unittest.TestCase):
         self.assertFalse((stale_dir / "removed-upstream.conf").exists())
         self.assertTrue((self.home_dir / ".config" / "kitty.old" / "removed-upstream.conf").exists())
 
+    def test_dots_deploy_clean_target_survives_a_prune_that_cannot_move(self):
+        """A stale file that cannot be moved is reported, and the deployment still runs.
+
+        The attic is a regular file here, so creating it as a directory fails.
+        Whatever the reason — a read-only parent, a path taken away underneath
+        the run — the deployment the user asked for has to happen anyway, with
+        the root left as it was rather than half pruned.
+        """
+        source_dir = Path(self.tmpdir.name) / "source"
+        (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".config/kitty/kitty.conf").write_text("font_size 12")
+        stale_dir = self.home_dir / ".config" / "kitty"
+        stale_dir.mkdir(parents=True, exist_ok=True)
+        (stale_dir / "removed-upstream.conf").write_text("orphan")
+        attic = self.home_dir / ".config" / "kitty.old"
+        attic.write_text("in the way")
+        config_path = Path(self.tmpdir.name) / "clean-deploy-blocked.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            '[[kitty.files]]\n'
+            'clean_target = true\n'
+            'action = "sync"\n'
+            'source_root = ".config"\n'
+            'target_root = "$HOME/.config"\n'
+            'paths = ["kitty"]\n'
+        )
+
+        result = self.run_cli(["dots", "--deploy", "--config", str(config_path)])
+        output = (result.stdout or "") + (result.stderr or "")
+
+        self.assertEqual(result.returncode, 0, output)
+        self.assertTrue((stale_dir / "kitty.conf").exists(), output)
+        self.assertTrue((stale_dir / "removed-upstream.conf").exists(), output)
+        self.assertTrue(attic.is_file())
+        self.assertIn("Could not prune", output)
+
     def test_dots_deploy_clean_target_leaves_unflagged_targets_untouched(self):
         source_dir = Path(self.tmpdir.name) / "source"
         (source_dir / ".config/kitty").mkdir(parents=True, exist_ok=True)
