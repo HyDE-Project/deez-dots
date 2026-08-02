@@ -7,6 +7,7 @@ namespace normalization in other integrations.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,7 +64,7 @@ def normalize_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     link_val = getattr(args, "link", None)
     action_link = link_val is not None
     action_list = bool(getattr(args, "list", False))
-    
+
     # Collect mutually exclusive actions
     action_flags = []
     if action_package: action_flags.append("--package")
@@ -74,7 +75,7 @@ def normalize_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     if action_link: action_flags.append("--link")
     if len(action_flags) > 1:
         parser.error(f"Conflicting actions: {' and '.join(action_flags)}. These cannot be combined.")
-    
+
     if not any([action_package, action_export, action_install, action_deploy, action_uninstall, action_link, action_filetree, action_healthcheck, action_restore, action_downgrade, action_list]):
         parser.print_help()
         return False
@@ -223,6 +224,66 @@ def _find_pkg_for_dots(pkg_paths: list[str], sections: list[str]) -> dict[str, s
     return dot_to_pkg
 
 
+def _bundle_hash_matches_cache(cli: Any, pkg_path: str, expected_hash: str) -> bool:
+    """Check if the bundle at pkg_path has the same SHA256 hash as expected_hash.
+    
+    Checks if we need to reinstall
+    """
+    expected_hash = (expected_hash or "").strip().lower()
+    if not expected_hash:
+        return False
+    try:
+        bundle_path = Path(pkg_path)
+        if not bundle_path.is_file():
+            return False
+        actual_hash = hashlib.sha256(bundle_path.read_bytes()).hexdigest().lower()
+        return actual_hash == expected_hash
+    except OSError:
+        return False
+
+
+def _should_reinstall_dot(cli: Any, dot: str, pkg_path: str) -> bool:
+    """Determine if a dot should be reinstalled based on content hash comparison.
+
+    Returns True if:
+    - Dot is not installed yet, OR
+    - Installed dot has different owner, OR
+    - Installed dot's bundle hash differs from the new bundle's hash (content changed)
+
+    Uses full SHA256 hash of the bundle tarball for accurate content detection,
+    unlike version comparison which is unreliable for content hashes.
+    """
+    existing_desc = cli.manifest_manager.load_desc(dot)
+    if not existing_desc:
+        return True  # First install
+
+    old_owner = existing_desc.get("owner")
+    new_bundle = cli._read_bundle_manifest(Path(pkg_path))
+    if not new_bundle:
+        return False  # Can't read new bundle, don't reinstall
+
+    new_owner = DeezUtils.normalize_owner(new_bundle.get("owner", ""))
+    if old_owner and new_owner and old_owner != new_owner:
+        return True  # Different owner, reinstall
+
+    # Content-based check: compare full bundle SHA256 hash
+    expected_hash = str(existing_desc.get("hash") or "").strip()
+    if expected_hash and _bundle_hash_matches_cache(cli, pkg_path, expected_hash):
+        return False  # Content identical, skip reinstall
+    if expected_hash:
+        return True  # Content changed, reinstall
+
+    # Fallback: no hash in manifest (old install), use version comparison
+    old_version = existing_desc.get("version")
+    new_version = new_bundle.get("version")
+    if old_version and new_version:
+        version_cmp = compare_versions(old_version, new_version)
+        if version_cmp <= 0:
+            return True  # New version is >= old version
+
+    return True  # Default to reinstall if unsure
+
+
 def _should_overwrite_installed_dot(cli: Any, dot: str, new_owner: str | None, new_version: str | None) -> bool:
     existing_desc = cli.manifest_manager.load_desc(dot)
     if not existing_desc:
@@ -249,15 +310,18 @@ def _should_overwrite_installed_dot(cli: Any, dot: str, new_owner: str | None, n
         f"Dot '{colored_dot}' version {colored_old_version} owned by {colored_old_owner} is installed. "
         f"Overwrite with version {colored_new_version} owned by {colored_new_owner}? [y/N]: "
     )
-    answer = UI.read_input(prompt).strip().lower()
-    if answer in ("y", "yes"):
-        return True
-    UI.info("Cancelled.")
-    return False
+    while True:
+        answer = UI.read_input(prompt).strip().lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            UI.info("Cancelled.")
+            return False
 
 
 def _deploy_dot(cli: Any, context: DotsRuntimeContext, dot: str, pkg_path: str) -> None:
-    if not _should_overwrite_installed_dot(cli, dot, *(_read_dot_manifest(cli, pkg_path) or (None, None))):
+    if not _should_reinstall_dot(cli, dot, pkg_path):
+        UI.info(f"'{dot}' is up to date (content hash matches), skipping.")
         return
     _run_global_action(
         cli,

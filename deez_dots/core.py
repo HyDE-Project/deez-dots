@@ -273,7 +273,6 @@ class DeezUtils:
         if norm.startswith(home + os.sep):
             return "${HOME}" + norm[len(home):]
         return path
-
     @staticmethod
     def normalize_owner(owner: Optional[str]) -> str:
         """Normalize a dot owner string into a canonical lowercase identifier."""
@@ -1351,6 +1350,24 @@ class WriteDots:
             UI.error(f"Privileged operation failed: {description}")
         return success
 
+    @staticmethod
+    def _content_hash(stage_dir: Union[str, Path]) -> str:
+        """Compute a deterministic short hash from staged file contents.
+
+        Walks the staged directory tree, hashing each file's relative path
+        and content in sorted order.  The same files always produce the same
+        hash regardless of when or where they were staged.
+        """
+        hasher = hashlib.sha256()
+        root = Path(stage_dir)
+        for path in sorted(root.rglob("*"), key=lambda p: str(p.relative_to(root))):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root)
+            hasher.update(str(rel).encode("utf-8"))
+            hasher.update(path.read_bytes())
+        return hasher.hexdigest()[:12]
+
     def _is_writable_path(self, candidate_path: Union[str, Path]) -> bool:
         path = Path(candidate_path)
         if path.exists():
@@ -1961,11 +1978,16 @@ class WriteDots:
                         if self._run_sudo_command(["rm", "-rf", str(destination_path)], "remove existing destination for tarball clean build"):
                             LOG.debug("Privileged clean build removed existing destination %s", destination_path)
                         else:
-                            raise
+                            return False
+                    elif getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM}:
+                        return False
                     else:
                         raise
             else:
-                self._remove_path_sudo(destination_path)
+                try:
+                    self._remove_path_sudo(destination_path)
+                except PermissionError:
+                    return False
 
         if not self._is_writable_path(extraction_root):
             if not self._run_sudo_command(["mkdir", "-p", str(extraction_root)], "create tarball destination directory"):
@@ -2169,10 +2191,20 @@ class WriteDots:
             if not any_staged:
                 LOG.debug("Nothing staged for %s", dot)
                 return ""
+            # Compute a content-based identifier from the staged files.  When a
+            # version is provided (e.g. "1.0.0") the hash is appended as a PEP 440
+            # local suffix ("1.0.0+3f7a2b1e"), so the version stays human-readable
+            # while also being content-addressed.  When no version is given, the
+            # short hash alone is used — fully deterministic without manual input.
+            content_id = self._content_hash(stage_dir)
+            if version and version not in ("", "unknown"):
+                resolved_version = f"{version}+{content_id}"
+            else:
+                resolved_version = content_id
             desc_data = {
                 "name": dot,
                 "owner": owner,
-                "version": version or "unknown",
+                "version": resolved_version,
                 "githash": githash,
                 "builddate": str(int(time.time())),
                 "origin": "package",
@@ -2194,11 +2226,15 @@ class WriteDots:
                 desc_data["post_command"] = post_command
             if build_command:
                 desc_data["build_command"] = build_command
-            pkg_path = self._pkg_path(dot, version, out_dir=out_dir)
+            pkg_path = self._pkg_path(dot, resolved_version, out_dir=out_dir)
             if not overwrite_existing:
                 existing_bundle = Path(pkg_path)
                 if existing_bundle.is_file():
                     if self._validate_bundle(str(existing_bundle)):
+                        # Check for stale extracted directory even when reusing bundle
+                        extracted_dir = Path(pkg_path[: -len(".tar.gz")]) if pkg_path.endswith(".tar.gz") else None
+                        if extracted_dir and extracted_dir.exists():
+                            UI.warn(f"Existing extracted build directory may be stale: {extracted_dir}. Use --rebuild to remove it.")
                         LOG.debug("Reusing existing valid package output: %s", existing_bundle)
                         UI.success(f"Bundled {dot} -> {existing_bundle}")
                         return str(existing_bundle)
@@ -4837,9 +4873,9 @@ class DeezCLI:
                         ):
                             deployed_pairs.append({"src": source_rel_path, "dst": destination_path, "action": entry_action})
                         continue
-                    if writer._copy_with_action(source_path, destination_path, entry_action, clean_target=entry_clean_target):
+                    elif writer._copy_with_action(source_path, destination_path, entry_action, clean_target=entry_clean_target):
                         deployed_pairs.append({"src": source_rel_path, "dst": destination_path, "action": entry_action})
-                    elif entry_action == "preserve" and Path(destination_path).exists():
+                    elif entry_action == "preserve" and writer._path_exists_or_link(destination_path):
                         adopted_pairs.append({"src": source_rel_path, "dst": destination_path, "action": entry_action})
                 if not deployed_pairs and not adopted_pairs:
                     UI.info(f"'{dot}' skipped — no files installed.")
