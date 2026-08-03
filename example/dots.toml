@@ -57,7 +57,11 @@ update = "flatpak update -y"
 pre_command = "echo 'Pre commands '"
 post_command = "echo 'HyDE backed up!'"
 [[hyde.dependency]]
-pacman = ["hyprland", "nwg-look", "qt5ct", "qt6ct"]
+# A requirement can name alternatives with "|". The dot is then satisfied when
+# the machine has any of them, so an editor or a browser it already uses is
+# left alone; only a machine with none gets the first, which is the project's
+# preference among equals.
+pacman = ["hyprland", "nwg-look", "qt5ct", "qt6ct", "vim|neovim|helix|nano"]
 dnf = ["another-dependency"]
 
 [[hyde.files]]

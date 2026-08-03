@@ -3729,6 +3729,11 @@ class DeezCLI:
             return None
         return parsed
 
+    def _package_installed(self, manager: str, package: str) -> bool:
+        if manager == "system":
+            return bool(shutil.which(package))
+        return self.package_manager_instance.query_installed(manager, package)
+
     def _check_dependency_status(self, dependency_map: Dict[str, List[str]]) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
         satisfied: Dict[str, List[str]] = {}
         missing: Dict[str, List[str]] = {}
@@ -3736,19 +3741,28 @@ class DeezCLI:
         UI.set_loader_message("Checking dependency status...")
         for manager, packages in dependency_map.items():
             for package in packages:
-                installed = False
-                if manager == "system":
-                    installed = bool(shutil.which(package))
-                else:
-                    installed = self.package_manager_instance.query_installed(manager, package)
+                # A requirement can name alternatives, "helix|vim|nano". The
+                # dot needs one of them, not a particular one, so a machine
+                # that already has any member is left alone. Only a machine
+                # with none of them gets the first, which is the project's
+                # preference among equals. Package names never contain "|",
+                # so a plain name is unaffected.
+                alternatives = [name for name in (part.strip() for part in package.split("|")) if name]
+                if not alternatives:
+                    continue
 
-                if installed:
-                    satisfied.setdefault(manager, []).append(package)
+                present = next((name for name in alternatives if self._package_installed(manager, name)), None)
+
+                if present is not None:
+                    satisfied.setdefault(manager, []).append(present)
                     # Show installed feedback in loader, not as a separate line
-                    UI.set_loader_message(f"[ok] {manager}: {package}")
+                    UI.set_loader_message(f"[ok] {manager}: {present}")
                 else:
-                    missing.setdefault(manager, []).append(package)
-                    UI.warn(f"{manager}: {package} missing")
+                    missing.setdefault(manager, []).append(alternatives[0])
+                    if len(alternatives) > 1:
+                        UI.warn(f"{manager}: none of {', '.join(alternatives)} installed, will use {alternatives[0]}")
+                    else:
+                        UI.warn(f"{manager}: {alternatives[0]} missing")
 
         LOG.debug("Dependency status satisfied: %s", satisfied)
         LOG.debug("Dependency status missing: %s", missing)
