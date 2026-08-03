@@ -335,6 +335,45 @@ def _deploy_dot(cli: Any, context: DotsRuntimeContext, dot: str, pkg_path: str) 
     )
 
 
+def _deploy_selected_dots(
+    cli: Any,
+    context: DotsRuntimeContext,
+    sections_to_deploy: list[str],
+    dot_to_pkg: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Deploy every selected dot and return the ones that failed.
+
+    A dot that raises used to take the rest of the deployment with it, so a
+    single bad entry left every dot queued behind it undeployed — and the ones
+    behind it are what carry the fix for whatever broke. Each dot is its own
+    bundle and nothing later depends on an earlier one having landed, so a
+    failure is reported and the run carries on. The caller decides what a
+    non-empty result means for the exit status.
+    """
+    failures: list[tuple[str, str]] = []
+    for dot in sections_to_deploy:
+        pkg_path = dot_to_pkg.get(dot)
+        try:
+            _deploy_dot(cli, context, dot, pkg_path)
+        except KeyboardInterrupt:
+            raise
+        except SystemExit as exc:
+            # The install path reports a per-dot problem by exiting, so an exit
+            # here says this dot failed, not that the whole run should stop.
+            code = exc.code
+            if code is None or code == 0:
+                continue
+            reason = f"exited with status {code}"
+            UI.error(f"Deploy failed for '{dot}': {reason}")
+            failures.append((dot, reason))
+        except Exception as exc:
+            LOG.debug("Deploy failed for '%s'", dot, exc_info=True)
+            reason = f"{type(exc).__name__}: {exc}"
+            UI.error(f"Deploy failed for '{dot}': {reason}")
+            failures.append((dot, reason))
+    return failures
+
+
 def _read_dot_manifest(cli: Any, pkg_path: str) -> tuple[str | None, str | None] | None:
     bundle_manifest = cli._read_bundle_manifest(Path(pkg_path))
     if not bundle_manifest:
@@ -461,12 +500,15 @@ def execute(cli: Any) -> None:
         if missing_dots:
             UI.error(f"Deploy failed: bundling failed for selected dots: {', '.join(missing_dots)}.")
             raise SystemExit(1)
-        for dot in sections_to_deploy:
-            pkg_path = dot_to_pkg.get(dot)
-            _deploy_dot(cli, context, dot, pkg_path)
+        failures = _deploy_selected_dots(cli, context, sections_to_deploy, dot_to_pkg)
         if hook_runner is not None:
             LOG.debug(f"Running global post_command: {context.global_post_command}")
             hook_runner.execute_commands([context.global_post_command], cwd=cli.source_dir)
+        if failures:
+            UI.error(f"Deploy finished with {len(failures)} failed dot(s):")
+            for dot, reason in failures:
+                UI.error(f"  {dot}: {reason}")
+            raise SystemExit(1)
         UI.success("Deploy complete")
         return
     if getattr(args, "do_uninstall", False):

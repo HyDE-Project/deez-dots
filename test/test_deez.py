@@ -3590,6 +3590,76 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("Deploy failed: bundling failed for selected dots: alacritty.", output)
         self.assertNotIn("Installed", output)
 
+    def test_dots_deploy_carries_on_after_a_dot_fails(self):
+        # A dot that raises used to take the rest of the deployment with it, so
+        # the dots queued behind it stayed on whatever version they were —
+        # including the ones carrying the fix for whatever broke.
+        source_dir = Path(self.tmpdir.name) / "source-deploy-partial"
+        for dot in ("alpha", "broken", "omega"):
+            config_file = source_dir / "Configs" / dot / f"{dot}.conf"
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            config_file.write_text(f"{dot} config")
+
+        # The middle dot deploys under a path that is a regular file, so its
+        # copy raises where the other two succeed.
+        blocked = self.home_dir / "blocked"
+        blocked.parent.mkdir(parents=True, exist_ok=True)
+        blocked.write_text("not a directory")
+
+        config_path = Path(self.tmpdir.name) / "deploy-partial.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[alpha]\n'
+            '[[alpha.files]]\n'
+            'source_root = "Configs/alpha"\n'
+            'target_root = "$HOME/.config/alpha"\n'
+            'paths = ["alpha.conf"]\n'
+            '\n'
+            '[broken]\n'
+            '[[broken.files]]\n'
+            'source_root = "Configs/broken"\n'
+            'target_root = "$HOME/blocked/broken"\n'
+            'paths = ["broken.conf"]\n'
+            '\n'
+            '[omega]\n'
+            '[[omega.files]]\n'
+            'source_root = "Configs/omega"\n'
+            'target_root = "$HOME/.config/omega"\n'
+            'paths = ["omega.conf"]\n'
+        )
+
+        result = run_deez([
+            "dots",
+            "--deploy",
+            "alpha",
+            "broken",
+            "omega",
+            "--config",
+            str(config_path),
+            "--no-deps-checks",
+        ], env=self.env)
+
+        output = result.stdout + result.stderr
+
+        # The failure is reported, named, and counted rather than swallowed.
+        self.assertIn("Deploy failed for 'broken'", output)
+        self.assertIn("Deploy finished with 1 failed dot(s):", output)
+        self.assertNotIn("Deploy complete", output)
+        self.assertEqual(result.returncode, 1)
+
+        # The dot queued behind the failure still landed.
+        self.assertTrue(
+            (self.home_dir / ".config/omega/omega.conf").exists(),
+            f"the dot after the failing one was not deployed:\n{output}",
+        )
+        self.assertTrue((self.home_dir / ".config/alpha/alpha.conf").exists())
+        self.assertEqual(blocked.read_text(), "not a directory")
+
     def test_run_entrypoint_handles_cancelled_actions(self):
         config_path = self._write_package_config()
         bundle_path = self._make_bundle_tarball(
