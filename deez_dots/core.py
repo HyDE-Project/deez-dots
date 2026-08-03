@@ -2862,7 +2862,7 @@ class GitHandler:
         else:
             repo_owner = url.split("/")[1]
             repo_name = url.split("/")[2].replace(".git", "")
-            target_branch = self.main_config.get("branch") or self.main_config.get("git_branch", "main")
+            target_branch = self.main_config.get("branch", "main")
             safe_branch = self.sanitize_branch(target_branch)
             LOG.debug("Repository Owner: %s", repo_owner)
             LOG.debug("Repository Name: %s", repo_name)
@@ -2883,6 +2883,19 @@ class GitHandler:
                 return out.strip()
         except Exception as e:
             LOG.warning("Could not get git hash for %s: %s", repo_path, e)
+        return ""
+
+    @staticmethod
+    def get_current_branch(repo_path: Union[str, Path]) -> str:
+        """Return the current active branch name for the given repository."""
+        try:
+            success, out, err = default_run_command(
+                ["git", "-C", str(repo_path), "symbolic-ref", "--short", "HEAD"]
+            )
+            if success and out.strip():
+                return out.strip()
+        except Exception:
+            pass
         return ""
 
 

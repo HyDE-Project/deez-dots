@@ -46,7 +46,6 @@ GLOBAL_OVERRIDE_ARGUMENTS: Tuple[Tuple[Tuple[str, ...], Dict[str, Any]], ...] = 
     (("--source",), {"dest": "source", "type": str, "help": "Override [global].source for package or deploy"}),
     (("--git",), {"dest": "git", "type": str, "help": "Override [global].git"}),
     (("--branch",), {"dest": "branch", "type": str, "help": "Override [global].branch"}),
-    (("--git-branch", "--git_branch"), {"dest": "git_branch", "type": str, "help": "Override [global].git_branch"}),
     (("--home",), {"dest": "home", "type": str, "help": "Override [global].home"}),
     (("--owner",), {"dest": "owner", "type": str, "help": "Override [global].owner"}),
     (("--name",), {"dest": "name", "type": str, "help": "Override [global].name"}),
@@ -64,7 +63,6 @@ GLOBAL_OVERRIDE_DEST_TO_KEY: Dict[str, str] = {
     "source": "source",
     "git": "git",
     "branch": "branch",
-    "git_branch": "git_branch",
     "home": "home",
     "owner": "owner",
     "name": "name",
@@ -271,7 +269,8 @@ def main() -> None:
         git_url = global_config.get("git")
         owner = global_config.get("owner")
         name = global_config.get("name")
-        target_branch = global_config.get("branch") or global_config.get("git_branch", "main")
+        # Resolve branch: config > auto-detect from explicit source > "main"
+        configured_branch = global_config.get("branch")
         source_override = getattr(args, "source", None)
         source_dir = source_override or global_config.get("source")
         explicit_source_path = bool(source_dir)
@@ -283,8 +282,26 @@ def main() -> None:
                     owner, name = GitHandler.get_git_owner_name(git_url)
                 else:
                     owner, name = "unknown", "unknown"
-            source_dir = GitHandler.source_cache_path(xdg_cache, owner, name, target_branch)
+            cache_branch = configured_branch or "main"
+            source_dir = GitHandler.source_cache_path(xdg_cache, owner, name, cache_branch)
         source_dir = DeezUtils.expand(source_dir)
+        if explicit_source_path and not configured_branch:
+            source_path = Path(source_dir)
+            if source_path.exists():
+                temp_git_handler = GitHandler(global_config)
+                if temp_git_handler.is_git_repo(source_path):
+                    current_branch = GitHandler.get_current_branch(source_path)
+                    if current_branch:
+                        LOG.debug("Auto-detected current branch: %s", current_branch)
+                        target_branch = current_branch
+                    else:
+                        target_branch = "main"
+                else:
+                    target_branch = "main"
+            else:
+                target_branch = "main"
+        else:
+            target_branch = configured_branch or "main"
         skip_global_source_prepare = bool(has_dot_level_source and not source_override and not global_config.get("source") and not git_url)
         need_source = bool(((args.do_package or args.do_deploy) and not skip_global_source_prepare) or (args.do_install and not args.from_stage))
 

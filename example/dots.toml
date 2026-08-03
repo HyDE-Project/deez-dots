@@ -7,7 +7,7 @@ owner = "The HyDE Project"                       # Owner of the configuration fi
 description = "Main HyDE deployment profile shown when the config is loaded."
 action= "preserve"                       # Actions can either be sync or preserve
 git = "https://github.com/HyDE-Project/HyDE.git"
-git_branch = "dev"
+branch = "dev"
 dots =[
     "kitty","hyprland",
 ] # List of dots to be used in the configuration file

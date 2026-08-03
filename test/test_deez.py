@@ -222,14 +222,14 @@ class TestDeezCLI(unittest.TestCase):
         )
         return config_path
 
-    def _write_git_config(self, *, git_url="https://github.com/HyDE-Project/HyDE.git", git_branch="dev"):
+    def _write_git_config(self, *, git_url="https://github.com/HyDE-Project/HyDE.git", branch="dev"):
         config_path = Path(self.tmpdir.name) / "git-dots.toml"
         config_path.write_text(
             '[global]\n'
             f'home = "{self.home_dir}"\n'
             'version = "0.1.0"\n'
             f'git = "{git_url}"\n'
-            f'git_branch = "{git_branch}"\n'
+            f'branch = "{branch}"\n'
             '\n'
             '[kitty]\n'
             'paths = [".config/kitty/kitty.conf"]\n'
@@ -2088,7 +2088,7 @@ class TestDeezCLI(unittest.TestCase):
         self.assertEqual(result, "/tmp/file-source")
 
     def test_root_global_overrides_before_subcommand_override_config(self):
-        config_path = self._write_git_config(git_url="https://github.com/example/original.git", git_branch="main")
+        config_path = self._write_git_config(git_url="https://github.com/example/original.git", branch="main")
         source_override = Path(self.tmpdir.name) / "root-source-override"
         captured = {}
 
@@ -2119,7 +2119,7 @@ class TestDeezCLI(unittest.TestCase):
                     str(source_override),
                     "--git",
                     "https://github.com/example/override.git",
-                    "--git_branch",
+                    "--branch",
                     "dev",
                     "dots",
                     "--package",
@@ -2132,7 +2132,7 @@ class TestDeezCLI(unittest.TestCase):
         self.assertTrue(captured["prepare_source"]["explicit_source_path"])
         self.assertEqual(captured["source_dir"], str(source_override))
         self.assertEqual(captured["main_config"]["global"]["git"], "https://github.com/example/override.git")
-        self.assertEqual(captured["main_config"]["global"]["git_branch"], "dev")
+        self.assertEqual(captured["main_config"]["global"]["branch"], "dev")
         self.assertEqual(captured["main_config"]["global"]["source"], str(source_override))
 
     def test_dots_package_section_only_config_uses_cli_source_override(self):
@@ -2887,7 +2887,7 @@ class TestDeezCLI(unittest.TestCase):
             f'home = "{self.home_dir}"\n'
             'owner = "hyde_project"\n'
             'git = "https://github.com/HyDE-Project/HyDE.git"\n'
-            'git_branch = "dev"\n'
+            'branch = "dev"\n'
             '\n'
             '[hyprland]\n'
             'version = "1.2.3"\n'
