@@ -242,13 +242,35 @@ def _bundle_hash_matches_cache(cli: Any, pkg_path: str, expected_hash: str) -> b
         return False
 
 
+def _deployed_files_missing(cli: Any, dot: str) -> bool:
+    """Report whether any file the manifest tracks for a dot is gone from disk.
+
+    Entries the manifest marks as not installed are skipped, the same way the
+    health check skips them.
+    """
+    try:
+        entries = cli.manifest_manager.get_file_entries(dot)
+    except Exception:
+        return False
+    for entry in entries:
+        raw_dst = str(DeezUtils.expand(entry.get("dst") or "")).strip()
+        if not raw_dst:
+            continue
+        path = Path(raw_dst)
+        if not cli._path_exists_or_link(path):
+            if entry.get("installed", True):
+                return True
+    return False
+
+
 def _should_reinstall_dot(cli: Any, dot: str, pkg_path: str) -> bool:
     """Determine if a dot should be reinstalled based on content hash comparison.
 
     Returns True if:
     - Dot is not installed yet, OR
     - Installed dot has different owner, OR
-    - Installed dot's bundle hash differs from the new bundle's hash (content changed)
+    - Installed dot's bundle hash differs from the new bundle's hash (content changed), OR
+    - The bundle is unchanged but tracked files are missing from the target tree
 
     Uses full SHA256 hash of the bundle tarball for accurate content detection,
     unlike version comparison which is unreliable for content hashes.
@@ -269,7 +291,9 @@ def _should_reinstall_dot(cli: Any, dot: str, pkg_path: str) -> bool:
     # Content-based check: compare full bundle SHA256 hash
     expected_hash = str(existing_desc.get("hash") or "").strip()
     if expected_hash and _bundle_hash_matches_cache(cli, pkg_path, expected_hash):
-        return False  # Content identical, skip reinstall
+        # An unchanged bundle says nothing about the target tree. Files removed
+        # since the install are put back rather than reported as up to date.
+        return _deployed_files_missing(cli, dot)
     if expected_hash:
         return True  # Content changed, reinstall
 
