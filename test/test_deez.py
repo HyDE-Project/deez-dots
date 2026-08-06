@@ -1286,6 +1286,40 @@ class TestDeezCLI(unittest.TestCase):
         self.assertNotIn("is up to date", third.stdout)
         self.assertTrue(deployed.exists(), "a removed file was not put back")
 
+    def test_dots_deploy_resolves_a_relative_dot_source_against_the_source_root(self):
+        """A dot shipping its own archive must not depend on the working directory."""
+        source_dir = Path(self.tmpdir.name) / "source-relative-archive"
+        payload = source_dir / "payload/kitty.conf"
+        payload.parent.mkdir(parents=True, exist_ok=True)
+        payload.write_text("font_size 12")
+        archive_dir = source_dir / "Source/arcs"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive = archive_dir / "kitty.tar.gz"
+        with tarfile.open(archive, "w:gz") as handle:
+            handle.add(payload, arcname="kitty/kitty.conf")
+
+        config_path = Path(self.tmpdir.name) / "relative-archive.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            f'source = "{source_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[kitty]\n'
+            'source = "Source/arcs/kitty.tar.gz"\n'
+            'action = "sync"\n'
+            'target_root = "$HOME/.config/kitty"\n'
+            'paths = "."\n'
+        )
+
+        result = self.run_cli_in_cwd(
+            ["dots", "--deploy", "kitty", "--config", str(config_path)],
+            cwd=Path(self.tmpdir.name))
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.home_dir / ".config/kitty/kitty.conf").exists())
+
     def test_deploy_respects_home_env_without_global_home(self):
         unique_path = f"deez_test_{uuid.uuid4().hex}/kitty.conf"
         source_dir = Path(self.tmpdir.name) / "source"

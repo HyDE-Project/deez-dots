@@ -4014,9 +4014,25 @@ class DeezCLI:
         if not dot_source:
             return self.source_dir, default_source_url, target_branch
         source_text = DeezUtils.expand(dot_source)
+        source_text = self._anchor_relative_source(source_text)
         dot_branch = dot_data.get("branch") or dot_data.get("git_branch") or target_branch
         source_dir = git_handler.prepare_source(source_text, None, dot_branch, explicit_source_path=True)
         return source_dir, source_text, dot_branch
+
+    def _anchor_relative_source(self, source_text: str) -> str:
+        """Resolve a relative dot source against the configured source root.
+
+        A dot may ship its own archive next to the rest of the tree. Such a
+        source is written the way `source_root` is, relative to the root the
+        run was given, and must not depend on the working directory.
+        """
+        if not source_text or GitHandler.is_source_url(source_text):
+            return source_text
+        candidate = Path(source_text)
+        if candidate.is_absolute() or candidate.exists():
+            return source_text
+        anchored = Path(self.source_dir) / candidate
+        return str(anchored) if anchored.exists() else source_text
 
     def _resolve_file_entry(
         self,
@@ -4141,7 +4157,7 @@ class DeezCLI:
             return source_dir or self.source_dir
         if git_handler is None:
             return source_dir or self.source_dir
-        source_text = DeezUtils.expand(source_text)
+        source_text = self._anchor_relative_source(DeezUtils.expand(source_text))
         branch = (
             file_entry.get("branch")
             or file_entry.get("git_branch")

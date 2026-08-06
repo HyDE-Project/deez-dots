@@ -243,23 +243,21 @@ def _bundle_hash_matches_cache(cli: Any, pkg_path: str, expected_hash: str) -> b
 
 
 def _deployed_files_missing(cli: Any, dot: str) -> bool:
-    """Report whether any file the manifest tracks for a dot is gone from disk.
+    """Report whether a file the manifest tracks as installed is gone from disk.
 
-    Entries the manifest marks as not installed are skipped, the same way the
-    health check skips them.
+    Entries the manifest never installed are ignored, the same ones the health
+    check leaves out of its summary.
     """
     try:
         entries = cli.manifest_manager.get_file_entries(dot)
-    except Exception:
+    except (AttributeError, OSError, ValueError):
         return False
     for entry in entries:
-        raw_dst = str(DeezUtils.expand(entry.get("dst") or "")).strip()
-        if not raw_dst:
+        if not entry.get("installed", True):
             continue
-        path = Path(raw_dst)
-        if not cli._path_exists_or_link(path):
-            if entry.get("installed", True):
-                return True
+        dst = str(DeezUtils.expand(entry.get("dst") or "")).strip()
+        if dst and not cli._path_exists_or_link(Path(dst)):
+            return True
     return False
 
 
@@ -291,8 +289,6 @@ def _should_reinstall_dot(cli: Any, dot: str, pkg_path: str) -> bool:
     # Content-based check: compare full bundle SHA256 hash
     expected_hash = str(existing_desc.get("hash") or "").strip()
     if expected_hash and _bundle_hash_matches_cache(cli, pkg_path, expected_hash):
-        # An unchanged bundle says nothing about the target tree. Files removed
-        # since the install are put back rather than reported as up to date.
         return _deployed_files_missing(cli, dot)
     if expected_hash:
         return True  # Content changed, reinstall
