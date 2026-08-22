@@ -4170,6 +4170,54 @@ class TestDeezCLI(unittest.TestCase):
         self.assertNotIn('removeddate', restored_text)
         self.assertTrue((self.home_dir / ".config/kitty/kitty.conf").exists())
 
+    def test_restore_snapshot_reinstalls_with_uninstall_existing(self):
+        cli = self._make_cli({"global": {}})
+        snapshot_path = str(Path(self.tmpdir.name) / "kitty-snapshot.tar.gz")
+        backup_base = Path(self.tmpdir.name)
+
+        with patch.object(cli, "_do_install") as mock_install:
+            cli._restore_snapshot("kitty", snapshot_path, backup_base, dry_run=False)
+
+        mock_install.assert_called_once_with(
+            [snapshot_path],
+            dry_run=False,
+            uninstall_existing=True,
+        )
+
+    def test_dots_downgrade_reinstalls_with_uninstall_existing(self):
+        cli = self._make_cli({"global": {}})
+        bundle_path = self._make_cache_bundle(
+            "kitty-0.1.0+abc123.tar.gz",
+            """name = "kitty"
+owner = "hyde_project"
+version = "0.1.0+abc123"
+githash = "abc123"
+builddate = "20260101"
+origin = "package"
+""",
+        )
+        entry = deez_module.CacheEntry(
+            path=bundle_path,
+            name="kitty",
+            version="0.1.0+abc123",
+            githash="abc123",
+            builddate="2026-01-01 00:00:00",
+            builddate_raw="20260101",
+            origin="package",
+            size=bundle_path.stat().st_size,
+            mtime="2026-01-01 00:00:00",
+            mtime_ts=0,
+            meta={},
+        )
+
+        with patch.object(cli.cache_manager, "bundles_by_dot", return_value={"kitty": [entry]}), \
+             patch.object(deez_module.InteractiveMenu, "choose_many", return_value=["kitty"]), \
+             patch.object(deez_module.InteractiveMenu, "choose_one", return_value=str(bundle_path)), \
+             patch.object(cli, "_do_install") as mock_install:
+            cli._do_downgrade(dots=None, dry_run=False)
+
+        mock_install.assert_called_once_with([str(bundle_path)], uninstall_existing=True)
+
     def test_backup_list_no_config(self):
         result = run_deez(["backup", "--list"], env=self.env)
         self.assertEqual(result.returncode, 0)

@@ -4603,6 +4603,12 @@ class DeezCLI:
             return None
         changed, changed_paths = self._source_changed_since_bundle(file_entries, existing)
         if not changed:
+            # Keep parity with stage() reuse behaviour: when a matching bundle is
+            # reused and the extracted sibling directory still exists, warn that
+            # it may be stale unless --rebuild is used.
+            extracted_dir = Path(existing[: -len(".tar.gz")]) if existing.endswith(".tar.gz") else None
+            if extracted_dir and extracted_dir.exists():
+                UI.warn(f"Existing extracted build directory may be stale: {extracted_dir}. Use --rebuild to remove it.")
             LOG.debug("Bundle is current, reusing: %s", existing)
             return existing
         # Sources are newer — report what changed and let the caller rebuild.
@@ -5117,7 +5123,9 @@ class DeezCLI:
         original_no_backup = getattr(self.args, "no_backup", False)
         self.args.no_backup = True
         try:
-            self._do_install([snapshot_path], dry_run=dry_run)
+            # Restore should replace the currently installed tracked files first,
+            # same deployment semantics as --deploy.
+            self._do_install([snapshot_path], dry_run=dry_run, uninstall_existing=True)
         finally:
             self.args.no_backup = original_no_backup
 
@@ -5235,7 +5243,8 @@ class DeezCLI:
             for p in to_install:
                 UI.info(f"[DRY RUN] Would install: {p}")
             return
-        self._do_install(to_install)
+        # Downgrade is a re-deploy of a selected cached bundle version.
+        self._do_install(to_install, uninstall_existing=True)
 
     def _serialize_tree_node(self, node: Dict[str, Any]) -> Dict[str, Any]:
         return {
