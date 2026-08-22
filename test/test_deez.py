@@ -5011,6 +5011,47 @@ class TestDeezCLI(unittest.TestCase):
         self.assertIn("Skipping 'kitty'.", result.stdout)
         self.assertFalse((self.home_dir / ".config/kitty/kitty.conf").exists())
 
+    def test_deps_accepts_any_of_a_group_of_alternatives(self):
+        # A dot that needs an editor needs one, not a particular one. Naming a
+        # single package forces it onto machines that already have another,
+        # and a restore there stops to install something nobody asked for.
+        bin_dir = Path(self.tmpdir.name) / "alt-bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        present = bin_dir / "deez-test-editor-b"
+        present.write_text("#!/bin/sh\nexit 0\n")
+        present.chmod(0o755)
+
+        config_path = Path(self.tmpdir.name) / "alt-deps.toml"
+        config_path.write_text(
+            '[global]\n'
+            f'home = "{self.home_dir}"\n'
+            'owner = "hyde_project"\n'
+            'version = "0.1.0"\n'
+            '\n'
+            '[[global.dependency]]\n'
+            'system = ['
+            '"deez-test-editor-a|deez-test-editor-b", '
+            '"deez-test-absent-x|deez-test-absent-y"'
+            ']\n'
+            '\n'
+            '[kitty]\n'
+            'paths = [".config/kitty/kitty.conf"]\n'
+        )
+
+        env = dict(self.env)
+        env["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"
+        result = run_deez(["deps", "--check", "--config", str(config_path)], env=env)
+        output = result.stdout + result.stderr
+
+        # The group the machine already satisfies is left alone, and the member
+        # actually present is the one reported.
+        self.assertIn("deez-test-editor-b", output)
+        self.assertNotIn("deez-test-editor-a", output)
+
+        # The group with no member present falls back to the first, which is
+        # the project's preference among equals.
+        self.assertIn("deez-test-absent-x", output)
+
     def test_deps_check_with_temp_config(self):
         result = run_deez(["deps", "--check", "--config", str(EXAMPLE_CONFIG)], env=self.env)
         self.assertEqual(result.returncode, 0)
