@@ -4540,6 +4540,88 @@ class DeezCLI:
         if selected:
             UI.success("Linking complete")
 
+    def _find_reusable_bundle(
+        self,
+        dot_section: str,
+        section_version: str,
+        file_entries: List[Dict[str, Any]],
+        out_dir: Optional[str],
+        writer: "WriteDots",
+    ) -> Optional[str]:
+        """Return an existing bundle path when it is still up to date, else None.
+
+        Uses mtime comparison (make-style): if every non-preserve source file is
+        older than the bundle, the bundle is current and can be reused.  When
+        sources are newer the old bundle is removed and None is returned so the
+        caller proceeds with a fresh build.
+
+        stage() names bundles ``{dot}-{version}+{content_hash}.tar.gz``, so we
+        glob for that pattern rather than looking for the plain version filename.
+        """
+        build_base = Path(out_dir) if out_dir else Path.cwd() / "build"
+        safe_ver = (section_version or "unknown").replace("/", "-")
+        base_pkg = build_base / f"{dot_section}-{safe_ver}.tar.gz"
+        candidates = sorted(
+            list(build_base.glob(f"{dot_section}-{safe_ver}+*.tar.gz"))
+            + ([base_pkg] if base_pkg.is_file() else []),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            return None
+        existing = str(candidates[0])
+        if not writer._validate_bundle(existing):
+            LOG.warning("Existing bundle invalid, rebuilding: %s", existing)
+            writer._remove_existing_output(existing)
+            return None
+        changed, changed_paths = self._source_changed_since_bundle(file_entries, existing)
+        if not changed:
+            LOG.debug("Bundle is current, reusing: %s", existing)
+            return existing
+        # Sources are newer — report what changed and let the caller rebuild.
+        preview = changed_paths[:5]
+        extra = len(changed_paths) - len(preview)
+        label = ", ".join(preview) + (f" (+{extra} more)" if extra else "")
+        UI.info(f"Rebuilding '{dot_section}': {len(changed_paths)} changed \u2014 {label}")
+        writer._remove_existing_output(existing)
+        return None
+
+    def _source_changed_since_bundle(
+        self,
+        file_entries: List[Dict[str, Any]],
+        pkg_path: str,
+    ) -> Tuple[bool, List[str]]:
+        bundle_path = Path(pkg_path)
+        if not bundle_path.is_file():
+            return True, []
+        bundle_mtime = bundle_path.stat().st_mtime
+        paths_to_check: List[Path] = []
+        for entry in file_entries:
+            if entry.get("action") == "preserve":
+                continue
+            src_root = Path(str(entry.get("src_root") or ""))
+            rel_paths = entry.get("rel_paths") or ["."]
+            if isinstance(rel_paths, str):
+                rel_paths = [rel_paths]
+            for rp in rel_paths:
+                rp = str(rp or "").strip() or "."
+                paths_to_check.append(src_root / rp)
+        if not paths_to_check:
+            return False, []
+        changed: List[str] = []
+        for check_path in paths_to_check:
+            if not check_path.exists():
+                continue
+            all_paths = [check_path] + list(check_path.rglob("*")) if check_path.is_dir() else [check_path]
+            for p in all_paths:
+                try:
+                    if p.stat().st_mtime > bundle_mtime:
+                        changed.append(str(p))
+                except OSError:
+                    pass
+        return bool(changed), changed
+
+
     def _do_package(self, global_owner: str, global_home: str, global_version: str, git_url: str = "", target_branch: str = "", compress: bool = True, out_dir: Optional[str] = None, overwrite_existing: bool = False, rebuild: bool = False, sections: Optional[List[str]] = None, dry_run: bool = False) -> List[str]:
         writer = WriteDots()
         git_handler = GitHandler(self.main_config)
@@ -4560,17 +4642,9 @@ class DeezCLI:
             pre_command = dot_data.get("pre_command")
             post_command = dot_data.get("post_command")
             build_command = dot_data.get("build_command")
-            pkg_path = writer._pkg_path(dot_section, section_version, out_dir=out_dir)
-            if not rebuild and Path(pkg_path).is_file():
-                if writer._validate_bundle(pkg_path):
-                    LOG.debug("Reusing existing valid package bundle for %s: %s", dot_section, pkg_path)
-                    UI.success(f"Bundled {dot_section} -> {pkg_path}")
-                    pkg_paths.append(pkg_path)
-                    continue
-                LOG.warning("Existing package bundle is invalid, rebuilding: %s", pkg_path)
-                writer._remove_existing_output(pkg_path)
+            # Build fully-resolved file entries now so action/path inheritance
+            # (global → dot → per-file) is correct for both the mtime check and staging.
             section_home = os.path.expandvars(dot_data.get("home", global_home))
-
             raw_file_entries = self._build_file_entry_records(
                 dot_data,
                 section_home,
@@ -4578,20 +4652,28 @@ class DeezCLI:
                 git_handler=git_handler,
                 target_branch=dot_target_branch,
             )
-            file_entries: List[Dict[str, Any]] = []
-            for file_entry in raw_file_entries:
-                file_entries.append(
-                    {
-                        "src_root": file_entry["src_root"],
-                        "tgt_root": file_entry["tgt_root"],
-                        "rel_paths": file_entry["rel_paths"],
-                        "ignored_paths": file_entry["ignored_paths"],
-                        "archive_root": file_entry["archive_root"],
-                        "entry_metadata": file_entry["entry_metadata"],
-                        "action": file_entry["action"],
-                        "clean_target": file_entry["clean_target"],
-                    }
+            file_entries: List[Dict[str, Any]] = [
+                {
+                    "src_root": fe["src_root"],
+                    "tgt_root": fe["tgt_root"],
+                    "rel_paths": fe["rel_paths"],
+                    "ignored_paths": fe["ignored_paths"],
+                    "archive_root": fe["archive_root"],
+                    "entry_metadata": fe["entry_metadata"],
+                    "action": fe["action"],
+                    "clean_target": fe["clean_target"],
+                }
+                for fe in raw_file_entries
+            ]
+            pkg_path = writer._pkg_path(dot_section, section_version, out_dir=out_dir)
+            if not rebuild:
+                reusable = self._find_reusable_bundle(
+                    dot_section, section_version, file_entries, out_dir, writer
                 )
+                if reusable:
+                    UI.success(f"Bundled {dot_section} -> {reusable}")
+                    pkg_paths.append(reusable)
+                    continue
             pkg_path = writer.stage(
                 file_entries=file_entries,
                 dot=dot_section,
