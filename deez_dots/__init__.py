@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from importlib.metadata import version as _pkg_version
+
+__version__ = _pkg_version("deez-dots")
+
 from .cli import (
     main,
     run_entrypoint,

@@ -28,7 +28,8 @@ from .ui import UI
 
 LOG = logging.getLogger("deez-dots")
 LOG.setLevel(logging.NOTSET)
-CLI_VERSION = "v0.1.0"
+from . import __version__
+CLI_VERSION = f"v{__version__}"
 
 
 class _AllSectionsRequested:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deez-dots"
-version = "0.1.0"
+version = "0.2.0"
 description = "Dotfiles deployment manager for The HyDE Project."
 readme = "README.md"
 requires-python = ">=3.11"
