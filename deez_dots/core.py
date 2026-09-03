@@ -2972,11 +2972,12 @@ class InteractiveMenu:
         was_paused = UI.pause_loader()
         try:
             cls._print_options(options, labels)
-            hint = f"numbers or ranges like 1,3,5 or 1-2,4-6{', ' + cls._BOLD + 'all' + cls._RESET if allow_all else ''}; Enter to cancel"
+            hint = f"numbers or ranges like 1,3,5 or 1-2,4-6{', ' + cls._BOLD + 'all' + cls._RESET if allow_all else ''}"
             while True:
                 raw = input(f"{prompt} ({hint}): ").strip()
                 if not raw:
-                    return []
+                    UI.plain("  Please enter a selection, or 0 to cancel.")
+                    continue
                 if raw == "0":
                     return []
                 if allow_all and raw.lower() == "all":
